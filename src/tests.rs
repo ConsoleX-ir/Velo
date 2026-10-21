@@ -1,16 +1,29 @@
 use std::{
     fs,
+    future::Future,
+    net::SocketAddr,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
 
+use reqwest::header::{HeaderMap, HeaderValue, CONTENT_LENGTH, TRANSFER_ENCODING};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
+    sync::oneshot,
     task::JoinHandle,
 };
+use url::Url;
 
-use crate::{DownloadEngine, DownloadError, DownloadState};
+use crate::{
+    cleanup_or_original, parse_content_length, promote_no_replace, redirect_decision,
+    temp_candidate, validate_transfer_encoding, DownloadEngine, DownloadError, DownloadState,
+    NetworkFailureKind, OpenedTemp, TempGuard,
+};
 
 static DIR_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -45,8 +58,7 @@ async fn serve_once(response: Vec<u8>) -> (String, JoinHandle<()>) {
     let address = listener.local_addr().expect("read listener address");
     let task = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.expect("accept request");
-        let mut request = vec![0_u8; 4096];
-        let _ = stream.read(&mut request).await;
+        let _request = read_request(&mut stream).await;
         let _ = stream.write_all(&response).await;
         let _ = stream.shutdown().await;
     });
@@ -60,8 +72,7 @@ async fn serve_redirect() -> (String, JoinHandle<()>) {
     let address = listener.local_addr().expect("read listener address");
     let task = tokio::spawn(async move {
         let (mut first, _) = listener.accept().await.expect("accept redirect request");
-        let mut request = vec![0_u8; 4096];
-        let _ = first.read(&mut request).await;
+        let _request = read_request(&mut first).await;
         let redirect = format!(
             "HTTP/1.1 302 Found\r\nLocation: http://{address}/final\r\nContent-Length: 3\r\nConnection: close\r\n\r\nold"
         );
@@ -69,7 +80,7 @@ async fn serve_redirect() -> (String, JoinHandle<()>) {
         let _ = first.shutdown().await;
 
         let (mut final_request, _) = listener.accept().await.expect("accept final request");
-        let _ = final_request.read(&mut request).await;
+        let _request = read_request(&mut final_request).await;
         let final_response = response(
             "200 OK",
             "Content-Length: 3\r\nConnection: close\r\n",
@@ -324,4 +335,964 @@ async fn rejects_non_identity_content_encoding() {
     assert!(matches!(error, DownloadError::InvalidResponse));
     assert!(!target.exists());
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1A hardening tests
+// ---------------------------------------------------------------------------
+
+fn entry_count(dir: &TestDir) -> usize {
+    fs::read_dir(dir.path()).unwrap().count()
+}
+
+async fn read_request(stream: &mut TcpStream) -> String {
+    let mut request = Vec::new();
+    loop {
+        let mut buffer = [0_u8; 512];
+        let read = stream.read(&mut buffer).await.unwrap_or(0);
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&buffer[..read]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") || request.len() >= 16 * 1024 {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&request).into_owned()
+}
+
+/// Serve exactly one connection with a scripted handler.
+async fn serve_with<F, Fut>(handler: F) -> (String, JoinHandle<()>)
+where
+    F: FnOnce(TcpStream) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let address = listener.local_addr().expect("read listener address");
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept request");
+        handler(stream).await;
+    });
+    (format!("http://{address}/file"), task)
+}
+
+/// Serve every connection until aborted. The handler maps (request path,
+/// listener address) to a full raw response. Also counts accepted connections.
+async fn serve_loop<F>(handler: F) -> (SocketAddr, Arc<AtomicUsize>, JoinHandle<()>)
+where
+    F: Fn(String, SocketAddr) -> Vec<u8> + Send + Sync + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let address = listener.local_addr().expect("read listener address");
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+    let handler = Arc::new(handler);
+    let task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let handler = handler.clone();
+            tokio::spawn(async move {
+                let request = read_request(&mut stream).await;
+                let path = request.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                let _ = stream.write_all(&handler(path, address)).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    (address, hits, task)
+}
+
+fn test_engine(read_inactivity_ms: u64, deadline_ms: u64) -> DownloadEngine {
+    DownloadEngine::with_timeouts(
+        Duration::from_secs(5),
+        Duration::from_millis(read_inactivity_ms),
+        Duration::from_millis(deadline_ms),
+    )
+    .unwrap()
+}
+
+/// Run `download` but fail the test instead of hanging if it never returns.
+async fn download_within(
+    engine: &DownloadEngine,
+    url: &str,
+    target: &Path,
+    limit: Duration,
+) -> Result<crate::DownloadResult, DownloadError> {
+    tokio::time::timeout(limit, engine.download(url, target))
+        .await
+        .expect("download did not finish within the test limit (hung)")
+}
+
+// ----- HTTP status / headers -------------------------------------------------
+
+#[tokio::test]
+async fn only_status_200_is_accepted() {
+    let cases = [
+        ("202 Accepted", "", 202_u16),
+        (
+            "206 Partial Content",
+            "Content-Range: bytes 0-3/10\r\n",
+            206,
+        ),
+        ("301 Moved Permanently", "", 301), // redirect without Location is final
+        ("500 Internal Server Error", "", 500),
+        ("503 Service Unavailable", "Retry-After: 1\r\n", 503),
+    ];
+    for (status, extra, code) in cases {
+        let (url, server) = serve_once(response(
+            status,
+            &format!("Content-Length: 4\r\nConnection: close\r\n{extra}"),
+            b"nope",
+        ))
+        .await;
+        let dir = TestDir::new();
+        let target = dir.path().join("status.bin");
+        let error = DownloadEngine::new()
+            .unwrap()
+            .download(&url, &target)
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(
+            matches!(error, DownloadError::HttpStatus(actual) if actual == code),
+            "status {code}: got {error:?}"
+        );
+        assert!(!target.exists(), "status {code} must not create a file");
+        assert_eq!(entry_count(&dir), 0, "status {code} left a temp file");
+    }
+}
+
+#[tokio::test]
+async fn rejects_200_with_content_range() {
+    let (url, server) = serve_once(response(
+        "200 OK",
+        "Content-Length: 4\r\nContent-Range: bytes 0-3/10\r\nConnection: close\r\n",
+        b"data",
+    ))
+    .await;
+    let dir = TestDir::new();
+    let target = dir.path().join("ranged.bin");
+    let error = DownloadEngine::new()
+        .unwrap()
+        .download(&url, &target)
+        .await
+        .unwrap_err();
+    server.await.unwrap();
+    assert!(matches!(error, DownloadError::InvalidResponse));
+    assert!(!target.exists());
+    assert_eq!(entry_count(&dir), 0);
+}
+
+#[tokio::test]
+async fn accepts_explicit_identity_content_encoding() {
+    let (url, server) = serve_once(response(
+        "200 OK",
+        "Content-Length: 4\r\nContent-Encoding: Identity\r\nConnection: close\r\n",
+        b"data",
+    ))
+    .await;
+    let dir = TestDir::new();
+    let target = dir.path().join("identity.bin");
+    DownloadEngine::new()
+        .unwrap()
+        .download(&url, &target)
+        .await
+        .unwrap();
+    server.await.unwrap();
+    assert_eq!(fs::read(&target).unwrap(), b"data");
+}
+
+#[tokio::test]
+async fn rejects_unsupported_encoding_in_any_header_value() {
+    let cases = [
+        "Content-Encoding: br\r\n",
+        "Content-Encoding: identity, gzip\r\n",
+        "Content-Encoding: identity\r\nContent-Encoding: gzip\r\n",
+        "Content-Encoding: gzip\r\nContent-Encoding: identity\r\n",
+    ];
+    for headers in cases {
+        let (url, server) = serve_once(response(
+            "200 OK",
+            &format!("Content-Length: 4\r\nConnection: close\r\n{headers}"),
+            b"data",
+        ))
+        .await;
+        let dir = TestDir::new();
+        let target = dir.path().join("encoded.bin");
+        let result = DownloadEngine::new().unwrap().download(&url, &target).await;
+        server.await.unwrap();
+        assert!(
+            matches!(result, Err(DownloadError::InvalidResponse)),
+            "{headers:?} must be rejected, got {result:?}"
+        );
+        assert!(!target.exists(), "{headers:?} must not produce a file");
+        assert_eq!(entry_count(&dir), 0, "{headers:?} left a temp file");
+    }
+}
+
+fn length_headers(values: &[&[u8]]) -> HeaderMap {
+    let mut map = HeaderMap::new();
+    for value in values {
+        map.append(CONTENT_LENGTH, HeaderValue::from_bytes(value).unwrap());
+    }
+    map
+}
+
+#[test]
+fn content_length_parser_accepts_only_one_plain_decimal() {
+    assert_eq!(parse_content_length(&length_headers(&[])).unwrap(), None);
+    assert_eq!(
+        parse_content_length(&length_headers(&[b"0"])).unwrap(),
+        Some(0)
+    );
+    assert_eq!(
+        parse_content_length(&length_headers(&[b"18446744073709551615"])).unwrap(),
+        Some(u64::MAX)
+    );
+    let malformed: [&[u8]; 10] = [
+        b"",
+        b"abc",
+        b"-1",
+        b"+5",
+        b"5 5",
+        b"5,5",
+        b"0x10",
+        b"1.5",
+        b"18446744073709551616",
+        b"\xff",
+    ];
+    for value in malformed {
+        assert!(
+            matches!(
+                parse_content_length(&length_headers(&[value])),
+                Err(DownloadError::InvalidResponse)
+            ),
+            "{value:?} must be rejected"
+        );
+    }
+    for pair in [[&b"5"[..], &b"5"[..]], [&b"5"[..], &b"6"[..]]] {
+        assert!(matches!(
+            parse_content_length(&length_headers(&pair)),
+            Err(DownloadError::InvalidResponse)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn malformed_content_length_never_produces_a_file() {
+    let cases = [
+        "Content-Length: abc\r\n",
+        "Content-Length: -1\r\n",
+        "Content-Length: 5\r\nContent-Length: 6\r\n",
+        "Content-Length: 99999999999999999999999\r\n",
+    ];
+    for headers in cases {
+        let (url, server) = serve_once(response(
+            "200 OK",
+            &format!("{headers}Connection: close\r\n"),
+            b"hello",
+        ))
+        .await;
+        let dir = TestDir::new();
+        let target = dir.path().join("malformed.bin");
+        let result = DownloadEngine::new().unwrap().download(&url, &target).await;
+        server.await.unwrap();
+        assert!(result.is_err(), "{headers:?} must fail, got {result:?}");
+        assert!(!target.exists(), "{headers:?} must not produce a file");
+        assert_eq!(entry_count(&dir), 0, "{headers:?} left a temp file");
+    }
+}
+
+#[tokio::test]
+async fn downloads_chunked_body_exact_bytes() {
+    let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+                5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
+        .to_vec();
+    let (url, server) = serve_once(raw).await;
+    let dir = TestDir::new();
+    let target = dir.path().join("chunked.bin");
+    let result = DownloadEngine::new()
+        .unwrap()
+        .download(&url, &target)
+        .await
+        .unwrap();
+    server.await.unwrap();
+    assert_eq!(result.bytes_written, 11);
+    assert_eq!(fs::read(&target).unwrap(), b"hello world");
+}
+
+#[tokio::test]
+async fn requests_identity_content_encoding() {
+    let (request_tx, request_rx) = oneshot::channel();
+    let (url, server) = serve_with(|mut stream| async move {
+        let request = read_request(&mut stream).await;
+        let _ = request_tx.send(request);
+        let body = response(
+            "200 OK",
+            "Content-Length: 2\r\nConnection: close\r\n",
+            b"ok",
+        );
+        let _ = stream.write_all(&body).await;
+        let _ = stream.shutdown().await;
+    })
+    .await;
+    let dir = TestDir::new();
+    DownloadEngine::new()
+        .unwrap()
+        .download(&url, dir.path().join("identity-request.bin"))
+        .await
+        .unwrap();
+    server.await.unwrap();
+    let request = request_rx.await.unwrap().to_ascii_lowercase();
+    assert!(
+        request.contains("accept-encoding: identity\r\n"),
+        "{request:?}"
+    );
+}
+
+#[tokio::test]
+async fn rejects_truncated_chunked_body_and_cleans_up() {
+    // First chunk is complete but the terminating zero-chunk never arrives.
+    let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+                5\r\nhello\r\n"
+        .to_vec();
+    let (url, server) = serve_once(raw).await;
+    let dir = TestDir::new();
+    let target = dir.path().join("truncated-chunked.bin");
+    let error = DownloadEngine::new()
+        .unwrap()
+        .download(&url, &target)
+        .await
+        .unwrap_err();
+    server.await.unwrap();
+    assert!(
+        matches!(
+            error,
+            DownloadError::NetworkFailure(NetworkFailureKind::RequestOrBody)
+        ),
+        "got {error:?}"
+    );
+    assert!(!target.exists());
+    assert_eq!(entry_count(&dir), 0);
+}
+
+// ----- redirects --------------------------------------------------------------
+
+fn urls(list: &[&str]) -> Vec<Url> {
+    list.iter().map(|u| Url::parse(u).unwrap()).collect()
+}
+
+#[test]
+fn redirect_policy_blocks_https_downgrade_anywhere_in_the_chain() {
+    let next = Url::parse("http://c.example/").unwrap();
+    for previous in [
+        urls(&["https://a.example/"]),
+        urls(&["https://a.example/", "https://b.example/"]),
+        urls(&["http://a.example/", "https://b.example/"]),
+        urls(&["https://a.example/", "http://b.example/"]),
+    ] {
+        assert!(
+            redirect_decision(&previous, &next).is_err(),
+            "{previous:?} -> http must be rejected"
+        );
+    }
+    let allowed = [
+        (urls(&["http://a.example/"]), "http://b.example/"),
+        (urls(&["http://a.example/"]), "https://b.example/"),
+        (urls(&["https://a.example/"]), "https://b.example/"),
+    ];
+    for (previous, next) in allowed {
+        let next = Url::parse(next).unwrap();
+        assert!(
+            redirect_decision(&previous, &next).is_ok(),
+            "{previous:?} -> {next} must be allowed"
+        );
+    }
+}
+
+#[test]
+fn redirect_policy_allows_ten_hops_and_rejects_the_eleventh() {
+    let next = Url::parse("http://next.example/").unwrap();
+    // `previous` always contains the original URL plus every hop already followed.
+    let after_hops = |hops: usize| vec![Url::parse("http://start.example/").unwrap(); hops + 1];
+    assert!(
+        redirect_decision(&after_hops(9), &next).is_ok(),
+        "10th hop must be allowed"
+    );
+    assert!(
+        redirect_decision(&after_hops(10), &next).is_err(),
+        "11th hop must be rejected"
+    );
+}
+
+#[test]
+fn redirect_policy_rejects_unsupported_schemes_and_userinfo() {
+    let previous = urls(&["http://a.example/"]);
+    for target in [
+        "file:///etc/passwd",
+        "ftp://b.example/file",
+        "http://user:pass@b.example/",
+        "https://user@b.example/",
+    ] {
+        let next = Url::parse(target).unwrap();
+        assert!(
+            redirect_decision(&previous, &next).is_err(),
+            "{target} must be rejected"
+        );
+    }
+}
+
+fn chain_handler(hops: usize) -> impl Fn(String, SocketAddr) -> Vec<u8> + Send + Sync + 'static {
+    move |path, address| {
+        let n: usize = path.trim_start_matches('/').parse().unwrap_or(0);
+        if n < hops {
+            response(
+                "302 Found",
+                &format!(
+                    "Location: http://{address}/{}\r\nContent-Length: 0\r\nConnection: close\r\n",
+                    n + 1
+                ),
+                b"",
+            )
+        } else {
+            response(
+                "200 OK",
+                "Content-Length: 4\r\nConnection: close\r\n",
+                b"done",
+            )
+        }
+    }
+}
+
+#[tokio::test]
+async fn follows_ten_redirects_end_to_end() {
+    let (address, _hits, server) = serve_loop(chain_handler(10)).await;
+    let dir = TestDir::new();
+    let target = dir.path().join("ten.bin");
+    let result = DownloadEngine::new()
+        .unwrap()
+        .download(&format!("http://{address}/0"), &target)
+        .await;
+    server.abort();
+    result.expect("a chain of exactly ten redirects is within the cap");
+    assert_eq!(fs::read(&target).unwrap(), b"done");
+}
+
+#[tokio::test]
+async fn rejects_eleven_redirects_and_loops_end_to_end() {
+    for hops in [11, usize::MAX] {
+        let (address, _hits, server) = serve_loop(chain_handler(hops)).await;
+        let dir = TestDir::new();
+        let target = dir.path().join("too-many.bin");
+        let error = DownloadEngine::new()
+            .unwrap()
+            .download(&format!("http://{address}/0"), &target)
+            .await
+            .unwrap_err();
+        server.abort();
+        assert!(
+            matches!(error, DownloadError::RedirectRejected),
+            "hops={hops}: got {error:?}"
+        );
+        assert!(!target.exists());
+        assert_eq!(entry_count(&dir), 0);
+    }
+}
+
+#[tokio::test]
+async fn redirect_to_unsupported_scheme_fails_without_saving_anything() {
+    // The redirect policy rejects schemes outside HTTP(S) before another
+    // request can be sent.
+    for location in ["file:///etc/passwd", "ftp://127.0.0.1/file"] {
+        let (url, server) = serve_once(response(
+            "302 Found",
+            &format!("Location: {location}\r\nContent-Length: 0\r\nConnection: close\r\n"),
+            b"",
+        ))
+        .await;
+        let dir = TestDir::new();
+        let target = dir.path().join("scheme.bin");
+        let result = DownloadEngine::new().unwrap().download(&url, &target).await;
+        server.await.unwrap();
+        assert!(
+            matches!(result, Err(DownloadError::RedirectRejected)),
+            "{location}: got {result:?}"
+        );
+        assert!(!target.exists());
+        assert_eq!(entry_count(&dir), 0);
+    }
+}
+
+#[tokio::test]
+async fn redirect_target_with_userinfo_is_never_contacted() {
+    let (address, hits, server) = serve_loop(|path, address| {
+        if path == "/start" {
+            response(
+                "302 Found",
+                &format!(
+                    "Location: http://user:secret@{address}/final\r\nContent-Length: 0\r\nConnection: close\r\n"
+                ),
+                b"",
+            )
+        } else {
+            response("200 OK", "Content-Length: 4\r\nConnection: close\r\n", b"leak")
+        }
+    })
+    .await;
+    let dir = TestDir::new();
+    let target = dir.path().join("userinfo.bin");
+    let result = DownloadEngine::new()
+        .unwrap()
+        .download(&format!("http://{address}/start"), &target)
+        .await;
+    server.abort();
+    assert!(
+        matches!(result, Err(DownloadError::RedirectRejected)),
+        "got {result:?}"
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "credentialed target was contacted"
+    );
+    assert!(!target.exists());
+    assert_eq!(entry_count(&dir), 0);
+}
+
+// ----- timeouts and network failures -----------------------------------------
+
+#[tokio::test]
+async fn connection_refused_is_a_network_failure_and_leaves_nothing_behind() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener); // nothing listens on this port any more
+    let dir = TestDir::new();
+    let target = dir.path().join("refused.bin");
+    let error = DownloadEngine::new()
+        .unwrap()
+        .download(&format!("http://{address}/file"), &target)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            DownloadError::NetworkFailure(NetworkFailureKind::RequestOrBody)
+        ),
+        "got {error:?}"
+    );
+    assert!(!target.exists());
+    assert_eq!(entry_count(&dir), 0);
+}
+
+#[tokio::test]
+async fn server_that_never_sends_headers_times_out() {
+    let (url, server) = serve_with(|mut stream| async move {
+        read_request(&mut stream).await;
+        std::future::pending::<()>().await;
+    })
+    .await;
+    let dir = TestDir::new();
+    let target = dir.path().join("no-headers.bin");
+    let engine = test_engine(200, 3_600_000);
+    let result = download_within(&engine, &url, &target, Duration::from_secs(5)).await;
+    server.abort();
+    assert!(
+        matches!(
+            result,
+            Err(DownloadError::NetworkFailure(NetworkFailureKind::Timeout))
+        ),
+        "got {result:?}"
+    );
+    assert!(!target.exists());
+    assert_eq!(entry_count(&dir), 0);
+}
+
+async fn serve_partial_then_stall() -> (String, JoinHandle<()>, oneshot::Receiver<()>) {
+    let (response_sent_tx, response_sent_rx) = oneshot::channel();
+    let (url, server) = serve_with(move |mut stream| async move {
+        read_request(&mut stream).await;
+        let head = response(
+            "200 OK",
+            "Content-Length: 100\r\nConnection: close\r\n",
+            b"short",
+        );
+        stream.write_all(&head).await.unwrap();
+        let _ = response_sent_tx.send(());
+        std::future::pending::<()>().await;
+    })
+    .await;
+    (url, server, response_sent_rx)
+}
+
+#[tokio::test]
+async fn stalled_body_hits_the_read_inactivity_timeout() {
+    let (url, server, response_sent) = serve_partial_then_stall().await;
+    let dir = TestDir::new();
+    let target = dir.path().join("stalled.bin");
+    let engine = test_engine(200, 3_600_000);
+    let result = download_within(&engine, &url, &target, Duration::from_secs(5)).await;
+    response_sent.await.unwrap();
+    server.abort();
+    assert!(
+        matches!(result, Err(DownloadError::BodyInactivityTimeout)),
+        "got {result:?}"
+    );
+    assert!(!target.exists());
+    assert_eq!(entry_count(&dir), 0);
+}
+
+#[tokio::test]
+async fn job_deadline_during_body_is_reported_as_a_timeout() {
+    let (url, server, response_sent) = serve_partial_then_stall().await;
+    let dir = TestDir::new();
+    let target = dir.path().join("deadline.bin");
+    let engine = test_engine(3_600_000, 300);
+    let result = download_within(&engine, &url, &target, Duration::from_secs(5)).await;
+    response_sent.await.unwrap();
+    server.abort();
+    assert!(
+        matches!(
+            result,
+            Err(DownloadError::NetworkFailure(NetworkFailureKind::Timeout))
+        ),
+        "a deadline expiry must not be reported as a short body: {result:?}"
+    );
+    assert_eq!(entry_count(&dir), 0);
+}
+
+#[tokio::test]
+async fn slow_but_steady_body_is_not_cut_off_by_the_inactivity_timeout() {
+    let (url, server) = serve_with(|mut stream| async move {
+        read_request(&mut stream).await;
+        let head = response("200 OK", "Content-Length: 9\r\nConnection: close\r\n", b"");
+        let _ = stream.write_all(&head).await;
+        for part in [b"abc", b"def", b"ghi"] {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let _ = stream.write_all(part).await;
+            let _ = stream.flush().await;
+        }
+        let _ = stream.shutdown().await;
+    })
+    .await;
+    let dir = TestDir::new();
+    let target = dir.path().join("slow.bin");
+    // Total transfer (~450 ms) exceeds the inactivity limit; each gap does not.
+    let engine = test_engine(1_000, 3_600_000);
+    download_within(&engine, &url, &target, Duration::from_secs(10))
+        .await
+        .unwrap();
+    server.await.unwrap();
+    assert_eq!(fs::read(&target).unwrap(), b"abcdefghi");
+}
+
+// ----- cleanup, drop, and destination races ----------------------------------
+
+#[test]
+fn cleanup_failure_reports_both_the_cleanup_error_and_the_original_error() {
+    let dir = TestDir::new();
+    let not_a_file = dir.path().join("a-directory");
+    fs::create_dir(&not_a_file).unwrap();
+    // remove_file on a directory fails with an error other than NotFound.
+    let error = cleanup_or_original(&not_a_file, DownloadError::DestinationConflict);
+    match error {
+        DownloadError::CleanupFailure { path, original, .. } => {
+            assert_eq!(path, not_a_file);
+            assert!(matches!(*original, DownloadError::DestinationConflict));
+        }
+        other => panic!("expected CleanupFailure, got {other:?}"),
+    }
+}
+
+#[test]
+fn cleanup_of_an_already_missing_file_returns_the_original_error() {
+    let dir = TestDir::new();
+    let error = cleanup_or_original(&dir.path().join("gone"), DownloadError::InvalidResponse);
+    assert!(matches!(error, DownloadError::InvalidResponse));
+}
+
+#[test]
+fn opened_temp_closes_and_removes_file_when_abandoned() {
+    let dir = TestDir::new();
+    let path = dir.path().join("abandoned.part");
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    let opened = OpenedTemp {
+        file: Some(file),
+        guard: Some(TempGuard::new(path.clone())),
+    };
+    drop(opened);
+    assert!(!path.exists());
+}
+
+#[test]
+fn temporary_candidate_never_aliases_the_requested_destination() {
+    let dir = TestDir::new();
+    let destination = dir.path().join(".consolex-123-4.part");
+    assert_eq!(
+        temp_candidate(dir.path(), &destination, 123, 4),
+        None,
+        "a caller-selected path must not be used as its own temporary file"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_promotion_moves_without_replacing_an_existing_destination() {
+    let dir = TestDir::new();
+    let destination = dir.path().join("final.bin");
+    let first_temp = dir.path().join("first.part");
+    fs::write(&first_temp, b"first payload").unwrap();
+
+    promote_no_replace(&first_temp, &destination).unwrap();
+    assert_eq!(fs::read(&destination).unwrap(), b"first payload");
+    assert!(!first_temp.exists());
+
+    let second_temp = dir.path().join("second.part");
+    fs::write(&second_temp, b"replacement payload").unwrap();
+    fs::write(&destination, b"preserved payload").unwrap();
+    let error = promote_no_replace(&second_temp, &destination).unwrap_err();
+    assert!(matches!(error, DownloadError::DestinationConflict));
+    assert_eq!(fs::read(&destination).unwrap(), b"preserved payload");
+    assert_eq!(fs::read(&second_temp).unwrap(), b"replacement payload");
+}
+
+#[tokio::test]
+async fn dropping_the_download_future_removes_the_temporary_file() {
+    let (url, server, response_sent) = serve_partial_then_stall().await;
+    let dir = TestDir::new();
+    let target = dir.path().join("dropped.bin");
+    let engine = DownloadEngine::new().unwrap();
+    let task = {
+        let engine = engine.clone();
+        let url = url.clone();
+        let target = target.clone();
+        tokio::spawn(async move { engine.download(&url, target).await })
+    };
+
+    // The server received the request and sent an incomplete response; the
+    // temporary file must exist before aborting the active transfer.
+    response_sent.await.unwrap();
+    assert_eq!(entry_count(&dir), 1, "temporary file was not created");
+
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    server.abort();
+
+    assert_eq!(entry_count(&dir), 0, "temporary file leaked after drop");
+    assert!(!target.exists());
+
+    // The in-process reservation must be released as well.
+    let (url, server) = serve_once(response(
+        "200 OK",
+        "Content-Length: 2\r\nConnection: close\r\n",
+        b"ok",
+    ))
+    .await;
+    engine.download(&url, &target).await.unwrap();
+    server.await.unwrap();
+    assert_eq!(fs::read(&target).unwrap(), b"ok");
+}
+
+/// Serve 5 of 10 bytes, wait for `release`, then send the rest.
+async fn serve_gated() -> (
+    String,
+    JoinHandle<()>,
+    oneshot::Receiver<()>,
+    oneshot::Sender<()>,
+) {
+    let (started_tx, started_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let (url, server) = serve_with(|mut stream| async move {
+        read_request(&mut stream).await;
+        let head = response(
+            "200 OK",
+            "Content-Length: 10\r\nConnection: close\r\n",
+            b"01234",
+        );
+        stream.write_all(&head).await.unwrap();
+        let _ = started_tx.send(());
+        let _ = release_rx.await;
+        stream.write_all(b"56789").await.unwrap();
+        let _ = stream.shutdown().await;
+    })
+    .await;
+    (url, server, started_rx, release_tx)
+}
+
+#[tokio::test]
+async fn destination_created_during_transfer_is_preserved_and_temp_removed() {
+    let (url, server, started, release) = serve_gated().await;
+    let dir = TestDir::new();
+    let target = dir.path().join("raced.bin");
+    let task = {
+        let url = url.clone();
+        let target = target.clone();
+        tokio::spawn(async move { DownloadEngine::new().unwrap().download(&url, target).await })
+    };
+    started.await.unwrap();
+    fs::write(&target, b"external").unwrap(); // appears after validation
+    release.send(()).unwrap();
+    let error = task.await.unwrap().unwrap_err();
+    server.await.unwrap();
+    assert!(
+        matches!(error, DownloadError::DestinationConflict),
+        "got {error:?}"
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"external");
+    assert_eq!(entry_count(&dir), 1, "temporary file was not cleaned up");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dangling_symlink_destination_is_never_followed() {
+    let dir = TestDir::new();
+    let victim = dir.path().join("victim.bin");
+    let target = dir.path().join("link.bin");
+    std::os::unix::fs::symlink(&victim, &target).unwrap();
+    let error = DownloadEngine::new()
+        .unwrap()
+        .download("http://127.0.0.1:1/file", &target)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, DownloadError::DestinationConflict));
+    assert!(!victim.exists(), "symlink target must not be created");
+    assert!(fs::symlink_metadata(&target)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(entry_count(&dir), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlink_created_during_transfer_is_not_followed() {
+    let (url, server, started, release) = serve_gated().await;
+    let dir = TestDir::new();
+    let victim = dir.path().join("victim.bin");
+    let target = dir.path().join("raced-link.bin");
+    let task = {
+        let url = url.clone();
+        let target = target.clone();
+        tokio::spawn(async move { DownloadEngine::new().unwrap().download(&url, target).await })
+    };
+    started.await.unwrap();
+    std::os::unix::fs::symlink(&victim, &target).unwrap();
+    release.send(()).unwrap();
+    let error = task.await.unwrap().unwrap_err();
+    server.await.unwrap();
+    assert!(
+        matches!(error, DownloadError::DestinationConflict),
+        "got {error:?}"
+    );
+    assert!(!victim.exists(), "symlink target must not be created");
+    assert_eq!(entry_count(&dir), 1, "only the racing symlink may remain");
+}
+
+#[tokio::test]
+async fn concurrent_downloads_to_distinct_destinations_do_not_share_temp_files() {
+    let (address, _hits, server) = serve_loop(|path, _| {
+        let n: u8 = path.trim_start_matches('/').parse().unwrap_or(0);
+        let body = vec![n; 64 * 1024];
+        response(
+            "200 OK",
+            &format!("Content-Length: {}\r\nConnection: close\r\n", body.len()),
+            &body,
+        )
+    })
+    .await;
+    let dir = TestDir::new();
+    let engine = DownloadEngine::new().unwrap();
+    let mut tasks = Vec::new();
+    for n in 0_u8..8 {
+        let engine = engine.clone();
+        let url = format!("http://{address}/{n}");
+        let target = dir.path().join(format!("file-{n}.bin"));
+        tasks.push(tokio::spawn(
+            async move { engine.download(&url, target).await },
+        ));
+    }
+    for task in tasks {
+        task.await.unwrap().unwrap();
+    }
+    server.abort();
+    for n in 0_u8..8 {
+        let bytes = fs::read(dir.path().join(format!("file-{n}.bin"))).unwrap();
+        assert_eq!(bytes, vec![n; 64 * 1024], "file {n} has wrong content");
+    }
+    assert_eq!(entry_count(&dir), 8, "unexpected leftover temp files");
+}
+
+#[tokio::test]
+async fn different_spellings_of_one_destination_still_conflict() {
+    let (address, _hits, server) = serve_loop(|_, _| {
+        response(
+            "200 OK",
+            "Content-Length: 4\r\nConnection: close\r\n",
+            b"data",
+        )
+    })
+    .await;
+    let dir = TestDir::new();
+    let url = format!("http://{address}/file");
+    let engine = DownloadEngine::new().unwrap();
+    let plain = dir.path().join("same.bin");
+    let dotted = dir.path().join(".").join("same.bin");
+    let first = {
+        let (engine, url) = (engine.clone(), url.clone());
+        tokio::spawn(async move { engine.download(&url, plain).await })
+    };
+    let second = {
+        let (engine, url) = (engine.clone(), url.clone());
+        tokio::spawn(async move { engine.download(&url, dotted).await })
+    };
+    let results = [first.await.unwrap(), second.await.unwrap()];
+    server.abort();
+    let ok = results.iter().filter(|r| r.is_ok()).count();
+    let conflicts = results
+        .iter()
+        .filter(|r| matches!(r, Err(DownloadError::DestinationConflict)))
+        .count();
+    assert_eq!((ok, conflicts), (1, 1), "results: {results:?}");
+    assert_eq!(fs::read(dir.path().join("same.bin")).unwrap(), b"data");
+    assert_eq!(entry_count(&dir), 1);
+}
+
+#[tokio::test]
+async fn rejects_transfer_coding_other_than_chunked() {
+    // hyper de-frames `chunked` only; a leading `gzip` coding would be saved still encoded.
+    let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\nConnection: close\r\n\r\n\
+                5\r\nhello\r\n0\r\n\r\n"
+        .to_vec();
+    let (url, server) = serve_once(raw).await;
+    let dir = TestDir::new();
+    let target = dir.path().join("te-gzip.bin");
+    let result = DownloadEngine::new().unwrap().download(&url, &target).await;
+    server.await.unwrap();
+    assert!(
+        matches!(result, Err(DownloadError::InvalidResponse)),
+        "got {result:?}"
+    );
+    assert!(!target.exists());
+    assert_eq!(entry_count(&dir), 0);
+}
+
+#[test]
+fn transfer_encoding_accepts_only_one_chunked_coding_without_content_length() {
+    let mut headers = HeaderMap::new();
+    assert!(validate_transfer_encoding(&headers).is_ok());
+
+    headers.append(TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
+    assert!(validate_transfer_encoding(&headers).is_ok());
+    headers.append(TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
+    assert!(matches!(
+        validate_transfer_encoding(&headers),
+        Err(DownloadError::InvalidResponse)
+    ));
 }

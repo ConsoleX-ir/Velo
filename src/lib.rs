@@ -22,6 +22,12 @@ use url::Url;
 
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest allowed wait for response headers, and for each subsequent body read.
+const READ_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
+const JOB_DEADLINE: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_REDIRECTS: usize = 10;
+
 /// Minimal lifecycle states exposed by this first engine increment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DownloadState {
@@ -98,33 +104,37 @@ pub enum NetworkFailureKind {
 pub struct DownloadEngine {
     client: reqwest::Client,
     reservations: Arc<Mutex<HashSet<PathBuf>>>,
+    read_inactivity: Duration,
 }
 
 impl DownloadEngine {
     pub fn new() -> Result<Self, DownloadError> {
+        Self::with_timeouts(CONNECT_TIMEOUT, READ_INACTIVITY_TIMEOUT, JOB_DEADLINE)
+    }
+
+    /// Construct with explicit timeouts so tests can use short, deterministic values.
+    fn with_timeouts(
+        connect: Duration,
+        read_inactivity: Duration,
+        deadline: Duration,
+    ) -> Result<Self, DownloadError> {
         let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(24 * 60 * 60))
+            .connect_timeout(connect)
+            .timeout(deadline)
             .referer(false)
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                if attempt.previous().len() >= 10 {
-                    return attempt.error("redirect limit exceeded");
-                }
-                if attempt
-                    .previous()
-                    .iter()
-                    .any(|url| url.scheme() == "https" && attempt.url().scheme() == "http")
-                {
-                    return attempt.error("HTTPS downgrade redirect rejected");
-                }
-                attempt.follow()
-            }))
+            .redirect(reqwest::redirect::Policy::custom(
+                |attempt| match redirect_decision(attempt.previous(), attempt.url()) {
+                    Ok(()) => attempt.follow(),
+                    Err(reason) => attempt.error(reason),
+                },
+            ))
             .build()
             .map_err(|_| DownloadError::ClientInitialization)?;
 
         Ok(Self {
             client,
             reservations: Arc::new(Mutex::new(HashSet::new())),
+            read_inactivity,
         })
     }
 
@@ -205,13 +215,17 @@ impl DownloadEngine {
         url: Url,
         destination: PathBuf,
     ) -> Result<DownloadResult, DownloadError> {
-        let (temp_path, mut file) = create_temp(&destination).await?;
+        let (temp_path, mut guard, file) = create_temp(&destination).await?;
+        // Rebound after the guard so the handle is closed before the guard
+        // (declared earlier, dropped later) removes the file.
+        let mut file = file;
         let attempt = self.transfer(&url, &temp_path, &mut file).await;
 
         let bytes_written = match attempt {
             Ok(bytes) => bytes,
             Err(original) => {
                 drop(file);
+                guard.disarm();
                 return Err(cleanup_or_original(&temp_path, original));
             }
         };
@@ -235,11 +249,16 @@ impl DownloadEngine {
         .await;
         if let Err(original) = finalization {
             drop(file);
+            guard.disarm();
             return Err(cleanup_or_original(&temp_path, original));
         }
         drop(file);
 
-        if let Err(original) = promote_no_replace(&temp_path, &destination) {
+        // No `.await` sits between promotion and disarming, so the future cannot
+        // be dropped in between.
+        let promoted = promote_no_replace(&temp_path, &destination);
+        guard.disarm();
+        if let Err(original) = promoted {
             return Err(cleanup_or_original(&temp_path, original));
         }
         Ok(DownloadResult {
@@ -255,7 +274,19 @@ impl DownloadEngine {
         temp_path: &Path,
         file: &mut tokio::fs::File,
     ) -> Result<u64, DownloadError> {
-        let response = self.client.get(url.clone()).send().await.map_err(|error| {
+        // The wait for response headers is bounded by the same inactivity limit
+        // as body reads; otherwise a silent server would only be cut off by the
+        // 24 h job deadline while holding the destination reservation.
+        let response = timeout(
+            self.read_inactivity,
+            self.client
+                .get(url.clone())
+                .header(reqwest::header::ACCEPT_ENCODING, "identity")
+                .send(),
+        )
+        .await
+        .map_err(|_| DownloadError::NetworkFailure(NetworkFailureKind::Timeout))?
+        .map_err(|error| {
             if error.is_redirect() {
                 DownloadError::RedirectRejected
             } else {
@@ -268,6 +299,13 @@ impl DownloadEngine {
         })?;
         let status = response.status();
         if status != reqwest::StatusCode::OK {
+            // Reqwest only applies the redirect policy to targets it knows how
+            // to follow. An unsupported Location (for example file: or ftp:)
+            // can therefore arrive here as an ordinary 3xx response.
+            if status.is_redirection() && response.headers().contains_key(reqwest::header::LOCATION)
+            {
+                return Err(DownloadError::RedirectRejected);
+            }
             return Err(DownloadError::HttpStatus(status.as_u16()));
         }
 
@@ -275,7 +313,8 @@ impl DownloadEngine {
         if headers.get(reqwest::header::CONTENT_RANGE).is_some() {
             return Err(DownloadError::InvalidResponse);
         }
-        if let Some(encoding) = headers.get(reqwest::header::CONTENT_ENCODING) {
+        // Inspect every header value: `get` would only see the first one.
+        for encoding in headers.get_all(reqwest::header::CONTENT_ENCODING) {
             let encoding = encoding
                 .to_str()
                 .map_err(|_| DownloadError::InvalidResponse)?;
@@ -283,29 +322,36 @@ impl DownloadEngine {
                 return Err(DownloadError::InvalidResponse);
             }
         }
+        // The HTTP client only de-frames one `chunked` coding; other coding
+        // sequences would be written to disk still encoded. Reject ambiguous
+        // or repeated transfer codings.
+        validate_transfer_encoding(headers)?;
         let expected = parse_content_length(headers)?;
         let mut written = 0_u64;
         let mut response = response;
 
         loop {
-            let next = timeout(Duration::from_secs(30), response.chunk())
+            let next = timeout(self.read_inactivity, response.chunk())
                 .await
                 .map_err(|_| DownloadError::BodyInactivityTimeout)?;
             let chunk = match next {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break,
                 Err(error) => {
+                    // A deadline expiry is a timeout even when a declared length
+                    // was not reached; only other failures are "short body".
+                    if error.is_timeout() {
+                        return Err(DownloadError::NetworkFailure(NetworkFailureKind::Timeout));
+                    }
                     if let Some(expected) = expected.filter(|expected| *expected > written) {
                         return Err(DownloadError::IncompleteResponse {
                             expected,
                             received: written,
                         });
                     }
-                    return Err(DownloadError::NetworkFailure(if error.is_timeout() {
-                        NetworkFailureKind::Timeout
-                    } else {
-                        NetworkFailureKind::RequestOrBody
-                    }));
+                    return Err(DownloadError::NetworkFailure(
+                        NetworkFailureKind::RequestOrBody,
+                    ));
                 }
             };
 
@@ -336,6 +382,33 @@ impl DownloadEngine {
     }
 }
 
+/// Removes the temporary file if the download future is dropped (task abort,
+/// an enclosing `timeout`, `select!`) before an explicit success or failure path
+/// has taken over. Those paths disarm it after doing their own, error-reporting
+/// cleanup or promotion.
+struct TempGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TempGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TempGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 struct Reservation {
     reservations: Arc<Mutex<HashSet<PathBuf>>>,
     target: PathBuf,
@@ -349,13 +422,36 @@ impl Drop for Reservation {
     }
 }
 
+/// Pure redirect policy. `previous` holds the original request URL plus every
+/// hop already followed, so `previous.len() == hops_followed + 1`. Up to
+/// `MAX_REDIRECTS` hops are followed; the next one is rejected.
+fn redirect_decision(previous: &[Url], next: &Url) -> Result<(), &'static str> {
+    if previous.len() > MAX_REDIRECTS {
+        return Err("redirect limit exceeded");
+    }
+    if !is_allowed_target(next) {
+        return Err("redirect target must be HTTP(S) without credentials");
+    }
+    if previous
+        .iter()
+        .any(|url| url.scheme() == "https" && next.scheme() == "http")
+    {
+        return Err("HTTPS downgrade redirect rejected");
+    }
+    Ok(())
+}
+
+/// Shared by the initial URL check and the redirect policy.
+fn is_allowed_target(url: &Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+}
+
 fn validate_url(raw: &str) -> Result<Url, DownloadError> {
     let url = Url::parse(raw).map_err(|_| DownloadError::InvalidUrl)?;
-    if !matches!(url.scheme(), "http" | "https")
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-    {
+    if !is_allowed_target(&url) {
         return Err(DownloadError::InvalidUrl);
     }
     Ok(url)
@@ -383,18 +479,56 @@ fn parse_content_length(
     }
 }
 
-async fn create_temp(destination: &Path) -> Result<(PathBuf, tokio::fs::File), DownloadError> {
+fn validate_transfer_encoding(headers: &reqwest::header::HeaderMap) -> Result<(), DownloadError> {
+    let values: Vec<_> = headers
+        .get_all(reqwest::header::TRANSFER_ENCODING)
+        .iter()
+        .collect();
+    match values.as_slice() {
+        [] => Ok(()),
+        [value] => {
+            let coding = value.to_str().map_err(|_| DownloadError::InvalidResponse)?;
+            if coding.trim().eq_ignore_ascii_case("chunked") {
+                Ok(())
+            } else {
+                Err(DownloadError::InvalidResponse)
+            }
+        }
+        _ => Err(DownloadError::InvalidResponse),
+    }
+}
+
+async fn create_temp(
+    destination: &Path,
+) -> Result<(PathBuf, TempGuard, tokio::fs::File), DownloadError> {
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     for _ in 0..128 {
         let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let temp_path = parent.join(format!(".consolex-{}-{id}.part", std::process::id()));
-        match tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-            .await
-        {
-            Ok(file) => return Ok((temp_path, file)),
+        let Some(temp_path) = temp_candidate(parent, destination, std::process::id(), id) else {
+            continue;
+        };
+        let open_path = temp_path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&open_path)
+                .map(|file| OpenedTemp {
+                    file: Some(file),
+                    guard: Some(TempGuard::new(open_path)),
+                })
+        })
+        .await
+        .map_err(|error| DownloadError::Filesystem {
+            operation: "create exclusive temporary file",
+            path: temp_path.clone(),
+            source: io::Error::other(error.to_string()),
+        })?;
+        match result {
+            Ok(created) => {
+                let (file, guard) = created.into_parts();
+                return Ok((temp_path, guard, tokio::fs::File::from_std(file)));
+            }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(source) => {
                 return Err(DownloadError::Filesystem {
@@ -413,6 +547,35 @@ async fn create_temp(destination: &Path) -> Result<(PathBuf, tokio::fs::File), D
             "temporary name attempts exhausted",
         ),
     })
+}
+
+fn temp_candidate(parent: &Path, destination: &Path, pid: u32, id: u64) -> Option<PathBuf> {
+    let candidate = parent.join(format!(".consolex-{pid}-{id}.part"));
+    (candidate != destination).then_some(candidate)
+}
+
+/// Keeps the file and cleanup guard together while an async task is waiting
+/// for the blocking exclusive-open operation to finish. If that task is
+/// abandoned, the file is closed before the guard removes its path.
+struct OpenedTemp {
+    file: Option<fs::File>,
+    guard: Option<TempGuard>,
+}
+
+impl OpenedTemp {
+    fn into_parts(mut self) -> (fs::File, TempGuard) {
+        (
+            self.file.take().expect("opened temp file is present"),
+            self.guard.take().expect("temp cleanup guard is present"),
+        )
+    }
+}
+
+impl Drop for OpenedTemp {
+    fn drop(&mut self) {
+        // The guard field drops after this method, so close before removing.
+        drop(self.file.take());
+    }
 }
 
 fn cleanup_or_original(path: &Path, original: DownloadError) -> DownloadError {
@@ -443,7 +606,9 @@ fn promote_no_replace(temp: &Path, destination: &Path) -> Result<(), DownloadErr
     if source[..source.len() - 1].contains(&0) || target[..target.len() - 1].contains(&0) {
         return Err(DownloadError::InvalidDestination(destination.to_path_buf()));
     }
-    // MoveFileW is same-volume and fails if the target already exists.
+    // UNVERIFIED on Windows (needs Windows CI): the same-directory temporary
+    // file should make this a same-volume move, and MoveFileW should fail when
+    // the destination name already exists instead of replacing it.
     let result = unsafe { MoveFileW(source.as_ptr(), target.as_ptr()) };
     if result != 0 {
         Ok(())
