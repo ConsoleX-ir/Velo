@@ -1,7 +1,13 @@
 # Download Engine Design
 
-**Status:** Phase 0 contract for Phase 1  
+**Status:** Phase 0 contract; partial Phase 1A implementation
 **Research checked:** 2026-10-21
+
+## Current implementation boundary
+
+The repository now contains a standalone Rust library implementing the first Phase 1A transfer slice (`src/lib.rs`). It performs one streamed HTTP/HTTPS GET, accepts only status 200 with identity content encoding, checks `Content-Length` when present, writes an exclusively-created sibling temporary file, reserves destinations within one engine instance, and promotes without replacing an existing target. Loopback tests cover successful and empty files, destination conflicts, HTTP errors, truncation, invalid schemes, response encoding, and concurrent same-destination calls.
+
+This slice does not yet implement the full state machine above: there is no accepted-job registry, progress delivery, cancellation API, retry policy, UI bridge, persistence, or crash recovery. `DownloadState` is a minimal value for the current transfer result; terminal errors are returned as typed `DownloadError` values. Provisional timing, admission, and event limits in this design remain planning defaults and are not implemented or benchmark-validated. Windows-specific no-replace promotion is implemented with `MoveFileW`, but this workspace has not been built or tested with the Windows MSVC toolchain, so that guarantee still requires Windows CI verification.
 
 ## Scope and non-goals
 

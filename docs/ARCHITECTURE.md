@@ -3,6 +3,8 @@
 **Status:** Phase 0 baseline  
 **Research checked:** 2026-10-21
 
+**Implementation update (2026-10-21):** A root-level, Tauri-independent Rust download library now provides the initial Phase 1A single-transfer path. The application service, job registry, bounded progress channel, cancellation/retry orchestration, frontend, and Tauri shell remain planned and are not present yet. See `DOWNLOAD_ENGINE_DESIGN.md` for the implemented boundary and unverified Windows-specific promotion behavior.
+
 ## Chosen stack
 
 - Desktop shell and native/webview bridge: Tauri 2.
