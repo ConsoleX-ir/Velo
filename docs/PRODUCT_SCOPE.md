@@ -15,6 +15,7 @@ Included:
 
 - HTTP and HTTPS GET for valid `http`/`https` URLs.
 - Destination validation, collision-safe output creation, safe filename derivation when the caller requests a suggested name, and explicit error reporting.
+- Phase 1 is no-clobber only: an existing destination or a finalization-time collision is an error. There is no overwrite flag; a later overwrite feature needs its own explicit semantics.
 - Bounded redirect handling, response validation, streaming writes, byte accounting, cancellation, and bounded retries for classified transient failures.
 - Deterministic integration tests against an in-process/local HTTP server.
 
@@ -34,7 +35,7 @@ Excluded from Phase 1: complete UI, browser integration, BitTorrent, segmented o
 1. Initial distribution is a direct Windows download, likely an NSIS per-user installer; final choice depends on signing, update, and user-install requirements.
 2. Windows 10/11 x64 is the initial support target; exact minimum Windows version and ARM64 support remain open.
 3. Users choose their download destination. The application should not elevate privileges for ordinary downloads.
-4. Initial functionality is single-stream per download. A global concurrent-download limit is a later product decision.
+4. Initial functionality is single-stream per download, with provisional limits of 4 active jobs and 100 retained job records, including unacknowledged terminal records. Adaptive concurrency is deferred.
 
 ## Success criteria (to be measured, not asserted)
 
@@ -48,7 +49,8 @@ Excluded from Phase 1: complete UI, browser integration, BitTorrent, segmented o
 
 - Exact supported Windows versions and architectures.
 - Installer format, per-user versus per-machine install, signing identity, and WebView2 runtime distribution.
-- Whether downloads may overwrite an existing file (Phase 1 default: refuse unless an explicit overwrite option is supplied; never truncate before validation).
+- Whether a later phase should offer an explicit overwrite workflow; Phase 1 does not overwrite.
 - Whether HTTP URLs are allowed, and whether HTTPS-to-HTTP redirects are rejected (Phase 1 decision: reject downgrade redirects).
 - Product name, publisher identity, icon, localization, and accessibility requirements.
+- Whether manually entered URLs may target loopback/private-network addresses; decide before browser integration or background URL ingestion.
 - Later-phase pause/resume policy, including how partial files and changed remote entities are handled.

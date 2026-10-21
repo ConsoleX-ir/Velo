@@ -32,13 +32,15 @@ Assume URLs, redirect targets, headers, content-disposition names, response bodi
 - Do not pass authorization/cookie headers in Phase 1. If authentication is added later, define redirect origin rules and secret storage first.
 - Validate TLS certificates/hostnames using the selected TLS backend defaults; do not provide an “accept invalid certificates” mode in initial release.
 - Do not perform arbitrary URL preflight/DNS fetches that could create SSRF-like behavior; the user is explicitly requesting the URL, but local/private-network access policy still requires a product decision.
+- Whether a manually entered user URL may target loopback/private-network addresses remains a product policy decision; resolve it before browser/link interception or background URL ingestion is added.
 
 ### Filesystem
 
 - Require an explicit destination selected/provided by the user; no silent overwrite.
-- Create a private random temp sibling exclusively; write then finalize/rename only after validation. Preserve existing final files on all failed/cancelled attempts.
+- Phase 1 does not support overwrite. Reject an existing final file and preserve it on any transfer failure or accepted cancellation. Re-check atomically during final promotion; fail without replacing if another process creates the path.
+- Create a random sibling temp file with exclusive create. Promote only after validation through a same-volume no-replace operation; Rust `std::fs::rename` may replace the destination on supported platforms and is not sufficient by itself for this policy.
 - Sanitize suggested names to a basename and handle Windows reserved names, separators, control characters, trailing dots/spaces, and collisions.
-- Avoid following unexpected reparse points; test path races and junction/symlink behavior on Windows.
+- Canonicalize the existing parent and reserve canonical case-insensitive destination keys in-process. Detect/reject reparse-point path components where possible; parent canonicalization alone does not eliminate a path race. Windows handle-based checks and junction/symlink tests are a release gate.
 - Do not execute downloaded files or inspect their content beyond optional later checksum verification.
 
 ### Data and diagnostics

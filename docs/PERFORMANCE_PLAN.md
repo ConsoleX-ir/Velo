@@ -5,7 +5,7 @@
 
 ## Targets versus evidence
 
-The approximately 100–130 MB Windows installer is a planning goal only. No package-size, startup, memory, CPU, throughput, or recovery benchmark has been run for this repository. Do not present estimates as results. The only current state is an empty workspace with no buildable application.
+The approximately 100–130 MB Windows installer is a planning goal only. No package-size, startup, memory, CPU, throughput, or failure-cleanup benchmark has been run for this repository. There is a Git repository containing planning documentation, but no buildable application. Do not present estimates as results.
 
 ## Reproducible baseline
 
@@ -17,11 +17,11 @@ For every release candidate, record commit, build profile, Rust/Node/Tauri versi
 | Installed footprint | Install in a clean VM, measure app files and separately account for shared WebView2/runtime files | App bytes and total incremental bytes |
 | Cold start | Reboot/clear file cache per documented protocol; launch to first usable window; instrument native start and first rendered-ready marker | Median/p90; exclude first-time runtime download separately |
 | Idle memory | At 1, 5, and 15 minutes after ready with no jobs; record process private working set and commit | Median/p90, background processes noted |
-| Active memory | Download fixed large fixture at 1, 4, and planned maximum concurrent jobs; sample at 1-second interval | Peak and steady-state private bytes; fixture size and duration |
-| CPU | Same concurrency and throughput scenarios; capture total process CPU and normalized CPU time | Average and p95 over steady state |
+| Active memory | Download fixed large fixture at 1 and the provisional maximum of 4 concurrent jobs; sample at 1-second interval | Peak and steady-state private bytes; fixture size and duration |
+| CPU | Same 1-job and 4-job concurrency and throughput scenarios; capture total process CPU and normalized CPU time | Average and p95 over steady state |
 | Throughput/correctness | Loopback controlled server and a separate controlled LAN server; fixed file sizes, latency, bandwidth, and concurrency; compare output hash/size | MiB/s, CPU, bytes, hash, errors; do not use public servers as baseline |
 | Progress overhead | Run identical transfer with progress disabled/minimal and configured events; measure CPU, wall time, number of emitted events, queue depth | Overhead %, event rate, max queue size |
-| Failure/recovery | Inject cancel at phases, reset connections, malformed/truncated body, full disk, app termination; for later recovery test relaunch | Time to terminal outcome, cleanup state, data integrity, recovered status |
+| Failure/cleanup | Inject cancel at phases, reset connections, malformed/truncated body, full disk, app termination | Time to terminal outcome, cleanup state, data integrity, orphan temp-file behavior; startup recovery is not claimed in Phase 1 |
 
 ## Acceptance thresholds
 

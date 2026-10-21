@@ -22,18 +22,19 @@ React + TypeScript
        └─ application service (validation, command authorization, orchestration)
             ├─ download engine (HTTP lifecycle, retries, streaming, cancellation)
             ├─ destination/file policy (path and collision rules)
-            └─ repository interface (in-memory in Phase 1; SQLite in a later phase)
+            └─ in-memory job registry (Phase 1; no database)
 ```
 
-The frontend does not open arbitrary filesystem paths or perform network requests directly. The Tauri command layer exposes explicit operations and DTOs; it does not expose generic shell, filesystem, or HTTP capabilities. The engine is a Rust library boundary independent of Tauri so it can be tested without a webview. A repository abstraction is not required in Phase 1 unless needed to keep orchestration testable; do not add an abstraction without a concrete consumer.
+The frontend does not open arbitrary filesystem paths or perform network requests directly. The Tauri command layer exposes explicit operations and DTOs; it does not expose generic shell, filesystem, or HTTP capabilities. The Phase 1 engine is a Rust library boundary independent of Tauri so it can be tested without a webview. No application-service, repository, workspace, or UI scaffold currently exists in the repository. A repository abstraction is not required in Phase 1 unless needed to keep orchestration testable; do not add one without a concrete consumer.
 
 ## State ownership and communication
 
 - The native core owns authoritative download lifecycle state and byte counters.
 - UI state is a projection of native snapshots/events and may be reconstructed; it is not durable truth.
-- Commands carry stable download IDs and validated request fields. Events are emitted only on meaningful changes or a configured progress interval/byte threshold.
-- Event queues must be bounded or coalescing. A slow UI must not cause unbounded memory growth or block response-body consumption.
+- Commands carry stable download IDs and validated request fields. State transitions are emitted immediately; ordinary progress is limited to at most 10 updates per second per job.
+- Progress is latest-value/coalesced, with at most one pending snapshot per job. Terminal outcome is immutable and separately retained in the job registry until acknowledged; it is not an ordinary event that a bounded queue can drop.
 - Phase 1 can use an in-memory registry and per-download task handle/token. Do not persist transient progress as if it guaranteed crash recovery.
+- Provisional scheduler cap: 4 active jobs and 100 retained job records, including terminal records not yet acknowledged; reject excess synchronously. Keep the fixed cap until benchmarks justify changing it; adaptive concurrency is deferred.
 
 ## Persistence model and later SQLite boundary
 
@@ -57,6 +58,8 @@ On normal application shutdown, stop accepting new work, request cancellation of
 - Do not log credentials, authorization/cookie headers, full sensitive URLs, or downloaded content.
 - Treat response headers, filenames, redirect targets, and remote error text as untrusted input.
 - The download engine should not accept arbitrary caller-supplied sensitive headers in Phase 1. If later supported, redirect policy must strip credentials/cookies on origin changes and block HTTPS-to-HTTP downgrade by default.
+- Phase 1 rejects existing final destinations and uses same-directory exclusive temp creation followed by an atomic same-volume no-replace promotion. Do not use `std::fs::rename` as the no-clobber operation on Windows: its documented behavior may replace an existing target. A direct, target-specific Windows API dependency may be justified for this narrow operation.
+- In-process path reservation prevents two jobs in one engine instance from claiming the same canonical destination. Atomic no-replace promotion handles cross-process/external races. Reparse points and path-component races require Windows-specific validation and remain a release gate until tested.
 
 ## Packaging assumptions
 
@@ -65,9 +68,9 @@ Windows x64 is the initial packaging target. Tauri currently documents MSI (WiX)
 ## Verified facts, decisions, assumptions
 
 - **Verified (official docs, checked 2026-10-21):** Tauri 2 supports a configured CSP and recommends avoiding remote scripts; Windows installers include MSI and NSIS options; Reqwest exposes streamed response bodies and configurable redirect policies; Tokio's filesystem API currently dispatches ordinary blocking file operations via its blocking pool; SQLite WAL uses companion files and has network-filesystem limitations.
-- **Decisions:** selected stack above; isolate engine from Tauri; authoritative lifecycle state in native code; no Phase 1 database; user-selected paths; no downgrade redirects.
+- **Decisions:** selected stack above; isolate engine from Tauri; authoritative lifecycle state in native code; no Phase 1 database; user-selected paths; no downgrade redirects; Phase 1 no-clobber output; cancellation is rejected once `Finalizing` begins; terminal results are retained separately from progress.
 - **Assumptions:** Windows 10/11 x64 first, single-stream transfer, direct distribution, and per-user installation are provisional.
-- **Unresolved:** exact crate versions/features, global concurrency limit, installer/runtime policy, support matrix, persistence schema, and resume protocol.
+- **Unresolved:** exact crate versions/features, whether to tune the provisional concurrency cap, installer/runtime policy, support matrix, persistence schema, and resume protocol.
 
 ## Official references
 
@@ -80,3 +83,5 @@ URLs were checked on 2026-10-21; versions can change. Pin and review versions wh
 - Reqwest redirect handling: https://docs.rs/reqwest/latest/reqwest/redirect/
 - Tokio filesystem behavior: https://docs.rs/tokio/latest/tokio/fs/index.html
 - SQLite WAL: https://www.sqlite.org/wal.html
+- Rust `std::fs::rename` behavior: https://doc.rust-lang.org/std/fs/fn.rename.html
+- Windows `MoveFileExW`: https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-movefileexw
