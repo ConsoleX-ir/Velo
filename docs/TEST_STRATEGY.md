@@ -1,11 +1,11 @@
 # Test Strategy
 
-**Status:** Phase 0 plan; no tests exist or have been run  
+**Status:** Phase 1A/1B test suite implemented; Windows validation passed 54 tests on 2026-10-21
 **Research checked:** 2026-10-21
 
 ## Phase 1 test layers
 
-1. **Unit tests:** URL validation, state transition legality, error classification, retry/backoff calculation with injected clock/jitter, filename sanitization, byte-counter overflow handling, progress coalescing.
+1. **Unit tests:** URL validation, response-header validation, partial-write accounting, cleanup error composition, progress coalescing, generation checks, and manager lifecycle behavior. Retry/backoff tests are deferred until retry implementation.
 2. **Engine integration tests:** use a loopback ephemeral-port HTTP server with scripted responses; no public internet. Compare output bytes directly so no hash dependency is needed for the fixture gate.
 3. **Filesystem integration tests:** temporary directories; exact bytes, collision behavior, failure cleanup, existing-file preservation, no-replace promotion, and finalization behavior.
 4. **Windows-specific tests:** reserved/device names, Unicode and long paths where supported, ACL/permission failure, junction/reparse-point cases, concurrent destination reservation, installer smoke test when packaging exists.
@@ -21,14 +21,15 @@
 | Redirect | valid same-origin, cross-origin, loop, over limit, HTTPS downgrade | bounded hops; policy enforced; no sensitive header leakage |
 | Incomplete | declared larger/smaller, connection reset mid-body | fail; do not promote; accurate partial-byte/cleanup result |
 | Cancellation | queued, connect, headers, body, backoff, race with finalization | accepted cancel yields Cancelled only after cleanup; cancel after Finalizing returns TooLate; exactly one terminal outcome |
-| Retry | transient failure then success, permanent failure, retry exhaustion, Retry-After | exact attempt count and delay policy; retries restart at byte zero |
+| Managed jobs | duplicate IDs, destination conflicts, retained capacity, FIFO order, configured concurrency, acknowledgement, stale handles | admission is atomic; retained capacity includes queued and terminal-unacknowledged records; stale generations cannot act on reused IDs |
+| Shutdown and worker failure | repeated/concurrent shutdown, queued cancellation, active cancellation, finalizing job, worker panic | admission closes once; no new dispatch after close; panic becomes one retained terminal failure; cleanup failure is preserved |
 | Destination | existing file, two jobs same path, external target created before promotion, invalid/sanitized name, disk write failure, cleanup failure | no unintended clobber; exactly one same-process reservation winner; deterministic error and cleanup path |
 | Progress | fast chunks, slow chunks, slow subscriber | state transitions immediate; ordinary updates ≤10/second/job; at most one pending snapshot/job; terminal result retained separately |
 
 ## Determinism and test hygiene
 
 - Bind only loopback and use ephemeral ports. Ensure server tasks and temp directories are shut down in cleanup, including on test failure.
-- Inject clock, jitter source, retry policy, and progress clock rather than sleeping for real backoff durations.
+- Use deterministic server gates and state inspection instead of timing-sensitive sleeps where practical. Retry-clock/jitter injection is deferred with retry implementation.
 - Assert state transitions as an allowed sequence, not timing-sensitive exact timestamps.
 - Avoid depending on public endpoints, DNS, external certificates, or uncontrolled bandwidth.
 - Use fixed byte fixtures and exact byte comparisons; do not add a digest dependency solely for test convenience.
@@ -38,8 +39,8 @@
 
 - Compare output byte-for-byte with 0-byte, 1 MiB, and 64 MiB fixtures; all successful cases must have exact expected length when known.
 - For a scripted sequence that ends in a terminal result, assert exactly one terminal result per accepted job. Rejected `start` requests are not jobs and receive a synchronous start error.
-- At an injected progress clock, assert no more than 10 ordinary progress snapshots per second per job; state transitions do not wait for that interval. Hold the progress subscriber stalled and assert one pending latest snapshot at most and a still-queryable terminal result.
-- For retry tests, use the provisional 3-attempt schedule with injected jitter and clock; assert attempts start at byte zero and attempt-local progress resets.
+- Assert progress snapshots coalesce to the latest value, ordinary updates are at most 10 per second/job, and state transitions publish immediately. A slow subscriber cannot block transfer or lose a separately queryable terminal result.
+- Each accepted Phase 1B job makes one attempt. Retries and retry timing have no Phase 1B acceptance criteria.
 - For every failure/cancellation test, assert an existing final file is byte-identical and any undeleted temporary path is included in a `Failed` result.
 - Reject all final statuses except 200; accept absent Content-Length only after successful EOF, and reject both short and long bodies when Content-Length is present.
 - Assert non-200 response bodies are neither saved nor retained in diagnostics; a final response with `Content-Range` or non-identity content encoding is rejected.
@@ -48,7 +49,7 @@
 
 ## Commands and evidence policy
 
-Once the Rust crate exists, expected commands are `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --workspace`, plus Windows CI filesystem tests. These commands have **not** been run because the workspace has no manifest or code. Add only commands that match the final workspace layout; report actual toolchain and output in release evidence.
+From the repository root, run `cargo fmt --check`, `cargo check`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings`. Execute Windows-only destination and promotion tests on Windows; cross-compilation alone does not validate their runtime behavior. Record exact commands and observed results in the completion report. Loopback server tests may require local-network permission in restricted environments.
 
 ## Later-phase tests
 

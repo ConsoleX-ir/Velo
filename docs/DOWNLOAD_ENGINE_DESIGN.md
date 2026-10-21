@@ -1,56 +1,55 @@
 # Download Engine Design
 
-**Status:** Phase 0 contract; partial Phase 1A implementation
+**Status:** Phase 1B implemented in the Rust core; in-memory only
 **Research checked:** 2026-10-21
 
 ## Current implementation boundary
 
-The repository now contains a standalone Rust library implementing the first Phase 1A transfer slice (`src/lib.rs`). It performs one streamed HTTP/HTTPS GET, requests identity encoding, accepts only status 200, validates response framing and `Content-Length` when present, writes an exclusively-created sibling temporary file, reserves destinations within one engine instance, and promotes without replacing an existing target. Local-server test cases cover response validation, redirects, timeouts, cancellation cleanup, destination races, and concurrent downloads; the suite has not been run in this workspace because the Windows linker and SDK are unavailable.
+The repository contains a reusable Reqwest transfer engine and a shared `DownloadManager` (`src/lib.rs`). The manager implements synchronous atomic admission, FIFO scheduling, configurable active and retained-record limits (defaults 4 and 100), generation-bearing handles, cooperative cancellation, latest-value `watch` progress, terminal lookup/acknowledgement, panic recovery, and idempotent shutdown. Each accepted job makes exactly one attempt. The manager reuses the existing HTTP response validation, timeout, redirect, exclusive-temp, and no-clobber promotion paths. The Rust test suite includes local HTTP and filesystem tests; its actual validation status is recorded in the project test evidence and must not be inferred from this design text.
 
-This slice does not yet implement the full state machine above: there is no accepted-job registry, progress delivery, cancellation API, retry policy, UI bridge, persistence, or crash recovery. Dropping a transfer future triggers best-effort temporary-file cleanup; because there is no caller-visible cancellation result, cleanup errors cannot be reported in that path, and abrupt process termination can still leave a partial temp file. `DownloadState` is a minimal value for the current transfer result; terminal errors are returned as typed `DownloadError` values. Provisional timing, admission, and event limits in this design remain planning defaults and are not implemented or benchmark-validated. Windows no-replace promotion uses `MoveFileW`; a direct native Windows probe confirmed same-volume promotion and rejection of an existing target, but the Rust FFI integration and full test suite remain unbuilt and require Windows CI verification.
+Terminal publication, active-slot release, and destination-reservation release are performed together exactly once by the registry commit path. A transfer task owns the open temporary file and cleanup guard; the manager records its path before streaming. On unwind the guard makes a best-effort attempt, then the supervisor attempts cleanup and retains any failure in the terminal error. Normal shutdown waits for accepted jobs to reach terminal outcomes. Abrupt process termination cannot guarantee cleanup or a terminal result; a forced runtime shutdown can interrupt best-effort cleanup. Windows-specific promotion and case-insensitive destination reservation are implemented with target-specific Win32 calls and require actual Windows test execution for release confidence.
 
 ## Scope and non-goals
 
-One job performs one HTTP/HTTPS GET and writes one response to one local file using a bounded-memory streaming loop. Phase 1 does not promise pause/resume, crash recovery, segmented transfers, checksum verification, or retrying from a partial offset. A retry starts a fresh attempt and must safely reset its private temporary file.
+One accepted Phase 1B job performs one HTTP/HTTPS GET attempt and writes one response to one local file using a bounded-memory streaming loop. Phase 1B does not implement retries, pause/resume, crash recovery, segmented transfers, or checksum verification. Any future retry design must use a fresh byte-zero attempt and receive its own contract and tests.
 
 ## Public contract (Rust-shaped, illustrative)
 
 ```rust
 struct DownloadRequest {
     id: DownloadId,
-    url: Url,
+    url: String,
     destination: PathBuf,       // complete desired output path
 }
 
 enum DownloadState {
-    Queued, Preparing, Downloading, Retrying,
+    Queued, Preparing, Downloading,
     Cancelling, Finalizing, Completed, Failed, Cancelled,
 }
 
-struct Progress {
+struct ProgressSnapshot {
     id: DownloadId,
     state: DownloadState,
     bytes_written: u64,
     total_bytes: Option<u64>,
-    attempt: u8,
-    // rate/ETA may be added only with documented smoothing and reset semantics
 }
 
-async fn start(request: DownloadRequest) -> Result<DownloadHandle, StartError>;
-async fn cancel(id: DownloadId) -> Result<(), ControlError>;
-async fn acknowledge_terminal(id: DownloadId) -> Result<(), ControlError>;
-// Handle exposes a bounded/coalescing progress view and a separately retained terminal result.
+fn start(request: DownloadRequest) -> Result<DownloadHandle, StartError>;
+fn cancel(handle: &DownloadHandle) -> Result<CancelDisposition, ControlError>;
+fn terminal_result(handle: &DownloadHandle) -> Result<Option<Arc<TerminalResult>>, ControlError>;
+fn acknowledge_terminal(handle: &DownloadHandle) -> Result<(), ControlError>;
+async fn shutdown(&self) -> ShutdownReport;
 ```
 
-`start` validates and reserves the ID/destination before accepting work. Any ID still present in the registry (including a terminal record not yet acknowledged) or any conflicting destination is rejected and is not an accepted job. Phase 1 has no overwrite option: any existing destination is a conflict, and callers requesting overwrite must receive an explicit unsupported-policy error. Terminal outcomes are exactly one of `Completed { path, bytes_written }`, `Cancelled`, or `Failed { kind, safe_message, http_status?, attempts, partial_path?, cleanup_error? }`. A cancellation request accepted before finalization ends in `Cancelled` only if cleanup succeeds; cleanup failure ends in `Failed` with the partial path and cleanup error. Rejected/late cancellation does not change the eventual terminal result.
+`start` is synchronous and accepts work only after URL/path preflight and an atomic registry commit. It rejects a duplicate retained ID, destination conflict, shutdown, or full retained capacity; rejected requests have no terminal outcome. The handle includes the caller-supplied ID and an internal generation. Every control, snapshot, lookup, and acknowledgement operation validates both against the currently registered record, so an old handle cannot affect a newly admitted job that reuses an acknowledged ID. Existing targets are always rejected; overwrite is unsupported.
 
-`cancel` returns `UnknownId` for an ID not in the registry and `AlreadyTerminal` for a terminal job; only an accepted cancellation of a nonterminal job returns success. `acknowledge_terminal` succeeds only for a terminal job and removes that retained record, freeing its capacity and ID. Start validation/capacity errors are synchronous and do not create jobs.
+`cancel` records a cooperative request and returns without waiting for file cleanup. It returns `TooLate` once `Finalizing` has won arbitration. Repeated cancellation while already cancelling is idempotent. A cancellation accepted before finalization ends in `Cancelled` only after cleanup succeeds; cleanup failure ends `Failed` and retains the cleanup path/error. Acknowledgement succeeds only after terminal publication, then removes the retained record and frees capacity and ID.
 
-For every accepted job, the registry stores one immutable terminal result independently of progress delivery. The result remains queryable until the caller acknowledges/removes the job; it cannot be displaced by progress or lost because a progress receiver is slow or closed. The destination reservation is held until the terminal result has been committed to the registry.
+For every accepted job, the registry stores one immutable terminal result independently of progress delivery. A Tokio `watch` channel stores only the latest snapshot; state changes publish immediately and ordinary byte updates are limited to 10 per second per job. A slow or closed receiver cannot block transfer or displace the terminal result. The destination reservation is held through terminal commit and then released in the same critical section as active-slot release and terminal publication.
 
 ## Admission and resource limits
 
-Provisional Phase 1 limits are 4 active network jobs and 100 retained job records total, including queued, active, and terminal-but-unacknowledged jobs. Additional start requests fail synchronously with `CapacityReached`; they are not accepted jobs and have no terminal result. Jobs beyond the active limit remain `Queued`. A terminal record is removed only after explicit acknowledgement. These limits bound task, temp-file, registry, and progress state; they are adjustable after benchmark evidence. There is no adaptive concurrency in Phase 1. Per active job, keep at most one response chunk being processed and one latest progress snapshot; memory must not scale with total file size.
+The defaults are 4 active jobs and 100 retained records total, including queued, active, and terminal-but-unacknowledged jobs. `DownloadManagerConfig` can set nonzero limits. Excess starts fail synchronously with `CapacityReached`; jobs over the active cap remain `Queued`. A record is removed only by explicit acknowledgement. Each accepted job gets one attempt; retries are deferred. Per active job, the engine holds bounded response data and one latest progress snapshot; memory does not scale with total file size.
 
 ## State machine
 
@@ -58,7 +57,6 @@ Provisional Phase 1 limits are 4 active network jobs and 100 retained job record
 Queued → Preparing → Downloading → Finalizing → Completed
                     │         │       │
                     │         │       └→ Failed
-                    │         ├→ Retrying → Preparing (fresh attempt; bounded)
                     │         ├→ Failed
                     │         └→ Cancelling → Cancelled (cleanup succeeded)
                     │                              └→ Failed (cleanup failed)
@@ -66,16 +64,15 @@ Queued → Preparing → Downloading → Finalizing → Completed
                                          └→ Failed (cleanup failed)
 ```
 
-Any nonterminal state before `Finalizing` may transition to `Cancelling`; all operational states may transition to `Failed`. State transitions and cancel acceptance are serialized by one per-job gate. The operation that wins the gate determines the result: if cancellation wins before `Finalizing`, the worker stops at a safe boundary and cleans up; if `Finalizing` wins, `cancel` returns `TooLate` and the job completes or fails finalization. `Retrying` either starts a fresh `Preparing` attempt or ends `Failed` when the attempt budget/deadline is exhausted. There is no accepted cancellation after finalization begins and no `Completed` result before successful promotion.
+Any nonterminal state before `Finalizing` may transition to `Cancelling`; operational states may transition to `Failed`. Cancellation and the transition to `Finalizing` are serialized by the manager registry lock. If cancellation wins first, the task stops at a safe boundary and cleans up. If `Finalizing` wins first, `cancel` returns `TooLate`. There is no retry transition and no `Completed` result before successful promotion. A single terminal commit releases the active slot/reservation and publishes the result exactly once.
 
 - `Queued`: accepted into the in-memory scheduler; no destination bytes written.
 - `Preparing`: create the exclusive private temp file and request; URL and destination shape were validated before job acceptance.
 - `Downloading`: successful eligible response accepted; body streamed and bytes written.
-- `Retrying`: classified transient failure occurred and another bounded attempt is scheduled. Report attempt and delay; no concurrent attempt for the same job.
 - `Cancelling`: cancellation requested; body stream and pending work are stopped and temporary output cleanup is attempted.
 - `Finalizing`: EOF and response-length checks succeeded; the temp file is `sync_all`'d, closed as needed, and promoted with an atomic same-volume **no-replace** operation. An unexpected destination collision fails finalization and preserves that destination.
 - `Completed`: final path is committed and byte count refers to bytes written/promoted.
-- `Failed`: non-retryable error, retry budget exhausted, finalization failure, or cleanup failure; error includes the safe typed cause and any cleanup failure/path. The engine attempts to remove its temp file on every failure; if removal fails, it reports the remaining path and cleanup error.
+- `Failed`: request, response, filesystem, worker-panic, finalization, or cleanup failure; the terminal error includes the safe typed cause and any cleanup failure/path.
 - `Cancelled`: cancellation was accepted before finalization and temp-file cleanup completed. Cleanup failure is `Failed`, never successful cancellation.
 
 There is no `Paused`, `Interrupted`, or `Verifying` state in Phase 1. Abrupt process exit is outside the live state machine; startup recovery is deferred.
@@ -93,7 +90,7 @@ There is no `Paused`, `Interrupted`, or `Verifying` state in Phase 1. Abrupt pro
 
 ## HTTP request and response contract
 
-- Reuse a configured Reqwest `Client`. Provisional defaults, to be configurable and adjusted only with evidence: 10-second connect timeout, 30-second read/inactivity timeout (bounds the wait for response headers and each body read, reset after each successful read), and a 24-hour network-job deadline from the first request attempt through response EOF, including retries/backoff. The deadline does not interrupt cleanup or a `Finalizing` phase already begun. Tests inject a clock and use short values. These are planning defaults, not validated user-facing settings.
+- Reuse a configured Reqwest `Client`. Defaults in this implementation are a 10-second connect timeout, 30-second read/inactivity timeout (bounds response-header waits and each body read), and a 24-hour Reqwest request deadline. These are implementation defaults, not measured UX budgets. There are no retry/backoff waits in Phase 1B.
 - Send GET, request identity encoding (`Accept-Encoding: identity`) and build without transparent compression features unless byte-accounting is explicitly adapted and tested.
 - Redirects: cap at 10 hops; validate every target scheme and reject userinfo; reject HTTPS-to-HTTP downgrade; allow HTTP-to-HTTPS. Loop, limit, and policy violations are typed terminal failures. Phase 1 sends no credentials/cookies/custom sensitive headers. If such headers are added later, strip them on origin changes and test the behavior; Reqwest's built-in sensitive-header stripping does not replace project policy.
 - Disable automatic `Referer` forwarding so redirect chains cannot leak a source URL's query string. Never log full URLs by default; redact query values from surfaced diagnostics.
@@ -106,7 +103,7 @@ There is no `Paused`, `Interrupted`, or `Verifying` state in Phase 1. Abrupt pro
 
 Consume Reqwest chunks/stream and write each chunk to Tokio `File` with a fixed upper bound on in-flight body data. Use a partial-write loop with `write`, incrementing the checked byte counter for each successful returned byte count; treat `Ok(0)` as `WriteZero`. Do not use `write_all` where accurate partial-byte accounting is required, and do not collect the response into a `Vec` or buffer proportional to file size. Tokio filesystem APIs currently use blocking filesystem operations behind the async interface; this is a performance characteristic, not a promise of kernel-native async disk I/O.
 
-Progress counts bytes successfully written in the current attempt; it resets to zero when a retry starts from byte zero. `total_bytes` is optional and comes from the accepted response. Emit state transitions immediately. Ordinary progress is capped at 10 events/second/job (minimum 100 ms between ordinary updates); byte thresholds may suppress updates but never increase that frequency. Keep only the latest pending snapshot per job; do not enqueue every network chunk. Terminal result delivery is separate and retained in the registry, so progress coalescing cannot drop it. A slow subscriber cannot block disk writes or grow memory without bound.
+Progress counts bytes successfully written in the single attempt. `total_bytes` is optional and comes from the accepted response. The internal byte counter is updated after every successful partial write; the public `watch` snapshot is published at most 10 ordinary times per second/job. State transitions are immediate. `watch` stores only its latest value; terminal results are retained separately in the registry, so slow subscribers cannot block disk writes, accumulate events, or lose a terminal result.
 
 `Finalizing` calls `sync_all` on the temporary file before promotion. This incurs per-download cost and is included in benchmarks. The contract guarantees validated bytes and atomic no-replace visibility after promotion, but does not claim survival of sudden power loss for the final directory entry.
 
@@ -114,28 +111,25 @@ Progress counts bytes successfully written in the current attempt; it resets to 
 
 For accurate partial byte counts, implement writes as a loop over `AsyncWriteExt::write`, incrementing the checked count after each successful returned byte count (`Ok(0)` is `WriteZero`). Never drop a `write_all` future mid-operation: it may have written a prefix without returning that byte count.
 
-Cancellation is cooperative and observable while queued, connecting, waiting for headers, reading the body, or in retry backoff. During a write, finish the current chunk write (or correctly account for partial writes) before stopping. Tokio documents `write_all` as not cancellation-safe when dropped mid-operation, so do not select-cancel it mid-write. Serialize cancellation against transition to `Finalizing`: cancellation accepted first gives cleanup ownership; `Finalizing` first makes cancellation return `TooLate`. Always close handles before deleting temp files. Cancellation cleanup success yields `Cancelled`; cleanup failure yields `Failed` with the partial path and cleanup error. A terminal result is stored separately from progress and remains queryable until acknowledged.
+Cancellation is cooperative while queued, connecting, waiting for headers, or reading the body. It is not selected against a pending file write: the current chunk write loop completes and counts each partial write before cancellation is observed. Cancellation is serialized against transition to `Finalizing` under the registry lock. Always close handles before deleting temp files. Cancellation cleanup success yields `Cancelled`; cleanup failure yields `Failed` with the temp path and cleanup error. On worker unwind, `TempGuard` makes a best-effort cleanup attempt and the supervisor makes an explicit second attempt before committing `Failed`. Runtime/process termination can prevent cleanup or terminal publication; no crash recovery is promised.
 
-## Retry policy
+## Retries (deferred)
 
-Effective wait is `min(30 s, max(computed_backoff, parsed_retry_after))`; invalid or past `Retry-After` values are ignored. Parse both delta-seconds and HTTP-date forms.
-
-Provisional policy: 3 total attempts including the first; retry delays are 250 ms then 500 ms, each with up to +20% injected jitter. For 429/503, parse a valid delta-seconds or HTTP-date `Retry-After` and wait for the greater of the computed delay and server delay, capped at 30 seconds. The 24-hour network-job deadline still applies. Retry connect timeouts, temporary name-resolution/connect errors, connection resets before headers, interrupted body reads, body-inactivity timeouts, and statuses 408, 429, 500, 502, 503, 504. Do not retry TLS certificate/hostname failures, malformed URLs, redirect policy errors, all other HTTP statuses, local filesystem errors, destination conflicts, cancellation, or clean-EOF length mismatch. If the HTTP/TLS stack cannot distinguish a certificate or permanent resolver error from a transient connect error, classify it as permanent. Exhaustion ends `Failed` with attempt count. Before every retry, truncate and seek the private temp file to byte zero; reset attempt progress and never append. Defaults remain provisional until tested and benchmarked.
+Every accepted Phase 1B job makes exactly one request attempt. Retry classification, `Retry-After`, jitter, delay injection, and retry-specific states/progress are not implemented. They require a later reviewed contract and tests.
 
 ## Deterministic test server and contract tests
 
-Use a local in-process HTTP server bound to loopback on an ephemeral port; no external network. Provide scripted endpoints for fixed bytes, chunked/slow streaming, declared-length mismatch/truncation, status codes, redirect chain/loop/downgrade, connection reset, delayed headers, and retry-then-success. Inject clock, jitter, timeout values, and cancellation gates. Acceptance criteria: exact byte-for-byte output for 0-byte, 1 MiB, and 64 MiB fixtures; no final file on invalid/incomplete response; existing destination bytes unchanged on all failures/cancellation; exactly one terminal result per accepted job; retry count/delays match injected schedule and attempts restart at byte zero; progress never exceeds 10 ordinary updates/second/job while state changes are immediate; one latest progress snapshot per job at most; a stalled progress consumer does not block transfer or lose the terminal result. Assert no more than 4 active and 100 retained job records (including unacknowledged terminal records), and synchronous `CapacityReached` beyond the cap. Add filesystem cases for two in-process jobs targeting the same path (exactly one accepted), external target creation before promotion (fail without overwrite), cleanup failure, Unicode and reserved Windows names, long paths within the selected OS policy, rename collision on Windows, and reparse points/junctions on Windows CI.
+Use a local in-process HTTP server bound to loopback on an ephemeral port; no external network. Script fixed bytes, chunked/slow streams, declared-length mismatch/truncation, status codes, redirects, connection reset, and delayed headers. Use deterministic cancellation and finalization gates. Assert exact output bytes; no final file on invalid/incomplete responses; existing destination bytes unchanged on failures/cancellation; exactly one terminal result per accepted job; progress snapshots coalesce and ordinary updates stay at or below 10/second/job; a stalled subscriber cannot block transfer or lose the terminal result. Assert FIFO order, no more than the configured active limit, the 100-record default (including unacknowledged terminal jobs), and synchronous capacity errors. Test concurrent duplicate IDs/destinations, stale generations after ID reuse, worker panic/cleanup failure, repeated shutdown, and Windows case-variant destination reservation and no-replace promotion.
 
 ## Open implementation decisions
 
-- Reqwest/Tokio versions and minimal feature set; TLS backend and system proxy policy.
+- TLS backend and system proxy policy.
 - Exact minimum Windows version/filesystems and handle-based mitigation for reparse-point/path races.
 - Whether user-entered URLs may target loopback/private-network addresses; decide before adding link interception or background URL ingestion.
 - Whether a later product version should add an explicit overwrite flow; Phase 1 itself is no-clobber only.
 - Whether the provisional scheduler limits (4 active, 100 retained job records) should change after representative measurements.
-- Whether the provisional retry and timeout defaults need adjustment based on test and benchmark evidence.
-- Semantics of cleanup failure if the OS prevents deletion of an open/locked temp file; Phase 1 must return `Failed` with its path and preserve it for user action.
-- Loopback server/test utilities dependency choice versus a small hand-written test server.
+- Retry classification and policy for a later phase.
+- Exact cleanup recovery UX when the OS prevents deletion of a temporary file; Phase 1 returns `Failed` with the temporary path and cleanup error.
 
 ## Official references
 

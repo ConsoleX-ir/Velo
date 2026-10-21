@@ -1,9 +1,9 @@
 # ConsoleX Velo Architecture
 
-**Status:** Phase 0 baseline  
+**Status:** Phase 1B managed Rust core; Tauri and frontend remain planned
 **Research checked:** 2026-10-21
 
-**Implementation update (2026-10-21):** A root-level, Tauri-independent Rust download library now provides the initial Phase 1A single-transfer path. The application service, job registry, bounded progress channel, cancellation/retry orchestration, frontend, and Tauri shell remain planned and are not present yet. See `DOWNLOAD_ENGINE_DESIGN.md` for the implemented boundary and unverified Windows-specific promotion behavior.
+**Implementation update (2026-10-21):** The root-level Rust library now includes the Phase 1A HTTP/HTTPS transfer core and Phase 1B `DownloadManager`, with FIFO admission, generation-bearing handles, cancellation, coalesced progress, retained terminal results, and shutdown. The download core remains independent of Tauri; the application service, frontend, and Tauri shell are not present. On the Windows host, the full test suite passed, including no-clobber promotion and case-insensitive destination reservation tests (54 passed, 0 failed).
 
 ## Chosen stack
 
@@ -22,7 +22,7 @@ This is the current project decision. No Electron comparison is in scope absent 
 React + TypeScript
   └─ narrow Tauri commands/events; presentation state only
        └─ application service (validation, command authorization, orchestration)
-            ├─ download engine (HTTP lifecycle, retries, streaming, cancellation)
+            ├─ managed download engine (HTTP lifecycle, streaming, cancellation)
             ├─ destination/file policy (path and collision rules)
             └─ in-memory job registry (Phase 1; no database)
 ```
@@ -35,7 +35,7 @@ The frontend does not open arbitrary filesystem paths or perform network request
 - UI state is a projection of native snapshots/events and may be reconstructed; it is not durable truth.
 - Commands carry stable download IDs and validated request fields. State transitions are emitted immediately; ordinary progress is limited to at most 10 updates per second per job.
 - Progress is latest-value/coalesced, with at most one pending snapshot per job. Terminal outcome is immutable and separately retained in the job registry until acknowledged; it is not an ordinary event that a bounded queue can drop.
-- Phase 1 can use an in-memory registry and per-download task handle/token. Do not persist transient progress as if it guaranteed crash recovery.
+- Phase 1B uses an in-memory registry, one task per active job, and caller-ID plus generation handles. Do not persist transient progress as if it guaranteed crash recovery. Each accepted job makes one attempt; retries are deferred.
 - Provisional scheduler cap: 4 active jobs and 100 retained job records, including terminal records not yet acknowledged; reject excess synchronously. Keep the fixed cap until benchmarks justify changing it; adaptive concurrency is deferred.
 
 ## Persistence model and later SQLite boundary
@@ -46,9 +46,9 @@ SQLite is selected for local metadata. Database placement should be under the pe
 
 ## Error and shutdown model
 
-Use typed error categories at the engine boundary: invalid request, destination conflict/permission/path error, request construction, DNS/connect/TLS/timeout, redirect policy/limit, non-success HTTP status, body stream error, length mismatch/incomplete response, write/flush/finalize error, retry exhausted, and cancelled. Preserve safe diagnostic context (status, category, attempt count); redact URL userinfo and sensitive query values from logs and UI.
+Use typed error categories at the engine boundary: invalid request, destination conflict/permission/path error, request construction, DNS/connect/TLS/timeout, redirect policy/limit, non-success HTTP status, body stream error, length mismatch/incomplete response, write/flush/finalize error, worker panic, cleanup failure, and cancellation. Preserve safe diagnostic context (status and category); redact URL userinfo and sensitive query values from logs and UI.
 
-On normal application shutdown, stop accepting new work, request cancellation of active Phase 1 jobs, await their cleanup for a bounded interval, and leave partial-file disposition explicit. Force termination can leave a partial file; without persistence/recovery this is reported as interrupted on next launch only after a later recovery phase exists.
+The manager's idempotent shutdown closes admission under the same lock used for dispatch, cancels queued and cancellable active jobs, allows finalizing jobs to finish, and waits until accepted jobs have terminal results and cleanup is complete. The application may impose its own exit deadline; abandoning that wait does not make cleanup complete. Force termination can leave a temporary file and cannot guarantee terminal publication; crash recovery is deferred.
 
 ## Security boundaries
 
@@ -61,7 +61,7 @@ On normal application shutdown, stop accepting new work, request cancellation of
 - Treat response headers, filenames, redirect targets, and remote error text as untrusted input.
 - The download engine should not accept arbitrary caller-supplied sensitive headers in Phase 1. If later supported, redirect policy must strip credentials/cookies on origin changes and block HTTPS-to-HTTP downgrade by default.
 - Phase 1 rejects existing final destinations and uses same-directory exclusive temp creation followed by an atomic same-volume no-replace promotion. Do not use `std::fs::rename` as the no-clobber operation on Windows: its documented behavior may replace an existing target. A direct, target-specific Windows API dependency may be justified for this narrow operation.
-- In-process path reservation prevents two jobs in one engine instance from claiming the same canonical destination. Atomic no-replace promotion handles cross-process/external races. Reparse points and path-component races require Windows-specific validation and remain a release gate until tested.
+- The shared manager registry reserves canonical destinations across all manager clones. Windows reservations compare canonical paths using ordinal case-insensitive comparison. Atomic no-replace promotion handles cross-process/external races. Reparse points and path-component races remain a Windows release-review concern.
 
 ## Packaging assumptions
 

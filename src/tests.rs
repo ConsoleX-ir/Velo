@@ -3,16 +3,18 @@ use std::{
     future::Future,
     net::SocketAddr,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc,
+        Arc, Barrier,
     },
+    task::{Context, Poll},
     time::Duration,
 };
 
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_LENGTH, TRANSFER_ENCODING};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::oneshot,
     task::JoinHandle,
@@ -21,8 +23,10 @@ use url::Url;
 
 use crate::{
     cleanup_or_original, parse_content_length, promote_no_replace, redirect_decision,
-    temp_candidate, validate_transfer_encoding, DownloadEngine, DownloadError, DownloadState,
-    NetworkFailureKind, OpenedTemp, TempGuard,
+    temp_candidate, validate_transfer_encoding, write_chunk_accounted, CancelDisposition,
+    ControlError, DownloadEngine, DownloadError, DownloadHandle, DownloadId, DownloadManager,
+    DownloadManagerConfig, DownloadRequest, DownloadState, NetworkFailureKind, OpenedTemp,
+    StartError, TempGuard,
 };
 
 static DIR_ID: AtomicU64 = AtomicU64::new(0);
@@ -1295,4 +1299,649 @@ fn transfer_encoding_accepts_only_one_chunked_coding_without_content_length() {
         validate_transfer_encoding(&headers),
         Err(DownloadError::InvalidResponse)
     ));
+}
+
+struct ShortWriter {
+    bytes: Vec<u8>,
+    max_write: usize,
+    return_zero: bool,
+}
+
+impl AsyncWrite for ShortWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.return_zero {
+            return Poll::Ready(Ok(0));
+        }
+        let count = buffer.len().min(self.max_write);
+        self.bytes.extend_from_slice(&buffer[..count]);
+        Poll::Ready(Ok(count))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn partial_writes_are_counted_exactly_and_zero_write_fails() {
+    let mut writer = ShortWriter {
+        bytes: Vec::new(),
+        max_write: 2,
+        return_zero: false,
+    };
+    let mut written = 0;
+    let mut observed = Vec::new();
+    write_chunk_accounted(
+        &mut writer,
+        Path::new("test.part"),
+        b"abcdefg",
+        &mut written,
+        |count| observed.push(count),
+    )
+    .await
+    .unwrap();
+    assert_eq!(writer.bytes, b"abcdefg");
+    assert_eq!(written, 7);
+    assert_eq!(observed, vec![2, 4, 6, 7]);
+
+    let mut zero_writer = ShortWriter {
+        bytes: Vec::new(),
+        max_write: 2,
+        return_zero: true,
+    };
+    let error = write_chunk_accounted(
+        &mut zero_writer,
+        Path::new("test.part"),
+        b"x",
+        &mut 0,
+        |_| {},
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, DownloadError::WriteZero));
+}
+
+fn managed_request(id: &str, url: String, destination: PathBuf) -> DownloadRequest {
+    DownloadRequest {
+        id: DownloadId::new(id).unwrap(),
+        url,
+        destination,
+    }
+}
+
+async fn wait_for_terminal(
+    manager: &DownloadManager,
+    handle: &DownloadHandle,
+) -> Arc<crate::TerminalResult> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut progress = handle.progress();
+        loop {
+            if let Some(result) = manager.terminal_result(handle).unwrap() {
+                return result;
+            }
+            progress.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("terminal result should be committed")
+}
+
+#[tokio::test]
+async fn manager_completes_retains_acknowledges_and_rejects_stale_generation() {
+    let payload = b"managed payload";
+    let (url, server) = serve_once(response(
+        "200 OK",
+        &format!("Content-Length: {}\r\nConnection: close\r\n", payload.len()),
+        payload,
+    ))
+    .await;
+    let dir = TestDir::new();
+    let manager = DownloadManager::new().unwrap();
+    let target = dir.path().join("managed.bin");
+    let old = manager
+        .start(managed_request("job-1", url, target.clone()))
+        .unwrap();
+    let terminal = wait_for_terminal(&manager, &old).await;
+    server.await.unwrap();
+
+    assert_eq!(terminal.state, DownloadState::Completed);
+    assert_eq!(terminal.bytes_written, payload.len() as u64);
+    assert_eq!(fs::read(&target).unwrap(), payload);
+    assert_eq!(old.latest_progress().bytes_written, payload.len() as u64);
+    assert!(matches!(manager.acknowledge_terminal(&old), Ok(())));
+    assert!(matches!(
+        manager.terminal_result(&old),
+        Err(ControlError::UnknownId)
+    ));
+
+    let (url, server) = serve_once(response(
+        "200 OK",
+        "Content-Length: 2\r\nConnection: close\r\n",
+        b"ok",
+    ))
+    .await;
+    let new = manager
+        .start(managed_request("job-1", url, dir.path().join("second.bin")))
+        .unwrap();
+    assert_ne!(old.generation(), new.generation());
+    assert!(matches!(
+        manager.cancel(&old),
+        Err(ControlError::StaleHandle)
+    ));
+    assert!(matches!(
+        manager.acknowledge_terminal(&old),
+        Err(ControlError::StaleHandle)
+    ));
+    let terminal = wait_for_terminal(&manager, &new).await;
+    server.await.unwrap();
+    assert_eq!(terminal.state, DownloadState::Completed);
+    manager.acknowledge_terminal(&new).unwrap();
+}
+
+#[tokio::test]
+async fn manager_coalesces_progress_without_losing_terminal_result() {
+    let (url, server, started, release) = serve_gated().await;
+    let dir = TestDir::new();
+    let manager = DownloadManager::new().unwrap();
+    let handle = manager
+        .start(managed_request(
+            "progress",
+            url,
+            dir.path().join("progress.bin"),
+        ))
+        .unwrap();
+    started.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if crate::lock_registry(&manager.core)
+                .jobs
+                .get(handle.id())
+                .is_some_and(|record| record.bytes_written == 5)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first partial body should be written");
+    let token = crate::JobToken {
+        id: handle.id().clone(),
+        generation: handle.generation(),
+    };
+
+    {
+        let mut registry = crate::lock_registry(&manager.core);
+        registry.jobs.get_mut(handle.id()).unwrap().last_progress_at =
+            std::time::Instant::now() - Duration::from_secs(1);
+    }
+    crate::update_progress(&manager.core, &token, 5, Some(10));
+    crate::update_progress(&manager.core, &token, 6, Some(10));
+    assert_eq!(handle.latest_progress().bytes_written, 5);
+    assert_eq!(
+        crate::lock_registry(&manager.core)
+            .jobs
+            .get(handle.id())
+            .unwrap()
+            .bytes_written,
+        6,
+        "internal accounting remains exact when the public snapshot is throttled"
+    );
+
+    {
+        let mut registry = crate::lock_registry(&manager.core);
+        registry.jobs.get_mut(handle.id()).unwrap().last_progress_at =
+            std::time::Instant::now() - Duration::from_secs(1);
+    }
+    crate::update_progress(&manager.core, &token, 7, Some(10));
+    assert_eq!(handle.latest_progress().bytes_written, 7);
+
+    {
+        let mut registry = crate::lock_registry(&manager.core);
+        registry.jobs.get_mut(handle.id()).unwrap().bytes_written = 5;
+    }
+    manager.cancel(&handle).unwrap();
+    release.send(()).unwrap();
+    let terminal = wait_for_terminal(&manager, &handle).await;
+    server.await.unwrap();
+    assert_eq!(terminal.state, DownloadState::Cancelled);
+    assert_eq!(
+        terminal.bytes_written, 5,
+        "actual successful writes are authoritative"
+    );
+    assert_eq!(handle.latest_progress().state, DownloadState::Cancelled);
+    assert!(manager.terminal_result(&handle).unwrap().is_some());
+    manager.acknowledge_terminal(&handle).unwrap();
+}
+
+#[tokio::test]
+async fn manager_admission_is_atomic_and_retention_frees_only_on_acknowledgement() {
+    let (url, server, started, release) = serve_gated().await;
+    let dir = TestDir::new();
+    let manager = DownloadManager::with_config(DownloadManagerConfig {
+        max_active: 1,
+        max_retained_jobs: 2,
+    })
+    .unwrap();
+    let first_path = dir.path().join("same.bin");
+    let first = manager
+        .start(managed_request("one", url.clone(), first_path.clone()))
+        .unwrap();
+    started.await.unwrap();
+
+    let conflict = manager.start(managed_request(
+        "two",
+        url.clone(),
+        dir.path().join(".").join("same.bin"),
+    ));
+    assert!(matches!(
+        conflict,
+        Err(StartError::InvalidRequest(
+            DownloadError::DestinationConflict
+        ))
+    ));
+
+    let queued = manager
+        .start(managed_request(
+            "three",
+            url.clone(),
+            dir.path().join("queued.bin"),
+        ))
+        .unwrap();
+    assert_eq!(queued.latest_progress().state, DownloadState::Queued);
+    assert!(matches!(
+        manager.start(managed_request(
+            "four",
+            url.clone(),
+            dir.path().join("four.bin")
+        )),
+        Err(StartError::CapacityReached)
+    ));
+    assert_eq!(
+        manager.cancel(&queued).unwrap(),
+        CancelDisposition::Accepted
+    );
+    assert_eq!(
+        wait_for_terminal(&manager, &queued).await.state,
+        DownloadState::Cancelled
+    );
+    assert!(matches!(
+        manager.start(managed_request(
+            "four",
+            url.clone(),
+            dir.path().join("four.bin")
+        )),
+        Err(StartError::CapacityReached)
+    ));
+    manager.acknowledge_terminal(&queued).unwrap();
+    let fourth = manager
+        .start(managed_request(
+            "four",
+            url.clone(),
+            dir.path().join("four.bin"),
+        ))
+        .unwrap();
+    assert_eq!(fourth.latest_progress().state, DownloadState::Queued);
+    manager.cancel(&fourth).unwrap();
+    wait_for_terminal(&manager, &fourth).await;
+    manager.acknowledge_terminal(&fourth).unwrap();
+
+    manager.cancel(&first).unwrap();
+    release.send(()).unwrap();
+    assert_eq!(
+        wait_for_terminal(&manager, &first).await.state,
+        DownloadState::Cancelled
+    );
+    server.await.unwrap();
+    assert!(!first_path.exists());
+    assert_eq!(entry_count(&dir), 0);
+    manager.acknowledge_terminal(&first).unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_starts_atomically_reject_destination_and_id_conflicts() {
+    let (address, _hits, server) = serve_loop(|_, _| {
+        response(
+            "200 OK",
+            "Content-Length: 2\r\nConnection: close\r\n",
+            b"ok",
+        )
+    })
+    .await;
+    let dir = TestDir::new();
+    let manager = DownloadManager::new().unwrap();
+    let url = format!("http://{address}/file");
+
+    let barrier = Arc::new(Barrier::new(8));
+    let mut starts = Vec::new();
+    for index in 0..8 {
+        let manager = manager.clone();
+        let barrier = Arc::clone(&barrier);
+        let url = url.clone();
+        let target = dir.path().join("shared.bin");
+        starts.push(std::thread::spawn(move || {
+            barrier.wait();
+            manager.start(managed_request(&format!("path-{index}"), url, target))
+        }));
+    }
+    let accepted: Vec<_> = starts
+        .into_iter()
+        .map(|task| task.join().unwrap())
+        .filter_map(Result::ok)
+        .collect();
+    assert_eq!(accepted.len(), 1, "same destination must have one winner");
+    let terminal = wait_for_terminal(&manager, &accepted[0]).await;
+    assert_eq!(terminal.state, DownloadState::Completed);
+    manager.acknowledge_terminal(&accepted[0]).unwrap();
+
+    let barrier = Arc::new(Barrier::new(8));
+    let mut starts = Vec::new();
+    for index in 0..8 {
+        let manager = manager.clone();
+        let barrier = Arc::clone(&barrier);
+        let url = url.clone();
+        let target = dir.path().join(format!("id-{index}.bin"));
+        starts.push(std::thread::spawn(move || {
+            barrier.wait();
+            manager.start(managed_request("shared-id", url, target))
+        }));
+    }
+    let accepted: Vec<_> = starts
+        .into_iter()
+        .map(|task| task.join().unwrap())
+        .filter_map(Result::ok)
+        .collect();
+    assert_eq!(accepted.len(), 1, "duplicate ID must have one winner");
+    let terminal = wait_for_terminal(&manager, &accepted[0]).await;
+    assert_eq!(terminal.state, DownloadState::Completed);
+    manager.acknowledge_terminal(&accepted[0]).unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn manager_dispatches_queued_jobs_in_fifo_order() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (first_started_tx, first_started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let (paths_tx, mut paths_rx) = tokio::sync::mpsc::unbounded_channel();
+    let server = tokio::spawn(async move {
+        let mut first_started_tx = Some(first_started_tx);
+        let mut release_rx = Some(release_rx);
+        for index in 0..3 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            let path = request.split_whitespace().nth(1).unwrap_or("/").to_owned();
+            paths_tx.send(path).unwrap();
+            if index == 0 {
+                let _ = first_started_tx.take().unwrap().send(());
+                let _ = release_rx.take().unwrap().await;
+            }
+            let body = index.to_string();
+            let raw = response(
+                "200 OK",
+                "Content-Length: 1\r\nConnection: close\r\n",
+                body.as_bytes(),
+            );
+            let _ = stream.write_all(&raw).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    let dir = TestDir::new();
+    let manager = DownloadManager::with_config(DownloadManagerConfig {
+        max_active: 1,
+        max_retained_jobs: 4,
+    })
+    .unwrap();
+    let first = manager
+        .start(managed_request(
+            "fifo-1",
+            format!("http://{address}/one"),
+            dir.path().join("one.bin"),
+        ))
+        .unwrap();
+    first_started_rx.await.unwrap();
+    let second = manager
+        .start(managed_request(
+            "fifo-2",
+            format!("http://{address}/two"),
+            dir.path().join("two.bin"),
+        ))
+        .unwrap();
+    let third = manager
+        .start(managed_request(
+            "fifo-3",
+            format!("http://{address}/three"),
+            dir.path().join("three.bin"),
+        ))
+        .unwrap();
+    assert_eq!(second.latest_progress().state, DownloadState::Queued);
+    assert_eq!(third.latest_progress().state, DownloadState::Queued);
+    release_tx.send(()).unwrap();
+
+    for handle in [&first, &second, &third] {
+        assert_eq!(
+            wait_for_terminal(&manager, handle).await.state,
+            DownloadState::Completed
+        );
+        manager.acknowledge_terminal(handle).unwrap();
+    }
+    server.await.unwrap();
+    let paths = [
+        paths_rx.recv().await.unwrap(),
+        paths_rx.recv().await.unwrap(),
+        paths_rx.recv().await.unwrap(),
+    ];
+    assert_eq!(paths, ["/one", "/two", "/three"]);
+}
+
+#[tokio::test]
+async fn manager_cancellation_is_too_late_after_finalizing_wins() {
+    let (url, server) = serve_once(response(
+        "200 OK",
+        "Content-Length: 4\r\nConnection: close\r\n",
+        b"done",
+    ))
+    .await;
+    let dir = TestDir::new();
+    let manager = DownloadManager::new().unwrap();
+    let (finalizing, release) = manager.pause_next_finalization();
+    let handle = manager
+        .start(managed_request(
+            "finalizing",
+            url,
+            dir.path().join("final.bin"),
+        ))
+        .unwrap();
+    finalizing.await.unwrap();
+    assert_eq!(handle.latest_progress().state, DownloadState::Finalizing);
+    assert!(matches!(
+        manager.cancel(&handle),
+        Err(ControlError::TooLate)
+    ));
+
+    let manager_a = manager.clone();
+    let shutdown_a = tokio::spawn(async move { manager_a.shutdown().await });
+    let shutdown_b = {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.shutdown().await })
+    };
+    while !crate::lock_registry(&manager.core).closing {
+        tokio::task::yield_now().await;
+    }
+    assert!(matches!(
+        manager.start(managed_request(
+            "after-close",
+            "http://127.0.0.1:1/file".to_owned(),
+            dir.path().join("late.bin")
+        )),
+        Err(StartError::ShuttingDown)
+    ));
+    release.send(()).unwrap();
+    let terminal = wait_for_terminal(&manager, &handle).await;
+    assert_eq!(terminal.state, DownloadState::Completed);
+    assert_eq!(shutdown_a.await.unwrap(), crate::ShutdownReport::Complete);
+    assert_eq!(shutdown_b.await.unwrap(), crate::ShutdownReport::Complete);
+    server.await.unwrap();
+    manager.acknowledge_terminal(&handle).unwrap();
+}
+
+#[tokio::test]
+async fn manager_worker_panic_is_terminalized_and_temp_is_cleaned() {
+    let (url, server) = serve_once(response(
+        "200 OK",
+        "Content-Length: 2\r\nConnection: close\r\n",
+        b"ok",
+    ))
+    .await;
+    let dir = TestDir::new();
+    let engine = DownloadEngine::new().unwrap();
+    engine.panic_next_worker();
+    let manager = DownloadManager::with_engine(engine, DownloadManagerConfig::default()).unwrap();
+    let handle = manager
+        .start(managed_request("panic", url, dir.path().join("panic.bin")))
+        .unwrap();
+    let result = wait_for_terminal(&manager, &handle).await;
+    assert_eq!(result.state, DownloadState::Failed);
+    assert!(matches!(
+        result.error.as_deref(),
+        Some(DownloadError::WorkerPanicked)
+    ));
+    assert!(!dir.path().join("panic.bin").exists());
+    assert_eq!(entry_count(&dir), 0);
+    server.abort();
+    manager.acknowledge_terminal(&handle).unwrap();
+    assert_eq!(manager.shutdown().await, crate::ShutdownReport::Complete);
+}
+
+#[tokio::test]
+async fn manager_preserves_cleanup_failure_when_worker_panics() {
+    let (url, server) = serve_once(response(
+        "200 OK",
+        "Content-Length: 2\r\nConnection: close\r\n",
+        b"ok",
+    ))
+    .await;
+    let dir = TestDir::new();
+    let engine = DownloadEngine::new().unwrap();
+    engine.panic_next_worker();
+    let manager = DownloadManager::with_engine(engine, DownloadManagerConfig::default()).unwrap();
+    manager.fail_next_cleanup();
+    let handle = manager
+        .start(managed_request(
+            "panic-cleanup",
+            url,
+            dir.path().join("panic.bin"),
+        ))
+        .unwrap();
+    let result = wait_for_terminal(&manager, &handle).await;
+    assert_eq!(result.state, DownloadState::Failed);
+    assert!(matches!(
+        result.error.as_deref(),
+        Some(DownloadError::CleanupFailure { original, .. })
+            if matches!(original.as_ref(), DownloadError::WorkerPanicked)
+    ));
+    assert!(!dir.path().join("panic.bin").exists());
+    assert_eq!(entry_count(&dir), 1, "failed cleanup path must be retained");
+    server.abort();
+    manager.acknowledge_terminal(&handle).unwrap();
+    assert_eq!(manager.shutdown().await, crate::ShutdownReport::Complete);
+}
+
+#[tokio::test]
+async fn concurrent_shutdown_cancels_queued_jobs_and_is_idempotent() {
+    let (url, server, started, release) = serve_gated().await;
+    let dir = TestDir::new();
+    let manager = DownloadManager::with_config(DownloadManagerConfig {
+        max_active: 1,
+        max_retained_jobs: 4,
+    })
+    .unwrap();
+    let active = manager
+        .start(managed_request(
+            "active",
+            url.clone(),
+            dir.path().join("active.bin"),
+        ))
+        .unwrap();
+    let queued = manager
+        .start(managed_request(
+            "queued",
+            url,
+            dir.path().join("queued.bin"),
+        ))
+        .unwrap();
+    started.await.unwrap();
+
+    let first = {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.shutdown().await })
+    };
+    let second = {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.shutdown().await })
+    };
+    release.send(()).unwrap();
+    assert_eq!(first.await.unwrap(), crate::ShutdownReport::Complete);
+    assert_eq!(second.await.unwrap(), crate::ShutdownReport::Complete);
+    server.await.unwrap();
+    assert_eq!(
+        wait_for_terminal(&manager, &active).await.state,
+        DownloadState::Cancelled
+    );
+    assert_eq!(
+        wait_for_terminal(&manager, &queued).await.state,
+        DownloadState::Cancelled
+    );
+    assert!(matches!(
+        manager.start(managed_request(
+            "late",
+            "http://127.0.0.1:1/file".to_owned(),
+            dir.path().join("late.bin")
+        )),
+        Err(StartError::ShuttingDown)
+    ));
+    manager.acknowledge_terminal(&active).unwrap();
+    manager.acknowledge_terminal(&queued).unwrap();
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn manager_reserves_windows_destinations_case_insensitively() {
+    let (url, server, started, release) = serve_gated().await;
+    let dir = TestDir::new();
+    let manager = DownloadManager::new().unwrap();
+    let first = manager
+        .start(managed_request(
+            "case-a",
+            url.clone(),
+            dir.path().join("Case.bin"),
+        ))
+        .unwrap();
+    started.await.unwrap();
+    assert!(matches!(
+        manager.start(managed_request("case-b", url, dir.path().join("case.bin"))),
+        Err(StartError::InvalidRequest(
+            DownloadError::DestinationConflict
+        ))
+    ));
+    manager.cancel(&first).unwrap();
+    release.send(()).unwrap();
+    assert_eq!(
+        wait_for_terminal(&manager, &first).await.state,
+        DownloadState::Cancelled
+    );
+    server.await.unwrap();
+    manager.acknowledge_terminal(&first).unwrap();
 }

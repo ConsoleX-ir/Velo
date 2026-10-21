@@ -9,7 +9,9 @@ The first implementation must establish correct basic HTTP/HTTPS downloads witho
 
 ## Decision
 
-Phase 1 implements a single-stream GET into an exclusively created sibling temporary file, with explicit lifecycle states, bounded progress reporting, cancellation, bounded classified retries from byte zero, response-length validation where available, and promotion only after successful finalization. It uses an in-memory registry and no SQLite recovery. Phase 1 is no-clobber only: existing targets are rejected, and final promotion must be atomic and must fail if the target appeared after validation. Cancellation and finalization are serialized; once `Finalizing` begins, cancellation is rejected as too late. Each accepted job has one retained terminal outcome independent of progress delivery.
+Phase 1A provides the single-stream HTTP/HTTPS transfer primitive. Phase 1B manages one-attempt jobs using that transfer path: caller-supplied IDs, generation-bearing handles, an in-memory FIFO queue, bounded active and retained capacities, latest-value progress, cooperative cancellation, panic supervision, terminal-result acknowledgement, and idempotent shutdown. Retries are deferred; each accepted job makes exactly one attempt. No SQLite recovery is included.
+
+Phase 1 remains no-clobber: existing targets are rejected and promotion fails if a target appears after validation. Cancellation and finalization are serialized; after `Finalizing` begins cancellation returns `TooLate`. A cancellation accepted earlier yields `Cancelled` only after cleanup succeeds; cleanup failure yields `Failed`. Each accepted job has one retained terminal result independent of progress delivery. Terminal publication, active-slot release, and reservation release share one idempotent registry commit path.
 
 ## Consequences
 
@@ -18,9 +20,11 @@ Phase 1 implements a single-stream GET into an exclusively created sibling tempo
 - No Pause, Interrupted, Verifying, Range, or resume state is exposed.
 - Response size may be unknown; successful EOF is the completion signal when no trustworthy length is available.
 - Only final HTTP 200 is accepted; the transfer rejects non-identity content encoding and validates Content-Length against bytes successfully written.
-- Provisional defaults: 3 total attempts, exponential delays of 250 ms and 500 ms with up to +20% jitter, `Retry-After` capped at 30 s (the total retry-delay ceiling), 10 s connect timeout, 30 s read-inactivity timeout, and 24 h network-job deadline. They must be adjustable and tested, not treated as validated UX settings.
+- Phase 1B makes one attempt per accepted job; retries, jitter, and `Retry-After` are deferred. The transfer keeps the 10 s connect, 30 s inactivity, and 24 h request-timeout defaults documented in `DOWNLOAD_ENGINE_DESIGN.md`; these are implementation defaults, not benchmark-validated UX budgets.
 - Ordinary progress is at most 10 updates/second/job; state transitions are immediate and terminal outcomes are retained separately.
 - Provisional admission cap is 4 active and 100 retained job records total, including unacknowledged terminal records. Excess start calls are rejected synchronously.
+- `DownloadHandle` combines the required caller ID with an internal generation. Every manager control, lookup, snapshot, and acknowledgement validates the active generation; acknowledgement permits ID reuse without allowing stale handles to target the new job.
+- `shutdown` closes admission under the registry lock, cancels queued and pre-finalizing active jobs, allows finalizing jobs to finish, and waits for all accepted jobs to commit terminal results. Repeated shutdown calls share the same close state and completion signal. Abrupt process/runtime termination is outside cleanup guarantees.
 - Rust `std::fs::rename` can replace an existing destination. Windows no-clobber promotion must use a same-volume API without replace-existing or cross-volume-copy flags; Windows path/reparse-point behavior remains a release gate.
 
 ## References
