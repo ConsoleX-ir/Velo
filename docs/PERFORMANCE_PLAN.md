@@ -1,11 +1,35 @@
 # Performance and Release Measurement Plan
 
-**Status:** Measurement protocol; no measurements recorded  
+**Status:** Measurement protocol plus one reproducible local engine run; release and UI metrics remain unmeasured
 **Research checked:** 2026-10-21
+
+## Phase 1E local engine run
+
+An opt-in deterministic benchmark/correctness harness is in `src/tests.rs` as the ignored test `local_performance_scenarios`. It runs only against a loopback server and verifies every output byte against a deterministic `(offset % 251)` pattern, exact length, terminal success, monotonic progress snapshots, active-request ceiling, queueing, and absence of leftover temporary files. It reports elapsed wall time and aggregate effective MiB/s. It exercises 1 MiB and 64 MiB single transfers, four concurrent 16 MiB transfers, eight 8 MiB jobs under a four-job active cap, and ten sequential 1 MiB cycles reusing one manager/engine/directory and acknowledging each terminal result. Existing non-benchmark tests cover empty bodies, throttled steady bodies, stalled bodies/timeouts, cancellation, and bounded Range continuation.
+
+Reproduce with:
+
+```powershell
+cargo test --release local_performance_scenarios -- --ignored --nocapture
+```
+
+Observed on 2026-10-22, before any production-code changes for Phase 1E:
+
+| Scenario | Jobs × bytes/job | Elapsed | Aggregate throughput | Correctness / concurrency |
+|---|---:|---:|---:|---|
+| Single fast small | 1 × 1 MiB | 6 ms | 147.11 MiB/s | exact bytes, 1 active, 1 success |
+| Single fast large | 1 × 64 MiB | 190 ms | 335.42 MiB/s | exact bytes, 1 active, 1 success |
+| Four throttled | 4 × 16 MiB | 3,651 ms | 17.53 MiB/s | exact bytes, peak 4 active, 4 successes |
+| Eight queued, four active | 8 × 8 MiB | 3,627 ms | 17.65 MiB/s | exact bytes, peak 4 active, 4 queued at admission, 8 successes |
+| Ten repeated small transfers | 10 sequential × 1 MiB, same manager/engine/directory | 5.47–7.91 ms; median 6.10 ms, nearest-rank p90 7.10 ms | median of per-cycle rates 164.05 MiB/s | all exact; terminal results acknowledged; no temp leftovers |
+
+Environment: Windows NT 10.0.26300.0, Rust 1.96.0, Cargo 1.96.0, 12 logical processors, release profile, repository baseline commit `a65050a`. Windows CIM access was denied, so CPU model and RAM could not be recorded. Storage type, power mode, antivirus state, and thermal state were not controlled. Timings are one exploratory run, not release targets or before/after evidence. The four/eight-job cases intentionally use a mock-server delay of 1 ms per 64 KiB write; those rates characterize the paced harness and should not be interpreted as unthrottled engine throughput. The generated pattern is checked byte-for-byte; no cryptographic digest is used. No CPU or memory measurements were collected.
+
+No production optimization was justified by this single controlled run. The high single-transfer rates and lower explicitly paced rates do not identify an engine bottleneck. Repeat on a controlled reference machine before setting budgets or making performance claims.
 
 ## Targets versus evidence
 
-The approximately 100–130 MB Windows installer is a planning goal only. No package-size, startup, memory, CPU, throughput, or failure-cleanup benchmark has been run for this repository. There is a Git repository containing planning documentation, but no buildable application. Do not present estimates as results.
+The approximately 100–130 MB Windows installer is a planning goal only. The Rust core is buildable and the local engine measurements below have been run, but no packaged desktop application exists. Installer size, installed footprint, startup, process memory/CPU, and controlled LAN results are not available. Do not present estimates as results.
 
 ## Reproducible baseline
 
@@ -40,7 +64,7 @@ Set numeric targets only after Phase 1 produces a baseline on representative har
 
 - **Verified official documentation:** Tauri offers MSI and NSIS Windows packaging paths; WebView2 distribution is configurable. Tokio's ordinary file operations currently use a blocking pool. These facts do not establish the resulting product size or throughput.
 - **Assumption:** 100–130 MB installer is an initial planning range.
-- **Unmeasured:** every performance and packaging metric above.
+- **Unmeasured:** installer and installed size, startup, process CPU/memory, controlled LAN throughput, and release-target distributions. The local results above are narrow engine observations only.
 
 ## References
 

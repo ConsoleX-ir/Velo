@@ -51,6 +51,8 @@
 
 From the repository root, run `cargo fmt --check`, `cargo check`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings`. Execute Windows-only destination and promotion tests on Windows; cross-compilation alone does not validate their runtime behavior. Record exact commands and observed results in the completion report. Loopback server tests may require local-network permission in restricted environments.
 
+The ignored local performance harness is opt-in and is not part of ordinary `cargo test`: run `cargo test --release local_performance_scenarios -- --ignored --nocapture`. It byte-verifies generated fixtures and reports wall time, aggregate throughput, peak server-observed active requests, queued-at-admission jobs, and output/temp-file counts. Record the environment and interpret paced-server results separately from unthrottled throughput; do not infer CPU or memory use from elapsed time.
+
 ## Later-phase tests
 
 - SQLite migrations, interrupted-write recovery, WAL sidecar handling, DB corruption/migration fallback, and user-data deletion.

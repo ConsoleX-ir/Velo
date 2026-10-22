@@ -9,7 +9,7 @@ use std::{
         Arc, Barrier,
     },
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_LENGTH, TRANSFER_ENCODING};
@@ -1863,6 +1863,238 @@ async fn wait_for_terminal(
     })
     .await
     .expect("terminal result should be committed")
+}
+
+async fn serve_generated_body(
+    body_len: u64,
+    chunk_delay: Duration,
+) -> (SocketAddr, Arc<AtomicUsize>, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak_active = Arc::new(AtomicUsize::new(0));
+    let peak_for_server = peak_active.clone();
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let active = active.clone();
+            let peak = peak_for_server.clone();
+            tokio::spawn(async move {
+                let _ = read_request(&mut stream).await;
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(current, Ordering::SeqCst);
+
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n"
+                );
+                let mut ok = stream.write_all(header.as_bytes()).await.is_ok();
+                let mut offset = 0_u64;
+                let mut chunk = vec![0_u8; 64 * 1024];
+                while ok && offset < body_len {
+                    let size = (body_len - offset).min(chunk.len() as u64) as usize;
+                    for (index, byte) in chunk[..size].iter_mut().enumerate() {
+                        *byte = ((offset + index as u64) % 251) as u8;
+                    }
+                    ok = stream.write_all(&chunk[..size]).await.is_ok();
+                    offset += size as u64;
+                    if !chunk_delay.is_zero() {
+                        tokio::time::sleep(chunk_delay).await;
+                    }
+                }
+                let _ = stream.shutdown().await;
+                active.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+    });
+    (address, peak_active, server)
+}
+
+fn verify_generated_file(path: &Path, expected_len: u64) {
+    use std::io::Read;
+
+    let mut file = fs::File::open(path).unwrap();
+    let mut offset = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).unwrap();
+        if count == 0 {
+            break;
+        }
+        for (index, actual) in buffer[..count].iter().enumerate() {
+            assert_eq!(
+                *actual,
+                ((offset + index as u64) % 251) as u8,
+                "content mismatch at byte {} in {}",
+                offset + index as u64,
+                path.display()
+            );
+        }
+        offset += count as u64;
+    }
+    assert_eq!(
+        offset,
+        expected_len,
+        "wrong output length: {}",
+        path.display()
+    );
+}
+
+async fn observe_monotonic_progress(handle: DownloadHandle) {
+    let mut progress = handle.progress();
+    let mut previous = 0;
+    loop {
+        let current = progress.borrow().clone();
+        assert!(current.bytes_written >= previous, "progress moved backward");
+        previous = current.bytes_written;
+        assert!(
+            current
+                .total_bytes
+                .is_none_or(|total| current.bytes_written <= total),
+            "progress exceeded the declared total"
+        );
+        if matches!(
+            current.state,
+            DownloadState::Completed | DownloadState::Failed | DownloadState::Cancelled
+        ) {
+            return;
+        }
+        progress.changed().await.unwrap();
+    }
+}
+
+#[tokio::test]
+#[ignore = "manual local benchmark; run with cargo test --release local_performance_scenarios -- --ignored --nocapture"]
+async fn local_performance_scenarios() {
+    async fn scenario(
+        label: &str,
+        body_len: u64,
+        jobs: usize,
+        max_active: usize,
+        chunk_delay: Duration,
+        cycle: usize,
+    ) {
+        let (address, peak_active, server) = serve_generated_body(body_len, chunk_delay).await;
+        let dir = TestDir::new();
+        let manager = DownloadManager::with_config(DownloadManagerConfig {
+            max_active,
+            max_retained_jobs: jobs.max(1),
+        })
+        .unwrap();
+        let started = Instant::now();
+        let mut handles = Vec::with_capacity(jobs);
+        for index in 0..jobs {
+            handles.push(
+                manager
+                    .start(managed_request(
+                        &format!("{label}-{cycle}-{index}"),
+                        format!("http://{address}/payload"),
+                        dir.path().join(format!("payload-{index}.bin")),
+                    ))
+                    .unwrap(),
+            );
+        }
+        let queued_at_admission = handles
+            .iter()
+            .filter(|handle| handle.latest_progress().state == DownloadState::Queued)
+            .count();
+        let observers: Vec<_> = handles
+            .iter()
+            .cloned()
+            .map(|handle| tokio::spawn(observe_monotonic_progress(handle)))
+            .collect();
+        for handle in &handles {
+            let terminal = wait_for_terminal(&manager, handle).await;
+            assert_eq!(terminal.state, DownloadState::Completed);
+            assert_eq!(terminal.bytes_written, body_len);
+        }
+        let elapsed = started.elapsed();
+        for observer in observers {
+            observer.await.unwrap();
+        }
+        server.abort();
+        manager.shutdown().await;
+
+        for index in 0..jobs {
+            verify_generated_file(&dir.path().join(format!("payload-{index}.bin")), body_len);
+        }
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), jobs);
+        let total_mib = body_len as f64 * jobs as f64 / (1024.0 * 1024.0);
+        let throughput = total_mib / elapsed.as_secs_f64();
+        let peak = peak_active.load(Ordering::SeqCst);
+        assert!(peak <= max_active, "server observed {peak} active requests");
+        if jobs > max_active {
+            assert!(
+                queued_at_admission > 0,
+                "jobs beyond the cap were not queued"
+            );
+        }
+        eprintln!(
+            "PERF label={label} cycle={cycle} jobs={jobs} per_job_bytes={body_len} elapsed_ms={} total_mib={total_mib:.2} throughput_mib_s={throughput:.2} max_active_observed={peak} queued_at_admission={queued_at_admission} success={jobs} failure=0 output_integrity=exact temp_files=0",
+            elapsed.as_millis()
+        );
+    }
+
+    scenario("small-fast", 1 << 20, 1, 1, Duration::ZERO, 0).await;
+    scenario("large-fast", 64 << 20, 1, 1, Duration::ZERO, 0).await;
+    scenario(
+        "four-throttled",
+        16 << 20,
+        4,
+        4,
+        Duration::from_millis(1),
+        0,
+    )
+    .await;
+    scenario("eight-queued", 8 << 20, 8, 4, Duration::from_millis(1), 0).await;
+
+    // Reuse one manager, engine, server, and directory while acknowledging
+    // each terminal result. This catches stale reservations and temp leakage.
+    let body_len = 1 << 20;
+    let (address, _, server) = serve_generated_body(body_len, Duration::ZERO).await;
+    let dir = TestDir::new();
+    let manager = DownloadManager::with_config(DownloadManagerConfig {
+        max_active: 4,
+        max_retained_jobs: 2,
+    })
+    .unwrap();
+    let mut elapsed_ms = Vec::with_capacity(10);
+    for cycle in 0..10 {
+        let destination = dir.path().join(format!("repeat-{cycle}.bin"));
+        let started = Instant::now();
+        let handle = manager
+            .start(managed_request(
+                &format!("repeat-cycle-{cycle}"),
+                format!("http://{address}/payload"),
+                destination.clone(),
+            ))
+            .unwrap();
+        let observer = tokio::spawn(observe_monotonic_progress(handle.clone()));
+        let terminal = wait_for_terminal(&manager, &handle).await;
+        let elapsed = started.elapsed();
+        observer.await.unwrap();
+        assert_eq!(terminal.state, DownloadState::Completed);
+        assert_eq!(terminal.bytes_written, body_len);
+        verify_generated_file(&destination, body_len);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), cycle + 1);
+        manager.acknowledge_terminal(&handle).unwrap();
+        elapsed_ms.push(elapsed.as_secs_f64() * 1000.0);
+    }
+    server.abort();
+    manager.shutdown().await;
+    elapsed_ms.sort_by(f64::total_cmp);
+    let median_ms = (elapsed_ms[4] + elapsed_ms[5]) / 2.0;
+    let p90_ms = elapsed_ms[8];
+    let min_ms = elapsed_ms[0];
+    let max_ms = elapsed_ms[9];
+    let mut throughputs_mib_s: Vec<_> = elapsed_ms
+        .iter()
+        .map(|elapsed| (body_len as f64 / (1024.0 * 1024.0)) / (elapsed / 1000.0))
+        .collect();
+    throughputs_mib_s.sort_by(f64::total_cmp);
+    let median_mib_s = (throughputs_mib_s[4] + throughputs_mib_s[5]) / 2.0;
+    eprintln!(
+        "PERF label=repeated-cycle cycles=10 bytes_per_cycle={body_len} elapsed_ms_min={min_ms:.2} median={median_ms:.2} p90={p90_ms:.2} max={max_ms:.2} median_throughput_mib_s={median_mib_s:.2} success=10 failure=0 output_integrity=exact leftover_temp_files=0"
+    );
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 10);
 }
 
 #[tokio::test]
