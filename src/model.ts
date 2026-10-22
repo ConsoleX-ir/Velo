@@ -24,6 +24,39 @@ export type DownloadDto = {
 
 export type DownloadView = "downloads" | "queue" | "completed" | "categories" | "settings";
 export type Filter = "all" | "active" | "queued" | "completed" | "failed";
+export type SpeedHistory = { sampledAt: number | null; samples: number[] };
+
+export const SPEED_SAMPLE_INTERVAL_MS = 1_000;
+export const SPEED_HISTORY_LIMIT = 36;
+
+export const emptySpeedHistory = (): SpeedHistory => ({ sampledAt: null, samples: [] });
+
+export function recordSpeedSample(
+  current: SpeedHistory,
+  state: DownloadState,
+  rate: number | null,
+  now: number,
+): SpeedHistory {
+  if (isTerminal(state)) return current.samples.length ? emptySpeedHistory() : current;
+  if (state !== "downloading" || rate === null || !Number.isFinite(rate) || rate < 0) return current;
+  if (current.sampledAt !== null && now - current.sampledAt < SPEED_SAMPLE_INTERVAL_MS) return current;
+  return {
+    sampledAt: now,
+    samples: [...current.samples, rate].slice(-SPEED_HISTORY_LIMIT),
+  };
+}
+
+export function speedHistoryPoints(samples: number[], width = 132, height = 42): string {
+  if (!samples.length || width <= 0 || height <= 0) return "";
+  const valid = samples.map((value) => Math.max(0, Number.isFinite(value) ? value : 0));
+  const max = Math.max(...valid);
+  const pad = 3;
+  return valid.map((value, index) => {
+    const x = valid.length === 1 ? width / 2 : (index / (valid.length - 1)) * width;
+    const y = height - pad - (max > 0 ? (value / max) * (height - pad * 2) : 0);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+}
 
 export function isTerminal(state: DownloadState): boolean {
   return state === "completed" || state === "failed" || state === "cancelled";
@@ -75,7 +108,7 @@ export function progressPercent(item: DownloadDto): number | null {
 }
 
 export function formatRate(rate: number | null): string | null {
-  return rate && rate > 0 ? `${formatBytes(rate)}/s` : null;
+  return rate !== null && Number.isFinite(rate) && rate >= 0 ? `${formatBytes(rate)}/s` : null;
 }
 
 export function formatEta(seconds: number | null): string | null {

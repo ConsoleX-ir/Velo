@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatBytes, isTerminal, mergeDownloads, progressPercent, selectDownloads, suggestedFileName, validateUrl, type DownloadDto } from "./model";
+import { emptySpeedHistory, formatBytes, formatRate, isTerminal, mergeDownloads, progressPercent, recordSpeedSample, selectDownloads, speedHistoryPoints, suggestedFileName, validateUrl, type DownloadDto } from "./model";
 
 const item = (patch: Partial<DownloadDto> = {}): DownloadDto => ({
   id: "job-1",
@@ -43,10 +43,34 @@ describe("download presentation model", () => {
     expect(validateUrl("https://example.test/file")).toBeNull();
     expect(validateUrl("ftp://example.test/file")).not.toBeNull();
     expect(validateUrl("https://user:pass@example.test/file")).not.toBeNull();
+    expect(formatRate(0)).toBe("0 B/s");
   });
 
   it("uses a safe filename suggestion", () => {
     expect(suggestedFileName("https://example.test/a%3Fb.zip?token=secret")).toBe("a_b.zip");
     expect(suggestedFileName("https://example.test/")).toBe("download");
+  });
+
+  it("samples bounded real speed history, including zero, at a stable interval", () => {
+    const first = recordSpeedSample(emptySpeedHistory(), "downloading", 512, 1_000);
+    expect(first.samples).toEqual([512]);
+    expect(recordSpeedSample(first, "downloading", 0, 1_500)).toBe(first);
+    const stopped = recordSpeedSample(first, "downloading", 0, 2_000);
+    expect(stopped.samples).toEqual([512, 0]);
+    let history = stopped;
+    for (let index = 0; index < 40; index += 1) {
+      history = recordSpeedSample(history, "downloading", index + 1, 3_000 + index * 1_000);
+    }
+    expect(history.samples).toHaveLength(36);
+    expect(history.samples.at(-1)).toBe(40);
+    expect(recordSpeedSample(history, "completed", 800, 50_000).samples).toEqual([]);
+    expect(recordSpeedSample(history, "cancelled", 800, 50_000).samples).toEqual([]);
+    expect(recordSpeedSample(history, "downloading", null, 50_000)).toBe(history);
+  });
+
+  it("maps speed history into a bounded sparkline and handles zero or missing values", () => {
+    expect(speedHistoryPoints([])).toBe("");
+    expect(speedHistoryPoints([0])).toBe("66.0,39.0");
+    expect(speedHistoryPoints([0, 10, 5])).toBe("0.0,39.0 66.0,3.0 132.0,21.0");
   });
 });

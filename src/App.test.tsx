@@ -99,4 +99,25 @@ describe("application preferences", () => {
     expect(container.textContent).toContain("8 B of 10 B");
     expect(container.textContent).not.toContain("2 B of 10 B");
   });
+
+  it("never presents terminal speed as a live measurement", async () => {
+    const completed = {
+      id: "done", generation: 1, revision: 2, order: 2, fileName: "finished.zip", state: "completed" as const,
+      bytesWritten: 10, totalBytes: 10, speedBytesPerSecond: 512, etaSeconds: null, error: null,
+    };
+    await act(async () => eventListener?.({ payload: completed }));
+    expect(container.querySelector(".speed-chart")).toBeNull();
+    expect(container.textContent).not.toContain("512 B/s");
+  });
+
+  it("renders a speed chart from a real-shaped active download event", async () => {
+    const active = {
+      id: "active", generation: 1, revision: 2, order: 3, fileName: "transfer.bin", state: "downloading" as const,
+      bytesWritten: 512, totalBytes: null, speedBytesPerSecond: 512, etaSeconds: null, error: null,
+    };
+    await act(async () => eventListener?.({ payload: active }));
+    expect(container.querySelector(".speed-chart-plot")?.getAttribute("role")).toBe("img");
+    expect(container.querySelector(".speed-chart-heading strong")?.textContent).toBe("512 B/s");
+    expect(container.textContent).toContain("SIZE UNKNOWN");
+  });
 });

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
@@ -6,15 +6,19 @@ import {
   formatBytes,
   formatEta,
   formatRate,
+  emptySpeedHistory,
   isTerminal,
   mergeDownloads,
   progressPercent,
+  recordSpeedSample,
   selectDownloads,
+  speedHistoryPoints,
   suggestedFileName,
   validateUrl,
   type DownloadDto,
   type DownloadView,
   type Filter,
+  type SpeedHistory,
 } from "./model";
 
 const navItems: { id: DownloadView; label: string; icon: IconName }[] = [
@@ -26,6 +30,7 @@ const navItems: { id: DownloadView; label: string; icon: IconName }[] = [
 ];
 
 type IconName = "download" | "queue" | "check" | "grid" | "settings" | "plus" | "search" | "sun" | "moon" | "folder" | "close" | "globe" | "arrow" | "spark" | "pause" | "alert" | "clock" | "cancel" | "info";
+const NO_SPEED_SAMPLES: number[] = [];
 
 function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
   const paths: Record<IconName, ReactNode> = {
@@ -69,13 +74,33 @@ export default function App() {
   const [theme, setTheme] = useState(() => localStorage.getItem("velo-theme") === "light" ? "light" : "dark");
   const [reducedMotion, setReducedMotion] = useState(() => localStorage.getItem("velo-motion") === "reduced");
   const [pending, setPending] = useState<Set<string>>(() => new Set());
+  const [speedHistories, setSpeedHistories] = useState<Record<string, SpeedHistory>>({});
+  const latestRevision = useRef(new Map<string, number>());
   const searchRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => {
+  function projectDownload(item: DownloadDto) {
+    const key = `${item.id}:${item.generation}`;
+    const revision = latestRevision.current.get(key);
+    if (revision !== undefined && item.revision <= revision) return;
+    latestRevision.current.set(key, item.revision);
+    setDownloads((current) => mergeDownloads(current, [item]));
+    const now = Date.now();
+    setSpeedHistories((current) => {
+      const before = current[key];
+      const history = recordSpeedSample(before ?? emptySpeedHistory(), item.state, item.speedBytesPerSecond, now);
+      if (history === before || (!before && history.samples.length === 0)) return current;
+      const next = { ...current };
+      if (history.samples.length) next[key] = history;
+      else delete next[key];
+      return next;
+    });
+  }
+
+  useLayoutEffect(() => {
     document.documentElement.dataset.theme = theme;
     localStorage.setItem("velo-theme", theme);
   }, [theme]);
-  useEffect(() => {
+  useLayoutEffect(() => {
     document.documentElement.dataset.motion = reducedMotion ? "reduced" : "system";
     localStorage.setItem("velo-motion", reducedMotion ? "reduced" : "system");
   }, [reducedMotion]);
@@ -86,13 +111,13 @@ export default function App() {
     void (async () => {
       try {
         const stopListening = await listen<DownloadDto>("download-updated", (event) => {
-          if (alive) setDownloads((current) => mergeDownloads(current, [event.payload]));
+          if (alive) projectDownload(event.payload);
         });
         if (!alive) stopListening();
         else unlisten = stopListening;
         const initial = await invoke<DownloadDto[]>("list_downloads");
         if (alive) {
-          setDownloads((current) => mergeDownloads(current, initial));
+          initial.forEach(projectDownload);
           setEngineConnected(true);
           setReady(true);
           setConnectionError(null);
@@ -154,6 +179,14 @@ export default function App() {
     try {
       await invoke("acknowledge_download", { id: item.id, generation: item.generation });
       setDownloads((current) => current.filter((candidate) => candidate.id !== item.id || candidate.generation !== item.generation));
+      const key = `${item.id}:${item.generation}`;
+      latestRevision.current.delete(key);
+      setSpeedHistories((current) => {
+        if (!current[key]) return current;
+        const next = { ...current };
+        delete next[key];
+        return next;
+      });
     } catch (error) {
       setConnectionError(errorText(error));
     } finally {
@@ -178,15 +211,14 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      <div className="ambient ambient-one" aria-hidden="true" />
-      <div className="ambient ambient-two" aria-hidden="true" />
       <aside className="sidebar">
         <div className="brand-lockup">
-          <div className="brand-mark"><span /><span /><span /></div>
+          <img className="brand-mark" src="/velo-mark.svg" alt="" />
           <div><span className="brand-name">console<span>x</span></span><span className="brand-product">VELO</span></div>
         </div>
         <div className="sidebar-section-label">WORKSPACE</div>
         <nav className="main-nav" aria-label="Main navigation">
+          <div className="nav-current" aria-hidden="true" style={{ top: `${Math.max(0, navItems.findIndex((item) => item.id === view)) * 47}px` }} />
           {navItems.map((item) => (
             <button key={item.id} className={`nav-item ${view === item.id ? "selected" : ""}`} onClick={() => setView(item.id)} aria-current={view === item.id ? "page" : undefined}>
               <Icon name={item.icon} /> <span>{item.label}</span>
@@ -257,8 +289,8 @@ export default function App() {
               {!ready ? <div className="loading-state"><span className="loading-ring" /> Connecting to the local download engine…</div> : visibleDownloads.length === 0 ? (
                 view === "downloads" && filter === "all" && downloads.length === 0 && !query ? <EmptyState onAdd={() => setDialogOpen(true)} /> : <div className="filtered-empty"><div className="filtered-empty-icon"><Icon name="search" size={22} /></div><strong>{query ? "No matching downloads" : view === "completed" ? "Nothing completed yet" : view === "queue" ? "Your queue is clear" : "No items in this filter"}</strong><span>{query ? "Try a different filename or clear your search." : "New activity will appear here as it happens."}</span></div>
               ) : (
-                <div className="download-list" aria-live="polite">
-                  {visibleDownloads.map((item) => <DownloadCard key={`${item.id}:${item.generation}`} item={item} pending={pending.has(`${item.id}:${item.generation}`)} onCancel={() => void cancelDownload(item)} onDismiss={() => void dismissDownload(item)} />)}
+                <div className="download-list" aria-live="off">
+                  {visibleDownloads.map((item) => <DownloadCard key={`${item.id}:${item.generation}`} item={item} speedHistory={speedHistories[`${item.id}:${item.generation}`]?.samples ?? NO_SPEED_SAMPLES} pending={pending.has(`${item.id}:${item.generation}`)} onCancel={() => void cancelDownload(item)} onDismiss={() => void dismissDownload(item)} />)}
                 </div>
               )}
             </>
@@ -271,7 +303,7 @@ export default function App() {
   );
 }
 
-function DownloadCard({ item, pending, onCancel, onDismiss }: { item: DownloadDto; pending: boolean; onCancel: () => void; onDismiss: () => void }) {
+function DownloadCard({ item, speedHistory, pending, onCancel, onDismiss }: { item: DownloadDto; speedHistory: number[]; pending: boolean; onCancel: () => void; onDismiss: () => void }) {
   const percent = progressPercent(item);
   const terminal = isTerminal(item.state);
   const stateLabel: Record<DownloadDto["state"], string> = {
@@ -298,9 +330,14 @@ function DownloadCard({ item, pending, onCancel, onDismiss }: { item: DownloadDt
     <div className={`file-icon ${terminal ? item.state : "active"}`}><Icon name={stateIcon[item.state]} size={21} /></div>
     <div className="card-main">
       <div className="card-heading"><div className="file-title" title={item.fileName}>{item.fileName}</div><span className={`state-pill ${item.state}`}><span className="pill-dot" />{stateLabel[item.state]}</span></div>
-      <div className={`card-secondary ${item.state === "failed" ? "error-copy" : ""}`}>{secondary}</div>
-      {item.state !== "cancelled" && <div className={`progress-track ${item.state === "completed" ? "complete" : ""}`}><span style={{ width: `${percent ?? (item.state === "completed" ? 100 : item.state === "queued" ? 0 : 4)}%` }} /></div>}
-      <div className="card-meta"><span>{percent === null ? (item.totalBytes === null && item.state === "downloading" ? "SIZE UNKNOWN" : stateLabel[item.state].toUpperCase()) : `${Math.floor(percent)}%`}</span>{rate && <span className="meta-live"><Icon name="download" size={12} /> {rate}</span>}{eta && <span>{eta}</span>}{item.state === "finalizing" && <span>Syncing file to disk</span>}</div>
+      <div className={`card-content ${item.state === "downloading" ? "has-speed-chart" : ""}`}>
+        <div className="transfer-copy">
+          <div className={`card-secondary ${item.state === "failed" ? "error-copy" : ""}`}>{secondary}</div>
+          {item.state !== "cancelled" && <div className={`progress-track ${item.state === "completed" ? "complete" : ""}`}><span style={{ width: `${percent ?? (item.state === "completed" ? 100 : item.state === "queued" ? 0 : 4)}%` }} /></div>}
+          <div className="card-meta"><span>{percent === null ? (item.totalBytes === null && item.state === "downloading" ? "SIZE UNKNOWN" : stateLabel[item.state].toUpperCase()) : `${Math.floor(percent)}%`}</span>{eta && <span>{eta}</span>}{item.state === "finalizing" && <span>Syncing file to disk</span>}</div>
+        </div>
+        {item.state === "downloading" && <SpeedChart history={speedHistory} currentRate={rate} />}
+      </div>
     </div>
     <div className="card-actions">
       {!terminal && item.state !== "finalizing" && <button className="icon-button cancel-button" onClick={onCancel} disabled={pending} aria-label={`Cancel ${item.fileName}`} title="Cancel download">{pending ? <span className="button-spinner" /> : <Icon name="close" size={17} />}</button>}
@@ -309,9 +346,29 @@ function DownloadCard({ item, pending, onCancel, onDismiss }: { item: DownloadDt
   </article>;
 }
 
+const SpeedChart = memo(function SpeedChart({ history, currentRate }: { history: number[]; currentRate: string | null }) {
+  const points = speedHistoryPoints(history);
+  const first = points ? points.split(" ")[0].split(",") : null;
+  const last = points ? points.split(" ").at(-1)?.split(",") : null;
+  const line = points ? `M ${points.replaceAll(" ", " L ")}` : "";
+  const area = points ? `${line} L 132,42 L 0,42 Z` : "";
+  const label = currentRate ?? "Measuring";
+
+  return <div className="speed-chart">
+    <div className="speed-chart-heading"><span>Recent speed</span><strong>{label}</strong></div>
+    {history.length ? <svg className="speed-chart-plot" viewBox="0 0 132 42" role="img" aria-label={`Recent download speed history, sampled about once per second. Current speed ${currentRate ?? "unavailable"}.`}>
+      <path className="speed-chart-area" d={area} />
+      <path className="speed-chart-line" d={line} />
+      {first && <circle className="speed-chart-point" cx={first[0]} cy={first[1]} r="2" />}
+      {last && <circle className="speed-chart-point current" cx={last[0]} cy={last[1]} r="3" />}
+    </svg> : <div className="speed-chart-empty" aria-hidden="true">Collecting samples</div>}
+    <span className="speed-chart-caption">{history.length} {history.length === 1 ? "sample" : "samples"} · about 1 sec apart</span>
+  </div>;
+});
+
 function EmptyState({ onAdd }: { onAdd: () => void }) {
   return <div className="empty-state">
-    <div className="motion-wave" aria-hidden="true"><span className="wave wave-a" /><span className="wave wave-b" /><span className="wave wave-c" /><div className="wave-core"><Icon name="download" size={30} /></div><i className="wave-star star-a" /><i className="wave-star star-b" /><i className="wave-star star-c" /></div>
+    <img className="empty-mark" src="/velo-mark.svg" alt="" />
     <div className="empty-eyebrow"><span /> READY WHEN YOU ARE <span /></div>
     <h2>A little more <em>flow.</em></h2>
     <p>Your download space is clear. Add a link and let Velo take it from here.</p>

@@ -5,6 +5,8 @@
 
 **Implementation update (2026-10-22):** The root-level Rust library includes the Phase 1A HTTP/HTTPS transfer core and Phase 1B `DownloadManager`, with FIFO admission, generation-bearing handles, cancellation, coalesced progress, retained terminal results, shutdown, and bounded strong-ETag-validated Range continuation after interrupted bodies. Phase 1D hardening rejects ambiguous Content-Length/Transfer-Encoding framing and prevents Range metadata from crossing redirects. `src-tauri/` now contains the native Tauri application service and the React/TypeScript frontend lives at the repository root. The application service validates UI requests, owns the manager, maps its snapshots into frontend DTOs, sends state updates as Tauri events, and acknowledges terminal results only when dismissed. UI history remains session-only. Packaging and interactive GUI behavior still require validation on the target Windows setup.
 
+**UI refinement update (2026-10-22):** The Aurora palette is now restrained, light and dark surfaces share theme-aware contrast tokens, and navigation, toolbar, and dialog use selective CSS glass materials with static edge reflections and blur. Navigation movement uses a short reduced-motion-aware CSS transition; no animation or chart framework was added. Active download speed charts consume the native DTO's measured bytes-per-second value, sampling at most once per second into a 36-value per-generation session buffer. SVG sparklines are hidden outside `Downloading`; terminal states never show a live rate. The custom V/download mark is the bundled frontend mark and source for the Windows ICO. No engine DTO or lifecycle behavior changed.
+
 ## Chosen stack
 
 - Desktop shell and native/webview bridge: Tauri 2.

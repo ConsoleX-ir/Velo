@@ -1,6 +1,6 @@
 # Test Strategy
 
-**Status:** Phase 1A/1B suite with Phase 1D adversarial HTTP coverage; Windows validation passed 65 tests on 2026-10-22
+**Status:** Phase 1A/1B suite with Phase 1D adversarial HTTP coverage and Phase 2 UI/IPC coverage; Windows engine validation passed 65 tests on 2026-10-22
 **Research checked:** 2026-10-22
 
 ## Phase 1 test layers
@@ -9,7 +9,7 @@
 2. **Engine integration tests:** use a loopback ephemeral-port HTTP server with scripted responses; no public internet. Compare output bytes directly so no hash dependency is needed for the fixture gate.
 3. **Filesystem integration tests:** temporary directories; exact bytes, collision behavior, failure cleanup, existing-file preservation, no-replace promotion, and finalization behavior.
 4. **Windows-specific tests:** reserved/device names, Unicode and long paths where supported, ACL/permission failure, junction/reparse-point cases, concurrent destination reservation, installer smoke test when packaging exists.
-5. **Frontend/IPC tests:** model tests cover revision-based merging, filtering, formatting, and URL/name validation; app tests cover persisted preferences and stale initial snapshots arriving after newer events. Tauri service tests cover command validation, safe errors, and a real loopback download. Capability restrictions and packaged WebView behavior remain manual release checks.
+5. **Frontend/IPC tests:** model tests cover revision-based merging, filtering, formatting, URL/name validation, bounded one-second speed-history sampling, and sparkline geometry; app tests cover persisted preferences, stale initial snapshots, active chart rendering, terminal metric suppression, and focus return. Tauri service tests cover command validation, safe errors, and a real loopback download. Capability restrictions and packaged WebView behavior remain manual release checks.
 
 ## Required scenario matrix
 
