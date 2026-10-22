@@ -36,7 +36,7 @@
 - Connect UI to tested engine; test event ordering/backpressure and packaged standard-user behavior.
 - Decide exact Windows support matrix, installer type, WebView2 strategy, app identity, signing, and distribution.
 
-Implementation now present: local Tauri shell, responsive Aurora Stream UI, native save-dialog workflow, typed command DTOs, manager-backed list/start/cancel/dismiss flow, session-only active/queued/completed/failed states, theme and reduced-motion preferences, plus frontend and native service tests. No pause/retry/history/category persistence or file opening is presented as supported. Windows packaging and interactive GUI validation remain release gates.
+Implementation now present: local Tauri shell, responsive Aurora Stream UI, native save-dialog workflow, typed command DTOs, manager-backed list/start/cancel/pause/resume/retry/dismiss flow, theme and reduced-motion preferences, persisted local history with DPAPI-protected URLs, plus frontend and native service tests. Restarted in-progress jobs are marked Interrupted and retry from byte zero. Categories and file opening remain unsupported. Windows installer smoke testing and interactive GUI validation remain release gates.
 
 ## Phase 3 — Durable metadata and startup recovery
 

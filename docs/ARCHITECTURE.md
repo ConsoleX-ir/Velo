@@ -1,11 +1,13 @@
 # ConsoleX Velo Architecture
 
-**Status:** Phase 1B managed Rust core with a Phase 2 Tauri + React application scaffold
+**Status:** Managed Rust core and Windows Tauri + React application with local history
 **Research checked:** 2026-10-21
 
-**Implementation update (2026-10-22):** The root-level Rust library includes the Phase 1A HTTP/HTTPS transfer core and Phase 1B `DownloadManager`, with FIFO admission, generation-bearing handles, cancellation, coalesced progress, retained terminal results, shutdown, and bounded strong-ETag-validated Range continuation after interrupted bodies. Phase 1D hardening rejects ambiguous Content-Length/Transfer-Encoding framing and prevents Range metadata from crossing redirects. `src-tauri/` now contains the native Tauri application service and the React/TypeScript frontend lives at the repository root. The application service validates UI requests, owns the manager, maps its snapshots into frontend DTOs, sends state updates as Tauri events, and acknowledges terminal results only when dismissed. UI history remains session-only. Packaging and interactive GUI behavior still require validation on the target Windows setup.
+**Implementation update (2026-10-22):** The root-level Rust library includes the HTTP/HTTPS transfer core and managed `DownloadManager`, with FIFO admission, generation-bearing handles, cancellation, coalesced progress, retained terminal results, shutdown, and bounded strong-ETag-validated Range continuation after interrupted bodies. It also supports chunk-boundary pause/resume. `src-tauri/` contains the native Tauri application service and the React/TypeScript frontend lives at the repository root. The service validates UI requests, owns the manager, maps snapshots into frontend DTOs, sends state updates as Tauri events, and persists local history. Packaging and interactive GUI behavior still require validation on the target Windows setup.
 
 **UI refinement update (2026-10-22):** The Aurora palette is now restrained, light and dark surfaces share theme-aware contrast tokens, and navigation, toolbar, and dialog use selective CSS glass materials with static edge reflections and blur. Navigation movement uses a short reduced-motion-aware CSS transition; no animation or chart framework was added. Active download speed charts consume the native DTO's measured bytes-per-second value, sampling at most once per second into a 36-value per-generation session buffer. SVG sparklines are hidden outside `Downloading`; terminal states never show a live rate. The custom V/download mark is the bundled frontend mark and source for the Windows ICO. No engine DTO or lifecycle behavior changed.
+
+**Application update (2026-10-22):** Tailwind CSS v4 is integrated through its Vite plugin, with existing CSS variables mapped to semantic utility tokens. The small `src/components/ui/button.tsx` component follows the shadcn/ui composition pattern without adding a runtime component dependency. Downloads can pause at a chunk boundary and resume in the same session only when the engine has a known total and strong ETag checkpoint. A JSON snapshot under the per-user app-data directory stores history and DPAPI-protected original URLs. On restart, unfinished jobs are marked interrupted and retry from byte zero; persisted partials are not advertised as restart-resumable. Completed history is checked against the saved file length.
 
 ## Chosen stack
 
@@ -14,7 +16,7 @@
 - Async orchestration: Tokio.
 - HTTP client: Reqwest.
 - UI: React + TypeScript.
-- Persistent metadata: SQLite, introduced after the in-memory Phase 1 core contract is stable.
+- Persistent metadata: atomic JSON snapshot in per-user app data; SQLite remains a future option if scale or query needs require it.
 
 This is the current project decision. No Electron comparison is in scope absent a concrete blocker.
 
@@ -26,35 +28,36 @@ React + TypeScript
        └─ application service (validation, command authorization, orchestration)
             ├─ managed download engine (HTTP lifecycle, streaming, cancellation)
             ├─ destination/file policy (path and collision rules)
-            └─ in-memory job registry (Phase 1; no database)
+            ├─ in-memory job registry
+            └─ JSON history snapshot with Windows DPAPI URL protection
 ```
 
 The frontend does not open arbitrary filesystem paths or perform network requests directly. The Tauri command layer exposes explicit operations and DTOs; it does not expose generic shell, filesystem, or HTTP capabilities. The native service invokes the manager for admission and cancellation, listens to each accepted handle's coalesced latest-value progress, and emits versioned UI snapshots. Startup subscribes to the event before requesting the initial snapshot; DTO revisions prevent older snapshots from replacing newer events. The frontend never treats itself as the source of transfer truth. The Phase 1 engine remains a Rust library boundary independent of Tauri, tested without a webview.
 
-The native app exposes `list_downloads`, `start_download`, `cancel_download`, and `acknowledge_download`. Destination selection uses the Tauri dialog plugin's save dialog; the selected path is still validated in Rust. File opening and folder reveal are intentionally absent. Tauri capability permissions are limited to core defaults and save-dialog access. The application waits for manager shutdown before allowing the normal close event to complete.
+The native app exposes list, start, cancel, pause, resume, retry, and acknowledge operations. Destination selection uses the Tauri dialog plugin's save dialog; the selected path is still validated in Rust. File opening and folder reveal are intentionally absent. Tauri capability permissions are limited to core defaults and save-dialog access. The application waits for manager shutdown before allowing the normal close event to complete.
 
-The frontend uses CSS design tokens and no component/animation framework. Dark and light palettes and reduced-motion preference are stored locally in webview localStorage. The categories view explains that categories are unavailable; completed records are limited to the current session. There is no SQLite persistence.
+The frontend uses CSS design tokens and Tailwind utilities, with a small local Button component. Dark and light palettes and reduced-motion preference are stored locally in webview localStorage. The categories view explains that categories are unavailable. Download history persists across launches.
 
 ## State ownership and communication
 
 - The native core owns authoritative download lifecycle state and byte counters.
-- UI state is a projection of native snapshots/events and may be reconstructed; it is not durable truth.
+- UI state is a projection of native snapshots/events. A JSON snapshot preserves history, destination, counters, and DPAPI-encrypted original URL; active transport state is not durable truth.
 - Commands carry stable download IDs and validated request fields. State transitions are emitted immediately; ordinary progress is limited to at most 10 updates per second per job.
 - Progress is latest-value/coalesced, with at most one pending snapshot per job. Terminal outcome is immutable and separately retained in the job registry until acknowledged; it is not an ordinary event that a bounded queue can drop.
-- Phase 1B uses an in-memory registry, one task per active job, and caller-ID plus generation handles. Interrupted response bodies can continue with up to three strict `If-Range` requests using a known total and strong ETag; this does not provide restart recovery. Byte-zero retries remain deferred.
+- The engine uses an in-memory registry, one task per active job, and caller-ID plus generation handles. Interrupted response bodies can continue with up to three strict `If-Range` requests using a known total and strong ETag. User pause/resume retains a validated same-session checkpoint. Restart recovery marks unfinished work Interrupted; Retry starts at byte zero.
 - Provisional scheduler cap: 4 active jobs and 100 retained job records, including terminal records not yet acknowledged; reject excess synchronously. Keep the fixed cap until benchmarks justify changing it; adaptive concurrency is deferred.
 
 ## Persistence model and later SQLite boundary
 
-Phase 1 uses no database. Later metadata should distinguish durable user intent from volatile transport state. Candidate durable fields: ID, original URL (with credentials/query-secret handling policy), destination, chosen filename, creation time, last known state, expected size if known, bytes durably recorded, and structured terminal error. Persisted state must not claim an interrupted partial file is resumable until validators/range semantics and file verification are implemented.
+The current app stores a JSON snapshot rather than a database because the manager caps retained jobs at 100 and needs only full-snapshot reads/writes. It stores the original URL only after Windows DPAPI protection, plus destination, DTO, and counters. Writes go to a synced temporary snapshot then replace the prior file. A restart never trusts old partial bytes: unfinished rows become Interrupted and retry from byte zero. Completed file presence and size are checked at startup. SQLite may be introduced if filtering/query volume or concurrent writers outgrow the snapshot model; migration must preserve these rules.
 
-SQLite is selected for local metadata. Database placement should be under the per-user application data directory, not beside the executable. Use schema migrations and transactions. WAL is an option to evaluate, not a default mandate: official SQLite documentation says WAL introduces `-wal`/`-shm` companion files and cannot operate over a network filesystem. Keep database and companions together, and test crash/reopen/migration behavior before enabling WAL.
+If SQLite is introduced later, keep it under per-user app data, use schema migrations and transactions, and evaluate WAL with its companion-file and network-filesystem constraints.
 
 ## Error and shutdown model
 
 Use typed error categories at the engine boundary: invalid request, destination conflict/permission/path error, request construction, DNS/connect/TLS/timeout, redirect policy/limit, non-success HTTP status, body stream error, length mismatch/incomplete response, write/flush/finalize error, worker panic, cleanup failure, and cancellation. Preserve safe diagnostic context (status and category); redact URL userinfo and sensitive query values from logs and UI.
 
-The manager's idempotent shutdown closes admission under the same lock used for dispatch, cancels queued and cancellable active jobs, allows finalizing jobs to finish, and waits until accepted jobs have terminal results and cleanup is complete. The application may impose its own exit deadline; abandoning that wait does not make cleanup complete. Force termination can leave a temporary file and cannot guarantee terminal publication; crash recovery is deferred.
+The manager's idempotent shutdown closes admission under the same lock used for dispatch, cancels queued and cancellable active jobs, allows finalizing jobs to finish, and waits until accepted jobs have terminal results and cleanup is complete. On a later launch, unfinished persisted rows are marked Interrupted and retry from byte zero. Force termination can leave a temporary file; the app does not trust that file for recovery.
 
 ## Security boundaries
 
@@ -78,7 +81,7 @@ Windows x64 is the initial packaging target. Tauri currently documents MSI (WiX)
 - **Verified (official docs, checked 2026-10-21):** Tauri 2 supports a configured CSP and recommends avoiding remote scripts; Windows installers include MSI and NSIS options; Reqwest exposes streamed response bodies and configurable redirect policies; Tokio's filesystem API currently dispatches ordinary blocking file operations via its blocking pool; SQLite WAL uses companion files and has network-filesystem limitations.
 - **Decisions:** selected stack above; isolate engine from Tauri; authoritative lifecycle state in native code; no Phase 1 database; user-selected paths; no downgrade redirects; Phase 1 no-clobber output; cancellation is rejected once `Finalizing` begins; terminal results are retained separately from progress.
 - **Assumptions:** Windows 10/11 x64 first, single-stream transfer, direct distribution, and per-user installation are provisional.
-- **Unresolved:** exact crate versions/features, whether to tune the provisional concurrency cap, installer/runtime policy, support matrix, persistence schema, durable user-controlled resume policy, and segmented-transfer protocol.
+- **Unresolved:** whether to tune the provisional concurrency cap, installer/runtime policy, support matrix, crash-safe resume across restarts, and segmented-transfer protocol.
 
 ## Official references
 

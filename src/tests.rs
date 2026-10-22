@@ -2178,6 +2178,102 @@ async fn manager_cancellation_during_range_continuation_cleans_partial_file() {
 }
 
 #[tokio::test]
+async fn manager_pauses_to_a_strong_etag_checkpoint_and_resumes_at_exact_offset() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (range_started_tx, range_started_rx) = oneshot::channel();
+    let (release_first_tx, release_first_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut initial, _) = listener.accept().await.unwrap();
+        read_request(&mut initial).await;
+        let first = response(
+            "200 OK",
+            "Content-Length: 10\r\nETag: \"stable\"\r\nConnection: close\r\n",
+            b"abcde",
+        );
+        initial.write_all(&first).await.unwrap();
+        initial.shutdown().await.unwrap();
+
+        let (mut interrupted_range, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut interrupted_range).await;
+        assert!(request.to_ascii_lowercase().contains("range: bytes=5-"));
+        let partial = response(
+            "206 Partial Content",
+            "Content-Range: bytes 5-9/10\r\nContent-Length: 5\r\nETag: \"stable\"\r\nConnection: close\r\n",
+            b"f",
+        );
+        interrupted_range.write_all(&partial).await.unwrap();
+        let _ = range_started_tx.send(());
+        let _ = release_first_rx.await;
+        drop(interrupted_range);
+
+        let (mut resumed_range, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut resumed_range).await;
+        assert!(request.to_ascii_lowercase().contains("range: bytes=6-"));
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("if-range: \"stable\""));
+        let tail = response(
+            "206 Partial Content",
+            "Content-Range: bytes 6-9/10\r\nContent-Length: 4\r\nETag: \"stable\"\r\nConnection: close\r\n",
+            b"ghij",
+        );
+        resumed_range.write_all(&tail).await.unwrap();
+        resumed_range.shutdown().await.unwrap();
+    });
+
+    let dir = TestDir::new();
+    let target = dir.path().join("pause-resume.bin");
+    let manager = DownloadManager::new().unwrap();
+    let handle = manager
+        .start(managed_request(
+            "pause-resume",
+            format!("http://{address}/file"),
+            target.clone(),
+        ))
+        .unwrap();
+    range_started_rx.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if crate::lock_registry(&manager.core)
+                .jobs
+                .get(handle.id())
+                .is_some_and(|record| record.bytes_written == 6)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first range byte should be written before pausing");
+
+    manager.pause(&handle).unwrap();
+    let mut progress = handle.progress();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if handle.latest_progress().state == DownloadState::Paused {
+                break;
+            }
+            progress.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("pause must wait for the partial file to be synced");
+    assert_eq!(handle.latest_progress().bytes_written, 6);
+    release_first_tx.send(()).unwrap();
+
+    manager.resume(&handle).unwrap();
+    let terminal = wait_for_terminal(&manager, &handle).await;
+    server.await.unwrap();
+    assert_eq!(terminal.state, DownloadState::Completed);
+    assert_eq!(terminal.bytes_written, 10);
+    assert_eq!(fs::read(&target).unwrap(), b"abcdefghij");
+    manager.acknowledge_terminal(&handle).unwrap();
+    manager.shutdown().await;
+}
+
+#[tokio::test]
 async fn manager_coalesces_progress_without_losing_terminal_result() {
     let (url, server, started, release) = serve_gated().await;
     let dir = TestDir::new();

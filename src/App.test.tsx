@@ -120,4 +120,20 @@ describe("application preferences", () => {
     expect(container.querySelector(".speed-chart-heading strong")?.textContent).toBe("512 B/s");
     expect(container.textContent).toContain("SIZE UNKNOWN");
   });
+
+  it("sends pause and resume commands for the current download generation", async () => {
+    const active = {
+      id: "active", generation: 4, revision: 1, order: 1, fileName: "transfer.bin", state: "downloading" as const,
+      bytesWritten: 512, totalBytes: 1024, speedBytesPerSecond: 10, etaSeconds: 50, error: null,
+    };
+    await act(async () => eventListener?.({ payload: active }));
+    const pause = container.querySelector<HTMLButtonElement>('[aria-label="Pause transfer.bin"]');
+    await act(async () => pause?.click());
+    expect(invokeMock).toHaveBeenCalledWith("pause_download", { id: "active", generation: 4 });
+
+    await act(async () => eventListener?.({ payload: { ...active, state: "paused", revision: 2 } }));
+    const resume = container.querySelector<HTMLButtonElement>('[aria-label="Resume transfer.bin"]');
+    await act(async () => resume?.click());
+    expect(invokeMock).toHaveBeenCalledWith("resume_download", { id: "active", generation: 4 });
+  });
 });

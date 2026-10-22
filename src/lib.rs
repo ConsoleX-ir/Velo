@@ -5,7 +5,8 @@
 //! promotion. Managed jobs use FIFO scheduling, cooperative cancellation,
 //! coalesced progress snapshots, and retained terminal results. Each accepted
 //! jobs may continue interrupted bodies with bounded, validator-checked Range
-//! requests; durable checkpoints, retries from byte zero, and persistence are deferred.
+//! requests. Same-session pause/resume uses a strong-ETag checkpoint; app-level
+//! history and byte-zero retries are implemented by the Tauri service.
 
 #[cfg(test)]
 use std::{collections::HashSet, sync::atomic::AtomicBool};
@@ -92,6 +93,8 @@ pub enum DownloadState {
     Queued,
     Preparing,
     Downloading,
+    Pausing,
+    Paused,
     Cancelling,
     Finalizing,
     Completed,
@@ -186,6 +189,12 @@ pub enum ControlError {
     NotTerminal,
     #[error("cancellation is too late because finalization has begun")]
     TooLate,
+    #[error("download cannot be paused in its current state")]
+    CannotPause,
+    #[error("download is not paused")]
+    NotPaused,
+    #[error("paused temporary data could not be removed")]
+    CleanupFailed,
 }
 
 #[derive(Debug, Error)]
@@ -267,9 +276,56 @@ pub enum NetworkFailureKind {
     RequestOrBody,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeCheckpoint {
+    pub effective_url: String,
+    pub strong_etag: String,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerControl {
+    Running,
+    Pause,
+    Cancel,
+}
+
 enum TransferExit {
     Complete(u64),
+    Paused {
+        bytes_written: u64,
+        checkpoint: Option<ResumeCheckpoint>,
+    },
     Cancelled,
+}
+
+fn interrupted_transfer(
+    signal: WorkerControl,
+    bytes_written: u64,
+    effective_url: &Url,
+    total_bytes: Option<u64>,
+    etag: Option<&reqwest::header::HeaderValue>,
+) -> TransferExit {
+    match signal {
+        WorkerControl::Cancel => TransferExit::Cancelled,
+        WorkerControl::Running => TransferExit::Cancelled,
+        WorkerControl::Pause => {
+            let checkpoint = total_bytes
+                .filter(|total| bytes_written > 0 && bytes_written < *total)
+                .and_then(|total_bytes| {
+                    let strong_etag = etag?.to_str().ok()?.to_owned();
+                    Some(ResumeCheckpoint {
+                        effective_url: effective_url.as_str().to_owned(),
+                        strong_etag,
+                        total_bytes,
+                    })
+                });
+            TransferExit::Paused {
+                bytes_written,
+                checkpoint,
+            }
+        }
+    }
 }
 
 struct CatchUnwind<F>(Pin<Box<F>>);
@@ -299,29 +355,30 @@ enum TransferEvent {
     },
 }
 
-async fn wait_for_cancel(receiver: &mut watch::Receiver<bool>) {
+async fn wait_for_control(receiver: &mut watch::Receiver<WorkerControl>) -> WorkerControl {
     loop {
-        if *receiver.borrow() {
-            return;
+        let control = *receiver.borrow();
+        if control != WorkerControl::Running {
+            return control;
         }
         if receiver.changed().await.is_err() {
-            return;
+            return WorkerControl::Cancel;
         }
     }
 }
 
 async fn cancellable<F: std::future::Future>(
-    receiver: &mut Option<&mut watch::Receiver<bool>>,
+    receiver: &mut Option<&mut watch::Receiver<WorkerControl>>,
     future: F,
-) -> Option<F::Output> {
+) -> Result<F::Output, WorkerControl> {
     if let Some(receiver) = receiver.as_deref_mut() {
         tokio::select! {
             biased;
-            _ = wait_for_cancel(receiver) => None,
-            output = future => Some(output),
+            control = wait_for_control(receiver) => Err(control),
+            output = future => Ok(output),
         }
     } else {
-        Some(future.await)
+        Ok(future.await)
     }
 }
 
@@ -478,12 +535,17 @@ impl DownloadEngine {
         // (declared earlier, dropped later) removes the file.
         let mut file = file;
         let attempt = self
-            .transfer(&url, &temp_path, &mut file, None, |_| {})
+            .transfer(&url, &temp_path, &mut file, None, None, 0, |_| {})
             .await;
 
         let bytes_written = match attempt {
             Ok(TransferExit::Complete(bytes)) => bytes,
             Ok(TransferExit::Cancelled) => {
+                drop(file);
+                guard.disarm();
+                return Err(cleanup_or_original(&temp_path, DownloadError::Cancelled));
+            }
+            Ok(TransferExit::Paused { .. }) => {
                 drop(file);
                 guard.disarm();
                 return Err(cleanup_or_original(&temp_path, DownloadError::Cancelled));
@@ -533,31 +595,51 @@ impl DownloadEngine {
         })
     }
 
+    // Keeping transfer's source, checkpoint, destination, control channel, and
+    // progress callback explicit makes the streaming contract easy to audit.
+    #[allow(clippy::too_many_arguments)]
     async fn transfer<F>(
         &self,
         url: &Url,
         temp_path: &Path,
         file: &mut tokio::fs::File,
-        mut cancellation: Option<&mut watch::Receiver<bool>>,
+        mut control: Option<&mut watch::Receiver<WorkerControl>>,
+        checkpoint: Option<ResumeCheckpoint>,
+        initial_bytes: u64,
         mut progress: F,
     ) -> Result<TransferExit, DownloadError>
     where
         F: FnMut(TransferEvent),
     {
-        let mut written = 0_u64;
+        let mut written = initial_bytes;
         let started = Instant::now();
-        let mut resume_url = url.clone();
-        let mut expected_total = None;
-        let mut etag: Option<reqwest::header::HeaderValue> = None;
+        let mut resume_url = checkpoint
+            .as_ref()
+            .and_then(|saved| Url::parse(&saved.effective_url).ok())
+            .unwrap_or_else(|| url.clone());
+        let mut expected_total = checkpoint.as_ref().map(|saved| saved.total_bytes);
+        let mut etag: Option<reqwest::header::HeaderValue> = checkpoint
+            .as_ref()
+            .and_then(|saved| reqwest::header::HeaderValue::from_str(&saved.strong_etag).ok());
         let mut resume_requests = 0;
-        let mut first_response = true;
+        let mut first_response = checkpoint.is_none();
 
         loop {
-            if cancellation
+            if control
                 .as_ref()
-                .is_some_and(|receiver| *receiver.borrow())
+                .is_some_and(|receiver| *receiver.borrow() != WorkerControl::Running)
             {
-                return Ok(TransferExit::Cancelled);
+                let signal = control
+                    .as_ref()
+                    .map(|receiver| *receiver.borrow())
+                    .unwrap_or(WorkerControl::Cancel);
+                return Ok(interrupted_transfer(
+                    signal,
+                    written,
+                    &resume_url,
+                    expected_total,
+                    etag.as_ref(),
+                ));
             }
 
             let is_resume = !first_response;
@@ -581,20 +663,28 @@ impl DownloadEngine {
                 return Err(DownloadError::NetworkFailure(NetworkFailureKind::Timeout));
             }
             let response_result = cancellable(
-                &mut cancellation,
+                &mut control,
                 timeout(self.read_inactivity.min(remaining), request.send()),
             )
             .await;
             let response = match response_result {
-                None => return Ok(TransferExit::Cancelled),
-                Some(Err(_)) => {
+                Err(signal) => {
+                    return Ok(interrupted_transfer(
+                        signal,
+                        written,
+                        &resume_url,
+                        expected_total,
+                        etag.as_ref(),
+                    ))
+                }
+                Ok(Err(_)) => {
                     if is_resume && resume_requests < MAX_RESUME_REQUESTS {
                         resume_requests += 1;
                         continue;
                     }
                     return Err(DownloadError::NetworkFailure(NetworkFailureKind::Timeout));
                 }
-                Some(Ok(Err(error))) => {
+                Ok(Ok(Err(error))) => {
                     if is_resume && resume_requests < MAX_RESUME_REQUESTS && !error.is_redirect() {
                         resume_requests += 1;
                         continue;
@@ -609,7 +699,7 @@ impl DownloadEngine {
                         })
                     });
                 }
-                Some(Ok(Ok(response))) => response,
+                Ok(Ok(Ok(response))) => response,
             };
 
             let status = response.status();
@@ -682,11 +772,21 @@ impl DownloadEngine {
             let mut response = response;
             let mut body_error = None;
             loop {
-                if cancellation
+                if control
                     .as_ref()
-                    .is_some_and(|receiver| *receiver.borrow())
+                    .is_some_and(|receiver| *receiver.borrow() != WorkerControl::Running)
                 {
-                    return Ok(TransferExit::Cancelled);
+                    let signal = control
+                        .as_ref()
+                        .map(|receiver| *receiver.borrow())
+                        .unwrap_or(WorkerControl::Cancel);
+                    return Ok(interrupted_transfer(
+                        signal,
+                        written,
+                        &resume_url,
+                        expected_total,
+                        etag.as_ref(),
+                    ));
                 }
                 let remaining = JOB_DEADLINE.saturating_sub(started.elapsed());
                 if remaining.is_zero() {
@@ -694,17 +794,25 @@ impl DownloadEngine {
                     break;
                 }
                 let next = cancellable(
-                    &mut cancellation,
+                    &mut control,
                     timeout(self.read_inactivity.min(remaining), response.chunk()),
                 )
                 .await;
                 let next = match next {
-                    None => return Ok(TransferExit::Cancelled),
-                    Some(Err(_)) => {
+                    Err(signal) => {
+                        return Ok(interrupted_transfer(
+                            signal,
+                            written,
+                            &resume_url,
+                            expected_total,
+                            etag.as_ref(),
+                        ))
+                    }
+                    Ok(Err(_)) => {
                         body_error = Some(DownloadError::BodyInactivityTimeout);
                         break;
                     }
-                    Some(Ok(next)) => next,
+                    Ok(Ok(next)) => next,
                 };
                 let chunk = match next {
                     Ok(Some(chunk)) => chunk,
@@ -837,10 +945,11 @@ struct JobRecord {
     total_bytes: Option<u64>,
     last_progress_at: Instant,
     progress_tx: watch::Sender<ProgressSnapshot>,
-    cancel_tx: watch::Sender<bool>,
+    control_tx: watch::Sender<WorkerControl>,
     cancel_requested: bool,
     active_slot_held: bool,
     temp_path: Option<PathBuf>,
+    checkpoint: Option<ResumeCheckpoint>,
     promoted: bool,
     terminal: Option<Arc<TerminalResult>>,
     task: Option<JoinHandle<()>>,
@@ -986,7 +1095,7 @@ impl DownloadManager {
             total_bytes: None,
         };
         let (progress_tx, progress_rx) = watch::channel(initial);
-        let (cancel_tx, _cancel_rx) = watch::channel(false);
+        let (control_tx, _control_rx) = watch::channel(WorkerControl::Running);
         let id = request.id.clone();
         registry
             .destinations
@@ -1002,10 +1111,11 @@ impl DownloadManager {
                 total_bytes: None,
                 last_progress_at: Instant::now(),
                 progress_tx,
-                cancel_tx,
+                control_tx,
                 cancel_requested: false,
                 active_slot_held: false,
                 temp_path: None,
+                checkpoint: None,
                 promoted: false,
                 terminal: None,
                 task: None,
@@ -1036,7 +1146,7 @@ impl DownloadManager {
 
         record.cancel_requested = true;
         record.state = DownloadState::Cancelling;
-        record.cancel_tx.send_replace(true);
+        record.control_tx.send_replace(WorkerControl::Cancel);
         publish_state(record);
         let queued = registry.queue.iter().position(|id| id == &handle.id);
         if let Some(position) = queued {
@@ -1049,9 +1159,78 @@ impl DownloadManager {
                 None,
             );
             dispatch_locked(&self.core, &mut registry);
+        } else if registry.jobs.get(&handle.id).is_some_and(|record| {
+            record.generation == handle.generation
+                && record.state == DownloadState::Cancelling
+                && !record.active_slot_held
+        }) {
+            let temp_path = registry
+                .jobs
+                .get_mut(&handle.id)
+                .and_then(|record| record.temp_path.take());
+            if temp_path
+                .as_deref()
+                .is_some_and(|path| cleanup_only(path).is_err())
+            {
+                return Err(ControlError::CleanupFailed);
+            }
+            commit_terminal_locked(
+                &mut registry,
+                &handle.id,
+                handle.generation,
+                DownloadState::Cancelled,
+                None,
+            );
+            dispatch_locked(&self.core, &mut registry);
         }
         drop(registry);
         Ok(CancelDisposition::Accepted)
+    }
+
+    pub fn pause(&self, handle: &DownloadHandle) -> Result<(), ControlError> {
+        let mut registry = lock_registry(&self.core);
+        let record = registered_record_mut(&mut registry, handle)?;
+        match record.state {
+            DownloadState::Paused | DownloadState::Pausing => return Ok(()),
+            DownloadState::Queued => {
+                registry.queue.retain(|id| id != &handle.id);
+                let record = registry
+                    .jobs
+                    .get_mut(&handle.id)
+                    .ok_or(ControlError::UnknownId)?;
+                record.state = DownloadState::Paused;
+                publish_state(record);
+            }
+            DownloadState::Preparing | DownloadState::Downloading => {
+                let record = registry
+                    .jobs
+                    .get_mut(&handle.id)
+                    .ok_or(ControlError::UnknownId)?;
+                record.state = DownloadState::Pausing;
+                record.control_tx.send_replace(WorkerControl::Pause);
+                publish_state(record);
+            }
+            _ => return Err(ControlError::CannotPause),
+        }
+        Ok(())
+    }
+
+    pub fn resume(&self, handle: &DownloadHandle) -> Result<(), ControlError> {
+        let mut registry = lock_registry(&self.core);
+        let record = registered_record_mut(&mut registry, handle)?;
+        if record.state != DownloadState::Paused {
+            return Err(ControlError::NotPaused);
+        }
+        let record = registry
+            .jobs
+            .get_mut(&handle.id)
+            .ok_or(ControlError::UnknownId)?;
+        record.state = DownloadState::Queued;
+        record.control_tx.send_replace(WorkerControl::Running);
+        publish_state(record);
+        registry.queue.push_back(handle.id.clone());
+        dispatch_locked(&self.core, &mut registry);
+        Ok(())
     }
 
     pub fn snapshot(&self, handle: &DownloadHandle) -> Result<ProgressSnapshot, ControlError> {
@@ -1091,7 +1270,7 @@ impl DownloadManager {
                 while let Some(id) = registry.queue.pop_front() {
                     if let Some(record) = registry.jobs.get_mut(&id) {
                         record.cancel_requested = true;
-                        record.cancel_tx.send_replace(true);
+                        record.control_tx.send_replace(WorkerControl::Cancel);
                     }
                     if let Some(record) = registry.jobs.get_mut(&id) {
                         record.state = DownloadState::Cancelling;
@@ -1116,7 +1295,7 @@ impl DownloadManager {
                         && record.state != DownloadState::Finalizing
                     {
                         record.cancel_requested = true;
-                        record.cancel_tx.send_replace(true);
+                        record.control_tx.send_replace(WorkerControl::Cancel);
                         record.state = DownloadState::Cancelling;
                         publish_state(record);
                     }
@@ -1202,7 +1381,10 @@ fn dispatch_locked(core: &Arc<ManagerCore>, registry: &mut Registry) {
         };
         let url = record.url.clone();
         let destination = record.destination.clone();
-        let cancel_rx = record.cancel_tx.subscribe();
+        let temp_path = record.temp_path.clone();
+        let checkpoint = record.checkpoint.clone();
+        let bytes_written = record.bytes_written;
+        let control_rx = record.control_tx.subscribe();
         let core_for_task = Arc::clone(core);
         let core_for_recovery = Arc::clone(core);
         let recovery_token = JobToken {
@@ -1215,7 +1397,10 @@ fn dispatch_locked(core: &Arc<ManagerCore>, registry: &mut Registry) {
                 token,
                 url,
                 destination,
-                cancel_rx,
+                temp_path,
+                checkpoint,
+                bytes_written,
+                control_rx,
             )));
             let result = (&mut guarded).await;
             drop(guarded);
@@ -1242,23 +1427,33 @@ enum WorkerOutput {
     Cancelled {
         temp: Option<(PathBuf, TempGuard)>,
     },
+    Paused {
+        temp_path: PathBuf,
+        guard: TempGuard,
+        bytes_written: u64,
+        checkpoint: Option<ResumeCheckpoint>,
+    },
 }
 
+// These parameters describe one worker invocation and are intentionally kept
+// explicit at this orchestration boundary.
+#[allow(clippy::too_many_arguments)]
 async fn prepare_managed_transfer(
     core: Arc<ManagerCore>,
     token: JobToken,
     engine: DownloadEngine,
     url: Url,
     destination: PathBuf,
-    mut cancel_rx: watch::Receiver<bool>,
+    existing_temp: Option<PathBuf>,
+    checkpoint: Option<ResumeCheckpoint>,
+    existing_bytes: u64,
+    mut control_rx: watch::Receiver<WorkerControl>,
 ) -> WorkerOutput {
-    #[allow(unused_mut)]
-    let (temp_path, mut guard, file) = match create_temp(&destination).await {
+    let opened = match open_or_create_temp(&destination, existing_temp, existing_bytes).await {
         Ok(created) => created,
-        Err(error) => {
-            return WorkerOutput::Failed { error, temp: None };
-        }
+        Err(error) => return WorkerOutput::Failed { error, temp: None },
     };
+    let (temp_path, mut guard, file, can_resume) = opened;
     {
         let mut registry = lock_registry(&core);
         if let Some(record) = registry.jobs.get_mut(&token.id) {
@@ -1273,14 +1468,34 @@ async fn prepare_managed_transfer(
         guard.disarm();
         panic!("injected download worker panic");
     }
-    let mut file = file;
-    if *cancel_rx.borrow() {
+    let file = file;
+    if *control_rx.borrow() == WorkerControl::Cancel {
         drop(file);
         return WorkerOutput::Cancelled {
             temp: Some((temp_path, guard)),
         };
     }
 
+    let mut file = file;
+    let resume_checkpoint = checkpoint.filter(|_| can_resume);
+    let initial_bytes = if resume_checkpoint.is_some() {
+        existing_bytes
+    } else {
+        0
+    };
+    if initial_bytes == 0 {
+        if let Err(source) = file.set_len(0).await {
+            drop(file);
+            return WorkerOutput::Failed {
+                error: DownloadError::Filesystem {
+                    operation: "reset temporary file",
+                    path: temp_path.clone(),
+                    source,
+                },
+                temp: Some((temp_path, guard)),
+            };
+        }
+    }
     let progress_core = Arc::clone(&core);
     let progress_token = JobToken {
         id: token.id.clone(),
@@ -1291,7 +1506,9 @@ async fn prepare_managed_transfer(
             &url,
             &temp_path,
             &mut file,
-            Some(&mut cancel_rx),
+            Some(&mut control_rx),
+            resume_checkpoint.clone(),
+            initial_bytes,
             |event| match event {
                 TransferEvent::Downloading { total_bytes } => {
                     set_downloading(&progress_core, &progress_token, total_bytes);
@@ -1304,7 +1521,81 @@ async fn prepare_managed_transfer(
         )
         .await;
 
+    let result = match (result, resume_checkpoint.is_some()) {
+        (Err(_), true) => {
+            if let Err(source) = file.set_len(0).await {
+                Err(DownloadError::Filesystem {
+                    operation: "restart temporary file",
+                    path: temp_path.clone(),
+                    source,
+                })
+            } else {
+                update_progress(&progress_core, &progress_token, 0, None);
+                engine
+                    .transfer(
+                        &url,
+                        &temp_path,
+                        &mut file,
+                        Some(&mut control_rx),
+                        None,
+                        0,
+                        |event| match event {
+                            TransferEvent::Downloading { total_bytes } => {
+                                set_downloading(&progress_core, &progress_token, total_bytes)
+                            }
+                            TransferEvent::BytesWritten {
+                                bytes_written,
+                                total_bytes,
+                            } => update_progress(
+                                &progress_core,
+                                &progress_token,
+                                bytes_written,
+                                total_bytes,
+                            ),
+                        },
+                    )
+                    .await
+            }
+        }
+        (result, _) => result,
+    };
+
     match result {
+        Ok(TransferExit::Paused {
+            bytes_written,
+            checkpoint,
+        }) => {
+            if let Err(source) = file.flush().await {
+                drop(file);
+                return WorkerOutput::Failed {
+                    error: DownloadError::Filesystem {
+                        operation: "flush paused temporary file",
+                        path: temp_path.clone(),
+                        source,
+                    },
+                    temp: Some((temp_path, guard)),
+                };
+            }
+            if let Err(source) = file.sync_all().await {
+                drop(file);
+                return WorkerOutput::Failed {
+                    error: DownloadError::Filesystem {
+                        operation: "sync paused temporary file",
+                        path: temp_path.clone(),
+                        source,
+                    },
+                    temp: Some((temp_path, guard)),
+                };
+            }
+            drop(file);
+            guard.disarm();
+            WorkerOutput::Paused {
+                temp_path,
+                guard,
+                bytes_written,
+                checkpoint,
+            }
+        }
         Ok(TransferExit::Cancelled) => {
             drop(file);
             WorkerOutput::Cancelled {
@@ -1352,12 +1643,16 @@ async fn prepare_managed_transfer(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn supervise_job(
     core: Arc<ManagerCore>,
     token: JobToken,
     url: Url,
     destination: PathBuf,
-    cancel_rx: watch::Receiver<bool>,
+    temp_path: Option<PathBuf>,
+    checkpoint: Option<ResumeCheckpoint>,
+    bytes_written: u64,
+    control_rx: watch::Receiver<WorkerControl>,
 ) {
     let output = prepare_managed_transfer(
         Arc::clone(&core),
@@ -1368,7 +1663,10 @@ async fn supervise_job(
         core.engine.clone(),
         url,
         destination.clone(),
-        cancel_rx,
+        temp_path,
+        checkpoint,
+        bytes_written,
+        control_rx,
     )
     .await;
 
@@ -1399,6 +1697,56 @@ async fn supervise_job(
             } else {
                 commit_terminal(&core, &token, DownloadState::Cancelled, None);
             }
+        }
+        WorkerOutput::Paused {
+            temp_path,
+            mut guard,
+            bytes_written,
+            checkpoint,
+        } => {
+            let mut registry = lock_registry(&core);
+            let Some(record) = registry.jobs.get_mut(&token.id) else {
+                guard.disarm();
+                let _ = cleanup_only(&temp_path);
+                return;
+            };
+            if record.generation != token.generation {
+                guard.disarm();
+                let _ = cleanup_only(&temp_path);
+                return;
+            }
+            if record.cancel_requested {
+                record.temp_path = None;
+                guard.disarm();
+                drop(registry);
+                let cleanup_error = cleanup_for_manager(&core, &temp_path).err().map(|source| {
+                    DownloadError::CleanupFailure {
+                        path: temp_path.clone(),
+                        source,
+                        original: Box::new(DownloadError::Cancelled),
+                    }
+                });
+                if let Some(error) = cleanup_error {
+                    commit_terminal(&core, &token, DownloadState::Failed, Some(Arc::new(error)));
+                } else {
+                    commit_terminal(&core, &token, DownloadState::Cancelled, None);
+                }
+                return;
+            }
+            record.state = DownloadState::Paused;
+            record.bytes_written = bytes_written;
+            record.checkpoint = checkpoint;
+            record.temp_path = Some(temp_path);
+            record.task.take();
+            let held_slot = record.active_slot_held;
+            record.active_slot_held = false;
+            publish_state(record);
+            if held_slot {
+                registry.active_slots = registry.active_slots.saturating_sub(1);
+            }
+            guard.disarm();
+            dispatch_locked(&core, &mut registry);
+            mark_shutdown_done(&core, &registry);
         }
         WorkerOutput::Ready {
             temp_path,
@@ -1944,6 +2292,42 @@ async fn create_temp(
             "temporary name attempts exhausted",
         ),
     })
+}
+
+async fn open_or_create_temp(
+    destination: &Path,
+    existing: Option<PathBuf>,
+    expected_len: u64,
+) -> Result<(PathBuf, TempGuard, tokio::fs::File, bool), DownloadError> {
+    if let Some(path) = existing {
+        let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+        let same_parent = path.parent().is_some_and(|candidate| candidate == parent);
+        if same_parent {
+            let metadata = tokio::fs::symlink_metadata(&path).await;
+            if let Ok(metadata) = metadata {
+                if metadata.file_type().is_file() && metadata.len() == expected_len {
+                    match tokio::fs::OpenOptions::new()
+                        .write(true)
+                        .append(true)
+                        .open(&path)
+                        .await
+                    {
+                        Ok(file) => return Ok((path.clone(), TempGuard::new(path), file, true)),
+                        Err(source) => {
+                            return Err(DownloadError::Filesystem {
+                                operation: "reopen temporary file",
+                                path,
+                                source,
+                            })
+                        }
+                    }
+                }
+            }
+            let _ = cleanup_only(&path);
+        }
+    }
+    let (path, guard, file) = create_temp(destination).await?;
+    Ok((path, guard, file, false))
 }
 
 fn temp_candidate(parent: &Path, destination: &Path, pid: u32, id: u64) -> Option<PathBuf> {

@@ -2,11 +2,14 @@ export type DownloadState =
   | "queued"
   | "preparing"
   | "downloading"
+  | "pausing"
+  | "paused"
   | "cancelling"
   | "finalizing"
   | "completed"
   | "failed"
-  | "cancelled";
+  | "cancelled"
+  | "interrupted";
 
 export type DownloadDto = {
   id: string;
@@ -23,7 +26,7 @@ export type DownloadDto = {
 };
 
 export type DownloadView = "downloads" | "queue" | "completed" | "categories" | "settings";
-export type Filter = "all" | "active" | "queued" | "completed" | "failed";
+export type Filter = "all" | "active" | "queued" | "paused" | "completed" | "failed";
 export type SpeedHistory = { sampledAt: number | null; samples: number[] };
 
 export const SPEED_SAMPLE_INTERVAL_MS = 1_000;
@@ -59,7 +62,7 @@ export function speedHistoryPoints(samples: number[], width = 132, height = 42):
 }
 
 export function isTerminal(state: DownloadState): boolean {
-  return state === "completed" || state === "failed" || state === "cancelled";
+  return state === "completed" || state === "failed" || state === "cancelled" || state === "interrupted";
 }
 
 export function mergeDownloads(current: DownloadDto[], incoming: DownloadDto[]): DownloadDto[] {
@@ -78,13 +81,15 @@ export function selectDownloads(items: DownloadDto[], view: DownloadView, filter
   if (view !== "downloads") return [];
   switch (filter) {
     case "active":
-      return items.filter((item) => item.state === "downloading" || item.state === "preparing" || item.state === "cancelling" || item.state === "finalizing");
+      return items.filter((item) => item.state === "downloading" || item.state === "preparing" || item.state === "pausing" || item.state === "paused" || item.state === "cancelling" || item.state === "finalizing");
     case "queued":
       return items.filter((item) => item.state === "queued");
+    case "paused":
+      return items.filter((item) => item.state === "paused");
     case "completed":
       return items.filter((item) => item.state === "completed");
     case "failed":
-      return items.filter((item) => item.state === "failed" || item.state === "cancelled");
+      return items.filter((item) => item.state === "failed" || item.state === "cancelled" || item.state === "interrupted");
     default:
       return items;
   }

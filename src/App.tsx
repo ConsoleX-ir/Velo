@@ -2,6 +2,7 @@ import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormE
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
+import { Button } from "./components/ui/button";
 import {
   formatBytes,
   formatEta,
@@ -153,7 +154,7 @@ export default function App() {
     if (normalizedQuery) items = items.filter((item) => item.fileName.toLocaleLowerCase().includes(normalizedQuery));
     return items;
   }, [downloads, filter, query, view]);
-  const activeCount = downloads.filter((item) => ["preparing", "downloading", "cancelling", "finalizing"].includes(item.state)).length;
+  const activeCount = downloads.filter((item) => ["preparing", "downloading", "pausing", "cancelling", "finalizing"].includes(item.state)).length;
   const queueCount = downloads.filter((item) => item.state === "queued").length;
   const completedCount = downloads.filter((item) => item.state === "completed").length;
 
@@ -162,6 +163,40 @@ export default function App() {
     setPending((current) => new Set(current).add(key));
     try {
       await invoke("cancel_download", { id: item.id, generation: item.generation });
+    } catch (error) {
+      setConnectionError(errorText(error));
+    } finally {
+      setPending((current) => {
+        const next = new Set(current);
+        next.delete(key);
+        return next;
+      });
+    }
+  }
+
+  async function togglePauseDownload(item: DownloadDto) {
+    const key = `${item.id}:${item.generation}`;
+    setPending((current) => new Set(current).add(key));
+    try {
+      await invoke(item.state === "paused" ? "resume_download" : "pause_download", { id: item.id, generation: item.generation });
+    } catch (error) {
+      setConnectionError(errorText(error));
+    } finally {
+      setPending((current) => {
+        const next = new Set(current);
+        next.delete(key);
+        return next;
+      });
+    }
+  }
+
+  async function retryDownload(item: DownloadDto) {
+    const key = `${item.id}:${item.generation}`;
+    setPending((current) => new Set(current).add(key));
+    try {
+      const replacement = await invoke<DownloadDto>("retry_download", { id: item.id, generation: item.generation });
+      latestRevision.current.delete(key);
+      projectDownload(replacement);
     } catch (error) {
       setConnectionError(errorText(error));
     } finally {
@@ -200,7 +235,7 @@ export default function App() {
 
   const title = view === "downloads" ? "Your downloads" : navItems.find((item) => item.id === view)?.label ?? "Downloads";
   const subtitle = view === "completed"
-    ? "Completed in this session. Download history is not saved between launches."
+    ? "Completed downloads saved on this device."
     : view === "queue"
       ? "Jobs waiting for one of the available transfer slots."
       : view === "categories"
@@ -228,7 +263,7 @@ export default function App() {
         </nav>
         <div className="sidebar-spacer" />
         <div className="side-activity">
-          <div className="side-activity-top"><span className="live-dot" /> SESSION ACTIVITY</div>
+          <div className="side-activity-top"><span className="live-dot" /> DOWNLOAD ACTIVITY</div>
           <div className="activity-number">{activeCount.toString().padStart(2, "0")} <span>active</span></div>
           <div className="activity-track"><span style={{ width: `${Math.min(100, activeCount * 25)}%` }} /></div>
           <div className="activity-meta"><span>{queueCount} queued</span><span>{completedCount} done</span></div>
@@ -250,7 +285,7 @@ export default function App() {
               <kbd>CTRL K</kbd>
             </label>
             <button className="theme-quick" aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} theme`} onClick={() => setTheme(theme === "dark" ? "light" : "dark")}><Icon name={theme === "dark" ? "sun" : "moon"} /></button>
-            <button className="primary-button top-add" onClick={() => setDialogOpen(true)}><Icon name="plus" /> <span>Add download</span></button>
+            <Button variant="primary" className="top-add" onClick={() => setDialogOpen(true)}><Icon name="plus" /> <span>Add download</span></Button>
           </div>
         </header>
 
@@ -262,7 +297,7 @@ export default function App() {
             <section className="info-view">
               <div className="eyebrow"><Icon name="grid" size={15} /> ORGANIZE</div>
               <h1>Categories, <em>when you need them.</em></h1>
-              <p>Downloads are kept in this session only. Persistent categories and saved history are not available yet, so Velo won’t create empty or misleading category lists.</p>
+              <p>Download history stays on this device. Category organization is not available yet, so Velo won’t create empty or misleading category lists.</p>
               <button className="secondary-button" onClick={() => setView("downloads")}>Back to downloads <Icon name="arrow" size={16} /></button>
             </section>
           ) : (
@@ -281,16 +316,16 @@ export default function App() {
               </div>
 
               {view === "downloads" && <div className="filter-row" role="group" aria-label="Filter downloads">
-                {(["all", "active", "queued", "completed", "failed"] as Filter[]).map((value) => <button key={value} className={`filter-chip ${filter === value ? "active" : ""}`} onClick={() => setFilter(value)}>{value === "failed" ? "Failed / cancelled" : value[0].toUpperCase() + value.slice(1)}</button>)}
+                {(["all", "active", "queued", "paused", "completed", "failed"] as Filter[]).map((value) => <button key={value} className={`filter-chip ${filter === value ? "active" : ""}`} onClick={() => setFilter(value)}>{value === "failed" ? "Failed / interrupted" : value[0].toUpperCase() + value.slice(1)}</button>)}
                 <span className="filter-spacer" />
-                <span className="session-tag"><span /> SESSION ONLY</span>
+                <span className="session-tag"><span /> SAVED LOCALLY</span>
               </div>}
 
               {!ready ? <div className="loading-state"><span className="loading-ring" /> Connecting to the local download engine…</div> : visibleDownloads.length === 0 ? (
                 view === "downloads" && filter === "all" && downloads.length === 0 && !query ? <EmptyState onAdd={() => setDialogOpen(true)} /> : <div className="filtered-empty"><div className="filtered-empty-icon"><Icon name="search" size={22} /></div><strong>{query ? "No matching downloads" : view === "completed" ? "Nothing completed yet" : view === "queue" ? "Your queue is clear" : "No items in this filter"}</strong><span>{query ? "Try a different filename or clear your search." : "New activity will appear here as it happens."}</span></div>
               ) : (
                 <div className="download-list" aria-live="off">
-                  {visibleDownloads.map((item) => <DownloadCard key={`${item.id}:${item.generation}`} item={item} speedHistory={speedHistories[`${item.id}:${item.generation}`]?.samples ?? NO_SPEED_SAMPLES} pending={pending.has(`${item.id}:${item.generation}`)} onCancel={() => void cancelDownload(item)} onDismiss={() => void dismissDownload(item)} />)}
+                  {visibleDownloads.map((item) => <DownloadCard key={`${item.id}:${item.generation}`} item={item} speedHistory={speedHistories[`${item.id}:${item.generation}`]?.samples ?? NO_SPEED_SAMPLES} pending={pending.has(`${item.id}:${item.generation}`)} onTogglePause={() => void togglePauseDownload(item)} onRetry={() => void retryDownload(item)} onCancel={() => void cancelDownload(item)} onDismiss={() => void dismissDownload(item)} />)}
                 </div>
               )}
             </>
@@ -303,14 +338,14 @@ export default function App() {
   );
 }
 
-function DownloadCard({ item, speedHistory, pending, onCancel, onDismiss }: { item: DownloadDto; speedHistory: number[]; pending: boolean; onCancel: () => void; onDismiss: () => void }) {
+function DownloadCard({ item, speedHistory, pending, onTogglePause, onRetry, onCancel, onDismiss }: { item: DownloadDto; speedHistory: number[]; pending: boolean; onTogglePause: () => void; onRetry: () => void; onCancel: () => void; onDismiss: () => void }) {
   const percent = progressPercent(item);
   const terminal = isTerminal(item.state);
   const stateLabel: Record<DownloadDto["state"], string> = {
-    queued: "Queued", preparing: "Preparing", downloading: "Downloading", cancelling: "Cancelling", finalizing: "Finishing", completed: "Completed", failed: "Failed", cancelled: "Cancelled",
+    queued: "Queued", preparing: "Preparing", downloading: "Downloading", pausing: "Pausing", paused: "Paused", cancelling: "Cancelling", finalizing: "Finishing", completed: "Completed", failed: "Failed", cancelled: "Cancelled", interrupted: "Interrupted",
   };
   const stateIcon: Record<DownloadDto["state"], IconName> = {
-    queued: "clock", preparing: "globe", downloading: "download", cancelling: "cancel", finalizing: "pause", completed: "check", failed: "alert", cancelled: "cancel",
+    queued: "clock", preparing: "globe", downloading: "download", pausing: "pause", paused: "pause", cancelling: "cancel", finalizing: "pause", completed: "check", failed: "alert", cancelled: "cancel", interrupted: "alert",
   };
   const secondary = item.state === "queued"
     ? "Waiting for an available transfer slot"
@@ -318,8 +353,10 @@ function DownloadCard({ item, speedHistory, pending, onCancel, onDismiss }: { it
       ? `${formatBytes(item.bytesWritten)} saved successfully`
       : item.state === "failed"
         ? item.error ?? "The transfer could not be completed"
-        : item.state === "cancelled"
+      : item.state === "cancelled"
           ? "Temporary data was removed"
+          : item.state === "interrupted"
+            ? item.error ?? "Retry starts this transfer from byte zero"
           : item.totalBytes === null
             ? `${formatBytes(item.bytesWritten)} downloaded · size unknown`
             : `${formatBytes(item.bytesWritten)} of ${formatBytes(item.totalBytes)}`;
@@ -340,7 +377,9 @@ function DownloadCard({ item, speedHistory, pending, onCancel, onDismiss }: { it
       </div>
     </div>
     <div className="card-actions">
+      {(item.state === "downloading" || item.state === "preparing" || item.state === "paused") && <button className="icon-button pause-button" onClick={onTogglePause} disabled={pending} aria-label={`${item.state === "paused" ? "Resume" : "Pause"} ${item.fileName}`} title={item.state === "paused" ? "Resume download" : "Pause download"}><Icon name={item.state === "paused" ? "download" : "pause"} size={16} /></button>}
       {!terminal && item.state !== "finalizing" && <button className="icon-button cancel-button" onClick={onCancel} disabled={pending} aria-label={`Cancel ${item.fileName}`} title="Cancel download">{pending ? <span className="button-spinner" /> : <Icon name="close" size={17} />}</button>}
+      {(item.state === "failed" || item.state === "cancelled" || item.state === "interrupted") && <button className="text-action" onClick={onRetry} disabled={pending}>{pending ? "Retrying…" : "Retry"}</button>}
       {terminal && <button className="text-action" onClick={onDismiss} disabled={pending}>{pending ? "Removing…" : "Dismiss"}</button>}
     </div>
   </article>;
@@ -372,7 +411,7 @@ function EmptyState({ onAdd }: { onAdd: () => void }) {
     <div className="empty-eyebrow"><span /> READY WHEN YOU ARE <span /></div>
     <h2>A little more <em>flow.</em></h2>
     <p>Your download space is clear. Add a link and let Velo take it from here.</p>
-    <button className="primary-button empty-add" onClick={onAdd}><Icon name="plus" /> Add your first download <Icon name="arrow" size={16} /></button>
+    <Button variant="primary" className="empty-add" onClick={onAdd}><Icon name="plus" /> Add your first download <Icon name="arrow" size={16} /></Button>
     <div className="empty-footnote"><Icon name="globe" size={14} /> HTTP and HTTPS links supported</div>
   </div>;
 }
@@ -390,8 +429,8 @@ function Settings({ theme, setTheme, reducedMotion, setReducedMotion }: { theme:
       <div className="settings-separator" />
       <div className="settings-item"><div className="settings-icon motion-icon"><Icon name="spark" /></div><div className="settings-copy"><strong>Reduced motion</strong><span>Use a static aurora and remove interface transitions.</span></div><button className={`toggle ${reducedMotion ? "on" : ""}`} role="switch" aria-checked={reducedMotion} aria-label="Reduced motion" onClick={() => setReducedMotion(!reducedMotion)}><span /></button></div>
     </div>
-    <div className="privacy-note"><div className="privacy-lock">◇</div><div><strong>Private by design</strong><span>Downloads stay on this device. No account, telemetry, or saved history.</span></div></div>
-    <div className="settings-limit"><Icon name="info" size={15} /> User-controlled pause, persistent history, and automatic retry are not available in this release.</div>
+    <div className="privacy-note"><div className="privacy-lock">◇</div><div><strong>Private by design</strong><span>History stays on this device. Saved download URLs are protected with your Windows account.</span></div></div>
+    <div className="settings-limit"><Icon name="info" size={15} /> If Velo closes unexpectedly, interrupted transfers return as retryable records and restart from byte zero.</div>
   </section>;
 }
 
@@ -462,7 +501,7 @@ function AddDownloadDialog({ onClose, onStarted }: { onClose: () => void; onStar
         <label className="field-label destination-label" htmlFor="download-destination">SAVE TO</label>
         <div className="destination-row"><div className={`input-wrap destination-input ${destination ? "has-value" : ""}`}><Icon name="folder" size={17} /><input id="download-destination" readOnly placeholder="Choose a destination…" value={destination} /><button type="button" className="browse-button" onClick={() => void chooseDestination()} disabled={busy}>Browse</button></div></div>
         {error && <div className="dialog-error" role="alert"><Icon name="alert" size={16} /><span>{error}</span></div>}
-        <div className="dialog-actions"><button type="button" className="secondary-button" onClick={onClose} disabled={busy}>Cancel</button><button type="submit" className="primary-button" disabled={busy || Boolean(urlError) || !url.trim() || !destination}>{busy ? <><span className="button-spinner" /> Starting…</> : <>Start download <Icon name="arrow" size={16} /></>}</button></div>
+        <div className="dialog-actions"><Button variant="secondary" className="secondary-button" onClick={onClose} disabled={busy}>Cancel</Button><Button variant="primary" type="submit" disabled={busy || Boolean(urlError) || !url.trim() || !destination}>{busy ? <><span className="button-spinner" /> Starting…</> : <>Start download <Icon name="arrow" size={16} /></>}</Button></div>
         <div className="dialog-trust"><span className="status-orb" /> Transfers are handled locally by the Velo engine</div>
       </form>
     </section>

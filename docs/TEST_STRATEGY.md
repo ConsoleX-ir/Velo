@@ -1,15 +1,15 @@
 # Test Strategy
 
-**Status:** Phase 1A/1B suite with Phase 1D adversarial HTTP coverage and Phase 2 UI/IPC coverage; Windows engine validation passed 65 tests on 2026-10-22
+**Status:** Engine, UI/IPC, pause/resume, persistence, and recovery coverage; Windows engine validation passed 65 tests on 2026-10-22
 **Research checked:** 2026-10-22
 
 ## Phase 1 test layers
 
-1. **Unit tests:** URL validation, response-header validation, partial-write accounting, cleanup error composition, progress coalescing, generation checks, and manager lifecycle behavior. Retry/backoff tests are deferred until retry implementation.
+1. **Unit tests:** URL validation, response-header validation, partial-write accounting, cleanup error composition, progress coalescing, generation checks, manager lifecycle, pause/resume checkpoint validation, and local history snapshot replacement.
 2. **Engine integration tests:** use a loopback ephemeral-port HTTP server with scripted responses; no public internet. Compare output bytes directly so no hash dependency is needed for the fixture gate.
 3. **Filesystem integration tests:** temporary directories; exact bytes, collision behavior, failure cleanup, existing-file preservation, no-replace promotion, and finalization behavior.
 4. **Windows-specific tests:** reserved/device names, Unicode and long paths where supported, ACL/permission failure, junction/reparse-point cases, concurrent destination reservation, installer smoke test when packaging exists.
-5. **Frontend/IPC tests:** model tests cover revision-based merging, filtering, formatting, URL/name validation, bounded one-second speed-history sampling, and sparkline geometry; app tests cover persisted preferences, stale initial snapshots, active chart rendering, terminal metric suppression, and focus return. Tauri service tests cover command validation, safe errors, and a real loopback download. Capability restrictions and packaged WebView behavior remain manual release checks.
+5. **Frontend/IPC tests:** model tests cover revision-based merging, filtering, formatting, URL/name validation, bounded one-second speed-history sampling, and sparkline geometry; app tests cover preferences, pause/resume/retry actions, stale initial snapshots, chart rendering, terminal metric suppression, and focus return. Tauri service tests cover command validation, safe errors, loopback download, and history storage. DPAPI roundtrip runs on Windows. Capability restrictions and packaged WebView behavior remain manual release checks.
 
 ## Required scenario matrix
 
@@ -21,6 +21,8 @@
 | Redirect | valid same-origin, cross-origin, loop, over limit, HTTPS downgrade | bounded hops; policy enforced; no sensitive header leakage |
 | Incomplete | declared larger/smaller, connection reset mid-body | fail; do not promote; accurate partial-byte/cleanup result |
 | Cancellation | queued, connect, headers, body, backoff, race with finalization | accepted cancel yields Cancelled only after cleanup; cancel after Finalizing returns TooLate; exactly one terminal outcome |
+| Pause/resume | queued pause, body-boundary pause, resume with valid ETag/total, resume after validator mismatch | same-session resume uses exact offset and If-Range; unsupported checkpoints safely restart from zero |
+| Persistence/recovery | snapshot replacement, malformed history, protected URL roundtrip, app restart with active/paused/completed rows | snapshots remain readable; URLs decrypt only for the protecting Windows account; unfinished jobs become Interrupted and retry from zero; missing/size-changed completed files are flagged |
 | Managed jobs | duplicate IDs, destination conflicts, retained capacity, FIFO order, configured concurrency, acknowledgement, stale handles | admission is atomic; retained capacity includes queued and terminal-unacknowledged records; stale generations cannot act on reused IDs |
 | Shutdown and worker failure | repeated/concurrent shutdown, queued cancellation, active cancellation, finalizing job, worker panic | admission closes once; no new dispatch after close; panic becomes one retained terminal failure; cleanup failure is preserved |
 | Destination | existing file, two jobs same path, external target created before promotion, invalid/sanitized name, disk write failure, cleanup failure | no unintended clobber; exactly one same-process reservation winner; deterministic error and cleanup path |
@@ -56,7 +58,7 @@ The ignored local performance harness is opt-in and is not part of ordinary `car
 ## Later-phase tests
 
 - SQLite migrations, interrupted-write recovery, WAL sidecar handling, DB corruption/migration fallback, and user-data deletion.
-- Durable resume contract against servers that support/ignore/reject Range and change ETag/Last-Modified; checkpoint and partial-file consistency across process restart.
+- Durable resume across process restart (current recovery deliberately retries from byte zero).
 - Segmented download assembly correctness, range overlap/gap detection, and bounded per-host concurrency.
 - Packaged Windows upgrade/uninstall and WebView2 online/offline distribution paths.
 

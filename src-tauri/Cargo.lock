@@ -371,11 +371,13 @@ version = "0.2.0"
 dependencies = [
  "consolex-download-engine",
  "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
  "tokio",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

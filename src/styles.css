@@ -1,3 +1,18 @@
+@import "tailwindcss";
+
+@theme inline {
+  --color-background: var(--bg);
+  --color-surface: var(--surface);
+  --color-foreground: var(--text);
+  --color-muted-foreground: var(--text-muted);
+  --color-action: var(--action);
+  --color-action-ink: var(--action-ink);
+  --color-border-subtle: var(--border);
+  --color-focus-ring: var(--focus);
+  --radius-control: var(--radius-sm);
+  --font-sans: Inter, "Segoe UI", system-ui, sans-serif;
+}
+
 :root {
   color-scheme: dark;
   font-family: Inter, "Segoe UI", system-ui, sans-serif;
@@ -155,7 +170,7 @@ h1, h2, p { margin-top: 0; }
 .session-tag { display: flex; align-items: center; gap: 6px; color: var(--text-muted); font-size: 9px; font-weight: 680; letter-spacing: .6px; }
 .session-tag span { width: 6px; height: 6px; border-radius: 50%; background: var(--amber); }
 .download-list { max-width: 1120px; display: grid; gap: 10px; margin: 0 auto; }
-.download-card { min-height: 104px; display: grid; grid-template-columns: 42px minmax(0, 1fr) 38px; align-items: center; gap: 15px; padding: 16px 18px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); box-shadow: 0 2px 8px var(--glass-shadow); transition: border-color .18s ease, box-shadow .18s ease; }
+.download-card { min-height: 104px; display: grid; grid-template-columns: 42px minmax(0, 1fr) 80px; align-items: center; gap: 15px; padding: 16px 18px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); box-shadow: 0 2px 8px var(--glass-shadow); transition: border-color .18s ease, box-shadow .18s ease; }
 .download-card:hover { border-color: var(--border-strong); box-shadow: 0 4px 12px var(--glass-shadow); }
 .file-icon { width: 39px; height: 43px; display: grid; place-items: center; border: 1px solid var(--border); border-radius: 9px; color: var(--text-secondary); background: var(--surface-raised); }
 .file-icon.active { color: var(--cyan); border-color: color-mix(in srgb, var(--cyan) 28%, var(--border)); background: color-mix(in srgb, var(--cyan) 8%, var(--surface)); }
@@ -172,12 +187,14 @@ h1, h2, p { margin-top: 0; }
 .state-pill.queued { color: var(--violet-text); }
 .state-pill.completed { color: var(--green); }
 .state-pill.failed, .state-pill.cancelled { color: var(--red); }
+.state-pill.interrupted { color: var(--amber); border-color: color-mix(in srgb, var(--amber) 32%, var(--border)); }
 .state-pill.finalizing { color: var(--amber); }
 .card-content { min-width: 0; margin-top: 7px; }
 .card-content.has-speed-chart { display: grid; grid-template-columns: minmax(0, 1fr) 158px; align-items: center; gap: 18px; }
 .transfer-copy { min-width: 0; }
 .card-secondary { margin: 0 0 8px; overflow: hidden; color: var(--text-muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .card-secondary.error-copy { color: var(--red); }
+.state-interrupted .card-secondary { color: var(--amber); }
 .progress-track { height: 5px; border-radius: 4px; background: var(--surface-soft); overflow: hidden; }
 .progress-track > span { height: 100%; display: block; min-width: 0; border-radius: inherit; background: var(--cyan); transition: width .3s ease; }
 .progress-track.complete > span { background: var(--green); }
@@ -192,7 +209,7 @@ h1, h2, p { margin-top: 0; }
 .speed-chart-point.current { fill: var(--cyan); }
 .speed-chart-empty { height: 34px; display: flex; align-items: center; color: var(--text-muted); font-size: 9px; }
 .speed-chart-caption { display: block; margin-top: 2px; color: var(--text-muted); font-size: 8px; }
-.card-actions { display: flex; justify-content: flex-end; }
+.card-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
 .cancel-button { width: 32px; height: 32px; border-color: transparent; color: var(--text-muted); background: transparent; }
 .cancel-button:hover { color: var(--red); border-color: color-mix(in srgb, var(--red) 30%, var(--border)); background: color-mix(in srgb, var(--red) 8%, var(--surface)); }
 .text-action { padding: 6px 8px; border: 0; border-radius: 6px; color: var(--text-muted); background: transparent; font-size: 10px; cursor: pointer; }
@@ -263,7 +280,7 @@ h1, h2, p { margin-top: 0; }
 .destination-label { margin-top: 20px; }
 .destination-input input { color: var(--text-secondary); }.browse-button { flex: 0 0 auto; padding: 6px 9px; border: 1px solid var(--border); border-radius: 7px; color: var(--cyan); background: var(--surface-raised); font-size: 10px; font-weight: 650; cursor: pointer; }.browse-button:hover { border-color: var(--cyan); }
 .dialog-error { display: flex; align-items: flex-start; gap: 8px; padding: 9px 10px; margin-top: 13px; border: 1px solid color-mix(in srgb, var(--red) 24%, var(--border)); border-radius: 8px; color: var(--red); background: color-mix(in srgb, var(--red) 7%, var(--surface)); font-size: 10px; line-height: 1.5; }
-.dialog-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 23px; }.dialog-actions .primary-button { min-width: 142px; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 23px; }.dialog-actions button[type="submit"] { min-width: 142px; }
 .dialog-trust { display: flex; align-items: center; justify-content: center; gap: 7px; margin-top: 18px; color: var(--text-muted); font-size: 9px; }.dialog-trust .status-orb { width: 5px; height: 5px; flex-basis: 5px; }
 
 @keyframes spin { to { transform: rotate(360deg); } }
