@@ -1,0 +1,111 @@
+export type DownloadState =
+  | "queued"
+  | "preparing"
+  | "downloading"
+  | "cancelling"
+  | "finalizing"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export type DownloadDto = {
+  id: string;
+  generation: number;
+  revision: number;
+  order: number;
+  fileName: string;
+  state: DownloadState;
+  bytesWritten: number;
+  totalBytes: number | null;
+  speedBytesPerSecond: number | null;
+  etaSeconds: number | null;
+  error: string | null;
+};
+
+export type DownloadView = "downloads" | "queue" | "completed" | "categories" | "settings";
+export type Filter = "all" | "active" | "queued" | "completed" | "failed";
+
+export function isTerminal(state: DownloadState): boolean {
+  return state === "completed" || state === "failed" || state === "cancelled";
+}
+
+export function mergeDownloads(current: DownloadDto[], incoming: DownloadDto[]): DownloadDto[] {
+  const byHandle = new Map(current.map((item) => [`${item.id}:${item.generation}`, item]));
+  for (const item of incoming) {
+    const key = `${item.id}:${item.generation}`;
+    const present = byHandle.get(key);
+    if (!present || item.revision > present.revision) byHandle.set(key, item);
+  }
+  return [...byHandle.values()].sort((a, b) => a.order - b.order);
+}
+
+export function selectDownloads(items: DownloadDto[], view: DownloadView, filter: Filter): DownloadDto[] {
+  if (view === "queue") return items.filter((item) => item.state === "queued");
+  if (view === "completed") return items.filter((item) => item.state === "completed");
+  if (view !== "downloads") return [];
+  switch (filter) {
+    case "active":
+      return items.filter((item) => item.state === "downloading" || item.state === "preparing" || item.state === "finalizing");
+    case "queued":
+      return items.filter((item) => item.state === "queued");
+    case "completed":
+      return items.filter((item) => item.state === "completed");
+    case "failed":
+      return items.filter((item) => item.state === "failed" || item.state === "cancelled");
+    default:
+      return items;
+  }
+}
+
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(value >= 100 ? 0 : 1)} ${units[unit]}`;
+}
+
+export function progressPercent(item: DownloadDto): number | null {
+  if (item.totalBytes === null || item.totalBytes === 0) return null;
+  return Math.min(100, Math.max(0, (item.bytesWritten / item.totalBytes) * 100));
+}
+
+export function formatRate(rate: number | null): string | null {
+  return rate && rate > 0 ? `${formatBytes(rate)}/s` : null;
+}
+
+export function formatEta(seconds: number | null): string | null {
+  if (seconds === null || !Number.isFinite(seconds) || seconds < 0) return null;
+  if (seconds < 60) return `${Math.ceil(seconds)} sec left`;
+  const minutes = Math.ceil(seconds / 60);
+  if (minutes < 60) return `${minutes} min left`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours} hr ${minutes % 60} min left`;
+}
+
+export function validateUrl(value: string): string | null {
+  try {
+    const url = new URL(value.trim());
+    if (url.protocol !== "http:" && url.protocol !== "https:") return "Use an HTTP or HTTPS link.";
+    if (!url.hostname || url.username || url.password) return "Enter a valid URL without embedded credentials.";
+    return null;
+  } catch {
+    return "Enter a complete URL, including https:// or http://.";
+  }
+}
+
+export function suggestedFileName(value: string): string {
+  try {
+    const url = new URL(value.trim());
+    const segment = url.pathname.split("/").filter(Boolean).at(-1);
+    const decoded = segment ? decodeURIComponent(segment) : "download";
+    const safe = decoded.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").replace(/[. ]+$/g, "");
+    return safe && safe !== "." && safe !== ".." ? safe.slice(0, 120) : "download";
+  } catch {
+    return "download";
+  }
+}

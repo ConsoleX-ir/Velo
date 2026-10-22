@@ -1,6 +1,6 @@
 # Security and Privacy Requirements
 
-**Status:** Phase 0 baseline  
+**Status:** Phase 0 baseline plus Phase 2 application bridge controls  
 **Research checked:** 2026-10-21
 
 ## Privacy commitments
@@ -24,6 +24,8 @@ Assume URLs, redirect targets, headers, content-disposition names, response bodi
 - Validate all IPC input on the Rust side; TypeScript validation is convenience, not a trust boundary.
 - Avoid rendering remote strings as HTML; escape filenames and error text.
 - Keep dependencies minimal and lock versions; review transitive dependency changes.
+
+Current application surface: the default capability enables Tauri core defaults and the native save dialog only. The frontend invokes four typed commands for list, start, cancel, and terminal acknowledgement; it has no generic filesystem, shell, file-open, or network-fetch command. The app uses bundled local frontend assets and an app CSP. Rust validates the URL scheme/host/credentials and requires an absolute destination with a filename before manager admission. UI errors map typed engine failures to bounded generic messages rather than exposing local paths or raw error sources. Interactive WebView2/CSP behavior and packaged Windows behavior still need target-machine validation; configuration alone is not a security audit.
 
 ### Network
 

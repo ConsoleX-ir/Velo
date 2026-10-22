@@ -1,6 +1,6 @@
 # Roadmap
 
-**Status:** Phase 0 complete; Phase 1A and Phase 1B implemented in the Rust core
+**Status:** Phase 0 and Phase 1A/1B complete; Phase 2 desktop application implemented, target Windows validation pending
 **Research checked:** 2026-10-21
 
 ## Phase 0 — Specifications and plan (completed)
@@ -25,7 +25,7 @@
 ### Next milestones
 
 1. **Phase 1C — Retry policy (deferred):** define classification, backoff/Retry-After, byte-zero restart, and deterministic timing tests before implementation.
-2. **Phase 2 — Desktop shell:** Tauri 2 + React/TypeScript, narrow IPC commands, CSP/capabilities, and a minimal user workflow connected to the tested manager.
+2. **Phase 2 — Desktop shell (implementation present; close after target validation):** Tauri 2 + React/TypeScript shell, narrow IPC commands, CSP/capabilities, and a user workflow connected to the tested manager. Verify packaged Windows behavior and keyboard/accessibility behavior before release.
 3. **Phase 3 — Durable metadata:** SQLite migrations and startup recovery with honest interrupted-job semantics.
 4. **Phase 4 — Durable resume and transfer concurrency:** define checkpoint and restart-recovery semantics; consider segmentation only after correctness and measurement.
 5. **Phase 5 — Release hardening and integrations:** signing, upgrades, accessibility, performance budgets, browser integration, and a separate BitTorrent security/product decision.
@@ -35,6 +35,8 @@
 - Establish Tauri 2 + React/TypeScript shell, strict CSP/capabilities, narrow IPC commands, accessible minimal add/download/status/cancel workflow.
 - Connect UI to tested engine; test event ordering/backpressure and packaged standard-user behavior.
 - Decide exact Windows support matrix, installer type, WebView2 strategy, app identity, signing, and distribution.
+
+Implementation now present: local Tauri shell, responsive Aurora Stream UI, native save-dialog workflow, typed command DTOs, manager-backed list/start/cancel/dismiss flow, session-only active/queued/completed/failed states, theme and reduced-motion preferences, plus frontend and native service tests. No pause/retry/history/category persistence or file opening is presented as supported. Windows packaging and interactive GUI validation remain release gates.
 
 ## Phase 3 — Durable metadata and startup recovery
 

@@ -1,9 +1,9 @@
 # ConsoleX Velo Architecture
 
-**Status:** Phase 1B managed Rust core; Tauri and frontend remain planned
+**Status:** Phase 1B managed Rust core with a Phase 2 Tauri + React application scaffold
 **Research checked:** 2026-10-21
 
-**Implementation update (2026-10-22):** The root-level Rust library includes the Phase 1A HTTP/HTTPS transfer core and Phase 1B `DownloadManager`, with FIFO admission, generation-bearing handles, cancellation, coalesced progress, retained terminal results, shutdown, and bounded strong-ETag-validated Range continuation after interrupted bodies. Phase 1D hardening rejects ambiguous Content-Length/Transfer-Encoding framing and prevents Range metadata from crossing redirects. The core remains independent of Tauri; the application service, frontend, and Tauri shell are not present. On Windows, the full test suite passed, including no-clobber promotion and case-insensitive destination reservation tests (65 passed, 0 failed).
+**Implementation update (2026-10-22):** The root-level Rust library includes the Phase 1A HTTP/HTTPS transfer core and Phase 1B `DownloadManager`, with FIFO admission, generation-bearing handles, cancellation, coalesced progress, retained terminal results, shutdown, and bounded strong-ETag-validated Range continuation after interrupted bodies. Phase 1D hardening rejects ambiguous Content-Length/Transfer-Encoding framing and prevents Range metadata from crossing redirects. `src-tauri/` now contains the native Tauri application service and the React/TypeScript frontend lives at the repository root. The application service validates UI requests, owns the manager, maps its snapshots into frontend DTOs, sends state updates as Tauri events, and acknowledges terminal results only when dismissed. UI history remains session-only. Packaging and interactive GUI behavior still require validation on the target Windows setup.
 
 ## Chosen stack
 
@@ -27,7 +27,11 @@ React + TypeScript
             └─ in-memory job registry (Phase 1; no database)
 ```
 
-The frontend does not open arbitrary filesystem paths or perform network requests directly. The Tauri command layer exposes explicit operations and DTOs; it does not expose generic shell, filesystem, or HTTP capabilities. The Phase 1 engine is a Rust library boundary independent of Tauri so it can be tested without a webview. No application-service, repository, workspace, or UI scaffold currently exists in the repository. A repository abstraction is not required in Phase 1 unless needed to keep orchestration testable; do not add one without a concrete consumer.
+The frontend does not open arbitrary filesystem paths or perform network requests directly. The Tauri command layer exposes explicit operations and DTOs; it does not expose generic shell, filesystem, or HTTP capabilities. The native service invokes the manager for admission and cancellation, listens to each accepted handle's coalesced latest-value progress, and emits versioned UI snapshots. Startup subscribes to the event before requesting the initial snapshot; DTO revisions prevent older snapshots from replacing newer events. The frontend never treats itself as the source of transfer truth. The Phase 1 engine remains a Rust library boundary independent of Tauri, tested without a webview.
+
+The native app exposes `list_downloads`, `start_download`, `cancel_download`, and `acknowledge_download`. Destination selection uses the Tauri dialog plugin's save dialog; the selected path is still validated in Rust. File opening and folder reveal are intentionally absent. Tauri capability permissions are limited to core defaults and save-dialog access. The application waits for manager shutdown before allowing the normal close event to complete.
+
+The frontend uses CSS design tokens and no component/animation framework. Dark and light palettes and reduced-motion preference are stored locally in webview localStorage. The categories view explains that categories are unavailable; completed records are limited to the current session. There is no SQLite persistence.
 
 ## State ownership and communication
 

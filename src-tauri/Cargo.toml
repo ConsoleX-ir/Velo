@@ -1,0 +1,29 @@
+[package]
+name = "consolex-velo"
+version = "0.2.0"
+description = "A free, private desktop download manager"
+authors = ["ConsoleX"]
+edition = "2021"
+publish = false
+
+[lib]
+name = "consolex_velo_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "consolex-velo"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+consolex-download-engine = { path = ".." }
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tokio = { version = "1", features = ["sync"] }
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
