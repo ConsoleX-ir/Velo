@@ -3,7 +3,7 @@
 **Status:** Phase 1B managed Rust core; Tauri and frontend remain planned
 **Research checked:** 2026-10-21
 
-**Implementation update (2026-10-21):** The root-level Rust library now includes the Phase 1A HTTP/HTTPS transfer core and Phase 1B `DownloadManager`, with FIFO admission, generation-bearing handles, cancellation, coalesced progress, retained terminal results, and shutdown. The download core remains independent of Tauri; the application service, frontend, and Tauri shell are not present. On the Windows host, the full test suite passed, including no-clobber promotion and case-insensitive destination reservation tests (54 passed, 0 failed).
+**Implementation update (2026-10-22):** The root-level Rust library includes the Phase 1A HTTP/HTTPS transfer core and Phase 1B `DownloadManager`, with FIFO admission, generation-bearing handles, cancellation, coalesced progress, retained terminal results, shutdown, and bounded strong-ETag-validated Range continuation after interrupted bodies. The core remains independent of Tauri; the application service, frontend, and Tauri shell are not present. On Windows, the full test suite passed, including no-clobber promotion and case-insensitive destination reservation tests (62 passed, 0 failed).
 
 ## Chosen stack
 
@@ -35,7 +35,7 @@ The frontend does not open arbitrary filesystem paths or perform network request
 - UI state is a projection of native snapshots/events and may be reconstructed; it is not durable truth.
 - Commands carry stable download IDs and validated request fields. State transitions are emitted immediately; ordinary progress is limited to at most 10 updates per second per job.
 - Progress is latest-value/coalesced, with at most one pending snapshot per job. Terminal outcome is immutable and separately retained in the job registry until acknowledged; it is not an ordinary event that a bounded queue can drop.
-- Phase 1B uses an in-memory registry, one task per active job, and caller-ID plus generation handles. Do not persist transient progress as if it guaranteed crash recovery. Each accepted job makes one attempt; retries are deferred.
+- Phase 1B uses an in-memory registry, one task per active job, and caller-ID plus generation handles. Interrupted response bodies can continue with up to three strict `If-Range` requests using a known total and strong ETag; this does not provide restart recovery. Byte-zero retries remain deferred.
 - Provisional scheduler cap: 4 active jobs and 100 retained job records, including terminal records not yet acknowledged; reject excess synchronously. Keep the fixed cap until benchmarks justify changing it; adaptive concurrency is deferred.
 
 ## Persistence model and later SQLite boundary
@@ -72,7 +72,7 @@ Windows x64 is the initial packaging target. Tauri currently documents MSI (WiX)
 - **Verified (official docs, checked 2026-10-21):** Tauri 2 supports a configured CSP and recommends avoiding remote scripts; Windows installers include MSI and NSIS options; Reqwest exposes streamed response bodies and configurable redirect policies; Tokio's filesystem API currently dispatches ordinary blocking file operations via its blocking pool; SQLite WAL uses companion files and has network-filesystem limitations.
 - **Decisions:** selected stack above; isolate engine from Tauri; authoritative lifecycle state in native code; no Phase 1 database; user-selected paths; no downgrade redirects; Phase 1 no-clobber output; cancellation is rejected once `Finalizing` begins; terminal results are retained separately from progress.
 - **Assumptions:** Windows 10/11 x64 first, single-stream transfer, direct distribution, and per-user installation are provisional.
-- **Unresolved:** exact crate versions/features, whether to tune the provisional concurrency cap, installer/runtime policy, support matrix, persistence schema, and resume protocol.
+- **Unresolved:** exact crate versions/features, whether to tune the provisional concurrency cap, installer/runtime policy, support matrix, persistence schema, durable user-controlled resume policy, and segmented-transfer protocol.
 
 ## Official references
 

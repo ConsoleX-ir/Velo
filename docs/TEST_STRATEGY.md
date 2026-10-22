@@ -1,7 +1,7 @@
 # Test Strategy
 
-**Status:** Phase 1A/1B test suite implemented; Windows validation passed 54 tests on 2026-10-21
-**Research checked:** 2026-10-21
+**Status:** Phase 1A/1B test suite implemented; Windows validation passed 62 tests on 2026-10-22
+**Research checked:** 2026-10-22
 
 ## Phase 1 test layers
 
@@ -40,10 +40,10 @@
 - Compare output byte-for-byte with 0-byte, 1 MiB, and 64 MiB fixtures; all successful cases must have exact expected length when known.
 - For a scripted sequence that ends in a terminal result, assert exactly one terminal result per accepted job. Rejected `start` requests are not jobs and receive a synchronous start error.
 - Assert progress snapshots coalesce to the latest value, ordinary updates are at most 10 per second/job, and state transitions publish immediately. A slow subscriber cannot block transfer or lose a separately queryable terminal result.
-- Each accepted Phase 1B job makes one attempt. Retries and retry timing have no Phase 1B acceptance criteria.
+- Each job starts with one full GET and may make at most three in-job Range continuations after an interrupted body. Validate exact offset, unchanged strong ETag and total, final URL, segment length, bounded continuation count, and no promotion after a rejected range. Byte-zero retry behavior remains deferred.
 - For every failure/cancellation test, assert an existing final file is byte-identical and any undeleted temporary path is included in a `Failed` result.
 - Reject all final statuses except 200; accept absent Content-Length only after successful EOF, and reject both short and long bodies when Content-Length is present.
-- Assert non-200 response bodies are neither saved nor retained in diagnostics; a final response with `Content-Range` or non-identity content encoding is rejected.
+- Assert non-200 response bodies are neither saved nor retained in diagnostics; a full response with `Content-Range` or non-identity content encoding is rejected.
 - For close-delimited responses without Content-Length, assert the protocol EOF outcome and unknown total; do not claim the client can detect a peer that closed early at a syntactically valid boundary.
 - Verify in code review and stress test that response bodies are streamed and there is no file-size-proportional buffer or unbounded per-chunk event queue. Record large-file peak memory in benchmarks; no benchmark result exists yet.
 
@@ -54,7 +54,7 @@ From the repository root, run `cargo fmt --check`, `cargo check`, `cargo test`, 
 ## Later-phase tests
 
 - SQLite migrations, interrupted-write recovery, WAL sidecar handling, DB corruption/migration fallback, and user-data deletion.
-- Resume contract against servers that support/ignore/reject Range and change ETag/Last-Modified; partial-file validator consistency.
+- Durable resume contract against servers that support/ignore/reject Range and change ETag/Last-Modified; checkpoint and partial-file consistency across process restart.
 - Segmented download assembly correctness, range overlap/gap detection, and bounded per-host concurrency.
 - Packaged Windows upgrade/uninstall and WebView2 online/offline distribution paths.
 

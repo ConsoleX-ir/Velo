@@ -14,20 +14,20 @@
 ### Phase 1A — Single-transfer foundation (implemented)
 
 - Existing Rust library with Reqwest streaming, HTTP/HTTPS validation, redirect limits and HTTPS downgrade prevention, timeouts, response-length checks, exclusive sibling temp files, and no-clobber promotion.
-- Local scripted HTTP and filesystem tests; no persistence, resume, or recovery claims.
+- Local scripted HTTP and filesystem tests; no durable checkpoint, pause/resume, segmented-transfer, or crash-recovery claims.
 
-### Phase 1B — Managed one-attempt jobs (implemented)
+### Phase 1B — Managed jobs and safe continuation (implemented)
 
 - Shared in-memory manager with synchronous atomic admission, caller IDs plus generation-bearing handles, FIFO scheduling, default four active jobs and 100 retained records, coalesced latest-value progress, cooperative cancellation, one terminal result per accepted job, terminal acknowledgement, worker-panic cleanup, and idempotent shutdown.
-- Each accepted job runs exactly one attempt. Retries are deferred to a separately reviewed milestone. SQLite, crash recovery, pause/resume, segmented downloads, adaptive concurrency, BitTorrent, and UI integration remain out of scope.
-- Phase 1B validation (2026-10-21): On Windows, `cargo fmt --check`, `cargo check`, `cargo test` (54 passed, 0 failed), and `cargo clippy --all-targets --all-features -- -D warnings` passed. The Windows-specific promotion and case-insensitive reservation tests ran in that suite.
+- Each job starts with one full GET and may use up to three strong-ETag-validated Range continuations after an interrupted response. Byte-zero retries, SQLite, crash recovery, user-controlled pause/resume, segmented downloads, adaptive concurrency, BitTorrent, and UI integration remain out of scope.
+- Phase 1B validation (2026-10-22): On Windows, `cargo fmt --check`, `cargo check`, `cargo test` (62 passed, 0 failed), and `cargo clippy --all-targets --all-features -- -D warnings` passed. The Windows-specific promotion and case-insensitive reservation tests ran in that suite.
 
 ### Next milestones
 
 1. **Phase 1C — Retry policy (deferred):** define classification, backoff/Retry-After, byte-zero restart, and deterministic timing tests before implementation.
 2. **Phase 2 — Desktop shell:** Tauri 2 + React/TypeScript, narrow IPC commands, CSP/capabilities, and a minimal user workflow connected to the tested manager.
 3. **Phase 3 — Durable metadata:** SQLite migrations and startup recovery with honest interrupted-job semantics.
-4. **Phase 4 — Resume and transfer concurrency:** define validators/range semantics before single-stream resume; consider segmentation only after correctness and measurement.
+4. **Phase 4 — Durable resume and transfer concurrency:** define checkpoint and restart-recovery semantics; consider segmentation only after correctness and measurement.
 5. **Phase 5 — Release hardening and integrations:** signing, upgrades, accessibility, performance budgets, browser integration, and a separate BitTorrent security/product decision.
 
 ## Phase 2 — Desktop shell and minimal user workflow

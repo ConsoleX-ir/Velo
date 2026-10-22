@@ -6,7 +6,7 @@
 ## Privacy commitments
 
 - Free and ad-free; no mandatory accounts, cloud sync, AI features, or telemetry.
-- Download requests are initiated by the user. Phase 1B makes one requested HTTP/HTTPS attempt per accepted job plus policy-approved redirects.
+- Download requests are initiated by the user. Each job starts with one HTTP/HTTPS GET plus policy-approved redirects; up to three Range continuations may follow a body interruption only when a strong ETag and known total prove a matching representation.
 - Store metadata locally. Define retention and deletion behavior before persistent history ships.
 - Avoid collecting diagnostic data. If optional diagnostics are later proposed, make them opt-in, documented, minimal, and scrubbed.
 - URLs can contain private tokens in query strings. Display/log redaction must remove userinfo and sensitive query values; database retention policy remains open.

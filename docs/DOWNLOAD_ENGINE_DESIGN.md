@@ -1,17 +1,17 @@
 # Download Engine Design
 
-**Status:** Phase 1B implemented in the Rust core; in-memory only
-**Research checked:** 2026-10-21
+**Status:** Phase 1B managed jobs with bounded in-job HTTP range continuation
+**Research checked:** 2026-10-22
 
 ## Current implementation boundary
 
-The repository contains a reusable Reqwest transfer engine and a shared `DownloadManager` (`src/lib.rs`). The manager implements synchronous atomic admission, FIFO scheduling, configurable active and retained-record limits (defaults 4 and 100), generation-bearing handles, cooperative cancellation, latest-value `watch` progress, terminal lookup/acknowledgement, panic recovery, and idempotent shutdown. Each accepted job makes exactly one attempt. The manager reuses the existing HTTP response validation, timeout, redirect, exclusive-temp, and no-clobber promotion paths. The Rust test suite includes local HTTP and filesystem tests; its actual validation status is recorded in the project test evidence and must not be inferred from this design text.
+The repository contains a reusable Reqwest transfer engine and a shared `DownloadManager` (`src/lib.rs`). The manager implements synchronous atomic admission, FIFO scheduling, configurable active and retained-record limits (defaults 4 and 100), generation-bearing handles, cooperative cancellation, latest-value `watch` progress, terminal lookup/acknowledgement, panic recovery, and idempotent shutdown. A job starts with one full GET and may make up to three bounded Range continuation requests after an interrupted or partial response, only when a known total and strong ETag are available. It does not retry a failed full request from byte zero. The manager reuses the existing response validation, timeout, redirect, exclusive-temp, and no-clobber promotion paths. The Rust test suite includes local HTTP and filesystem tests; validation status must be taken from the commands actually run.
 
 Terminal publication, active-slot release, and destination-reservation release are performed together exactly once by the registry commit path. A transfer task owns the open temporary file and cleanup guard; the manager records its path before streaming. On unwind the guard makes a best-effort attempt, then the supervisor attempts cleanup and retains any failure in the terminal error. Normal shutdown waits for accepted jobs to reach terminal outcomes. Abrupt process termination cannot guarantee cleanup or a terminal result; a forced runtime shutdown can interrupt best-effort cleanup. Windows-specific promotion and case-insensitive destination reservation are implemented with target-specific Win32 calls and require actual Windows test execution for release confidence.
 
 ## Scope and non-goals
 
-One accepted Phase 1B job performs one HTTP/HTTPS GET attempt and writes one response to one local file using a bounded-memory streaming loop. Phase 1B does not implement retries, pause/resume, crash recovery, segmented transfers, or checksum verification. Any future retry design must use a fresh byte-zero attempt and receive its own contract and tests.
+One accepted job performs a single-stream HTTP/HTTPS transfer using bounded-memory streaming. After a complete `200 OK` establishes a known total and a strong ETag, an interrupted body may continue from the exact number of bytes successfully written. Each continuation sends `Range: bytes=N-` and `If-Range: <strong-etag>`. The response must be `206 Partial Content`, identify a range beginning exactly at N, report the same total, carry the same strong ETag, and have a body matching the advertised range. The final response URL must equal the established effective URL. Any ignored range (`200`), changed/missing validator, malformed or misaligned range, unexpected total, or unsupported response fails and cleans up the temporary file. Only strong ETags are used; weak ETags and `Last-Modified` dates do not enable continuation. There are at most three continuation requests per job. If there is no known length or strong ETag, an interrupted body fails without promotion. This is in-job transfer continuation only: explicit pause/resume, durable checkpoints, crash recovery, byte-zero retries, segmented downloads, and checksum verification remain deferred.
 
 ## Public contract (Rust-shaped, illustrative)
 
@@ -49,7 +49,7 @@ For every accepted job, the registry stores one immutable terminal result indepe
 
 ## Admission and resource limits
 
-The defaults are 4 active jobs and 100 retained records total, including queued, active, and terminal-but-unacknowledged jobs. `DownloadManagerConfig` can set nonzero limits. Excess starts fail synchronously with `CapacityReached`; jobs over the active cap remain `Queued`. A record is removed only by explicit acknowledgement. Each accepted job gets one attempt; retries are deferred. Per active job, the engine holds bounded response data and one latest progress snapshot; memory does not scale with total file size.
+The defaults are 4 active jobs and 100 retained records total, including queued, active, and terminal-but-unacknowledged jobs. `DownloadManagerConfig` can set nonzero limits. Excess starts fail synchronously with `CapacityReached`; jobs over the active cap remain `Queued`. A record is removed only by explicit acknowledgement. Each job starts with one full GET and can make at most three validator-checked Range continuation requests; general retries are deferred. Per active job, the engine holds bounded response data and one latest progress snapshot; memory does not scale with total file size.
 
 ## State machine
 
@@ -64,7 +64,7 @@ Queued → Preparing → Downloading → Finalizing → Completed
                                          └→ Failed (cleanup failed)
 ```
 
-Any nonterminal state before `Finalizing` may transition to `Cancelling`; operational states may transition to `Failed`. Cancellation and the transition to `Finalizing` are serialized by the manager registry lock. If cancellation wins first, the task stops at a safe boundary and cleans up. If `Finalizing` wins first, `cancel` returns `TooLate`. There is no retry transition and no `Completed` result before successful promotion. A single terminal commit releases the active slot/reservation and publishes the result exactly once.
+Any nonterminal state before `Finalizing` may transition to `Cancelling`; operational states may transition to `Failed`. Range continuation stays within `Downloading` and never resets the byte counter. Cancellation and the transition to `Finalizing` are serialized by the manager registry lock. If cancellation wins first, the task stops at a safe boundary and cleans up. If `Finalizing` wins first, `cancel` returns `TooLate`. There is no `Completed` result before successful promotion. A single terminal commit releases the active slot/reservation and publishes the result exactly once.
 
 - `Queued`: accepted into the in-memory scheduler; no destination bytes written.
 - `Preparing`: create the exclusive private temp file and request; URL and destination shape were validated before job acceptance.
@@ -94,16 +94,16 @@ There is no `Paused`, `Interrupted`, or `Verifying` state in Phase 1. Abrupt pro
 - Send GET, request identity encoding (`Accept-Encoding: identity`) and build without transparent compression features unless byte-accounting is explicitly adapted and tested.
 - Redirects: cap at 10 hops; validate every target scheme and reject userinfo; reject HTTPS-to-HTTP downgrade; allow HTTP-to-HTTPS. Loop, limit, and policy violations are typed terminal failures. Phase 1 sends no credentials/cookies/custom sensitive headers. If such headers are added later, strip them on origin changes and test the behavior; Reqwest's built-in sensitive-header stripping does not replace project policy.
 - Disable automatic `Referer` forwarding so redirect chains cannot leak a source URL's query string. Never log full URLs by default; redact query values from surfaced diagnostics.
-- Accept final status `200 OK` only for a full GET. This includes a valid zero-byte body when `Content-Length: 0` or EOF confirms empty content. Reject final `204`, `206`, other 2xx, and all non-2xx statuses; redirects are processed by the redirect policy and their bodies are never saved. Phase 1 never sends `Range`.
+- Accept final status `200 OK` for the initial full GET, including a valid zero-byte body. Reject final `204`, `206` on the initial request, other 2xx, and all non-2xx statuses; redirects are processed by the redirect policy and their bodies are never saved. A continuation request is the only request that accepts `206`, and it must pass the strict `Content-Range`, `Content-Length`-if-present, effective-URL, total-length, and strong-ETag checks above. A `200` response to a continuation is treated as range-ignored/entity-changed and is never appended.
 - A redirect response body is never written as file data. Body is consumed only after status/headers pass validation.
-- Require absent or `identity` `Content-Encoding` (every header value is checked); reject other encodings, and any `Transfer-Encoding` other than `chunked`, so on-disk byte accounting is directly comparable to `Content-Length`. Reject `Content-Range` because Phase 1 never issues a range request. Record `Content-Length` as expected total, not proof of completion. Count bytes only after successful writes with checked `u64` addition. On EOF, if length is present and differs from bytes written, fail and never promote; reject overrun as soon as detected. If length is absent, successful protocol EOF is the completion signal and `total_bytes` remains unknown. For a close-delimited response without a declared length, the client cannot distinguish an intentional end from a peer that closed early; this limitation must be surfaced in product copy and no cryptographic integrity claim is made.
+- Require absent or `identity` `Content-Encoding` and absent or a single `chunked` `Transfer-Encoding`, so on-disk byte accounting remains comparable to `Content-Length`. Reject `Content-Range` on the initial full response. Record full-response `Content-Length` as expected total, not proof of completion. Count bytes only after successful writes with checked `u64` addition. Reject segment overrun immediately and require every range body to match its `Content-Range` span. If the full response has no length, successful protocol EOF completes it but an interrupted transfer cannot resume. A close-delimited response without a declared length cannot distinguish intentional EOF from a peer that closes early at a valid boundary; no integrity claim is made.
 - Server-provided names, MIME types, and error bodies are untrusted. On non-200 HTTP responses, do not read or retain the response body; report the numeric status and a local safe message only.
 
 ## Streaming, accounting, and progress
 
 Consume Reqwest chunks/stream and write each chunk to Tokio `File` with a fixed upper bound on in-flight body data. Use a partial-write loop with `write`, incrementing the checked byte counter for each successful returned byte count; treat `Ok(0)` as `WriteZero`. Do not use `write_all` where accurate partial-byte accounting is required, and do not collect the response into a `Vec` or buffer proportional to file size. Tokio filesystem APIs currently use blocking filesystem operations behind the async interface; this is a performance characteristic, not a promise of kernel-native async disk I/O.
 
-Progress counts bytes successfully written in the single attempt. `total_bytes` is optional and comes from the accepted response. The internal byte counter is updated after every successful partial write; the public `watch` snapshot is published at most 10 ordinary times per second/job. State transitions are immediate. `watch` stores only its latest value; terminal results are retained separately in the registry, so slow subscribers cannot block disk writes, accumulate events, or lose a terminal result.
+Progress counts all bytes successfully written across the initial response and any continuation; it never resets when a Range request begins. `total_bytes` comes from the initial full response and remains fixed. The internal byte counter is updated after every successful partial write; the public `watch` snapshot is published at most 10 ordinary times per second/job. State transitions are immediate. `watch` stores only its latest value; terminal results are retained separately in the registry, so slow subscribers cannot block disk writes, accumulate events, or lose a terminal result.
 
 `Finalizing` calls `sync_all` on the temporary file before promotion. This incurs per-download cost and is included in benchmarks. The contract guarantees validated bytes and atomic no-replace visibility after promotion, but does not claim survival of sudden power loss for the final directory entry.
 
@@ -113,13 +113,13 @@ For accurate partial byte counts, implement writes as a loop over `AsyncWriteExt
 
 Cancellation is cooperative while queued, connecting, waiting for headers, or reading the body. It is not selected against a pending file write: the current chunk write loop completes and counts each partial write before cancellation is observed. Cancellation is serialized against transition to `Finalizing` under the registry lock. Always close handles before deleting temp files. Cancellation cleanup success yields `Cancelled`; cleanup failure yields `Failed` with the temp path and cleanup error. On worker unwind, `TempGuard` makes a best-effort cleanup attempt and the supervisor makes an explicit second attempt before committing `Failed`. Runtime/process termination can prevent cleanup or terminal publication; no crash recovery is promised.
 
-## Retries (deferred)
+## Retry and resume boundary
 
-Every accepted Phase 1B job makes exactly one request attempt. Retry classification, `Retry-After`, jitter, delay injection, and retry-specific states/progress are not implemented. They require a later reviewed contract and tests.
+Range continuation is not a general retry policy: it is allowed only after a known-length representation with a strong ETag has begun streaming, and it resumes from the exact successfully written offset. Initial connection failures and failures without a strong validator fail immediately. Byte-zero retries, HTTP status retry classification, `Retry-After`, jitter, durable checkpoints, and restart-after-process-exit behavior are not implemented.
 
 ## Deterministic test server and contract tests
 
-Use a local in-process HTTP server bound to loopback on an ephemeral port; no external network. Script fixed bytes, chunked/slow streams, declared-length mismatch/truncation, status codes, redirects, connection reset, and delayed headers. Use deterministic cancellation and finalization gates. Assert exact output bytes; no final file on invalid/incomplete responses; existing destination bytes unchanged on failures/cancellation; exactly one terminal result per accepted job; progress snapshots coalesce and ordinary updates stay at or below 10/second/job; a stalled subscriber cannot block transfer or lose the terminal result. Assert FIFO order, no more than the configured active limit, the 100-record default (including unacknowledged terminal jobs), and synchronous capacity errors. Test concurrent duplicate IDs/destinations, stale generations after ID reuse, worker panic/cleanup failure, repeated shutdown, and Windows case-variant destination reservation and no-replace promotion.
+Use a local in-process HTTP server bound to loopback on an ephemeral port; no external network. Script fixed bytes, chunked/slow streams, declared-length mismatch/truncation, status codes, redirects, connection reset, and delayed headers. For Range continuation, test matching ETag success, changed/missing ETag, missing/weak validators, ignored Range (`200`), `416`, malformed/misaligned `Content-Range`, wrong total, wrong segment length, repeated interruption through the request cap, and cancellation during a continuation. Assert exact output bytes and that failed continuations never promote a partial destination. Also retain lifecycle assertions: existing destination bytes stay unchanged on failures/cancellation; exactly one terminal result per accepted job; progress snapshots coalesce and remain monotonic; ordinary updates stay at or below 10/second/job; a stalled subscriber cannot block transfer or lose the terminal result. Assert FIFO order, no more than the configured active limit, the 100-record default (including unacknowledged terminal jobs), and synchronous capacity errors. Test concurrent duplicate IDs/destinations, stale generations after ID reuse, worker panic/cleanup failure, repeated shutdown, and Windows case-variant destination reservation and no-replace promotion.
 
 ## Open implementation decisions
 
@@ -128,7 +128,7 @@ Use a local in-process HTTP server bound to loopback on an ephemeral port; no ex
 - Whether user-entered URLs may target loopback/private-network addresses; decide before adding link interception or background URL ingestion.
 - Whether a later product version should add an explicit overwrite flow; Phase 1 itself is no-clobber only.
 - Whether the provisional scheduler limits (4 active, 100 retained job records) should change after representative measurements.
-- Retry classification and policy for a later phase.
+- Byte-zero retry classification and policy for a later phase.
 - Exact cleanup recovery UX when the OS prevents deletion of a temporary file; Phase 1 returns `Failed` with the temporary path and cleanup error.
 
 ## Official references
@@ -144,3 +144,5 @@ Checked 2026-10-21:
 - Rust rename behavior (including Windows): https://doc.rust-lang.org/std/fs/fn.rename.html
 - Windows MoveFileEx semantics: https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-movefileexw
 - Reqwest read and total request timeout semantics: https://docs.rs/reqwest/latest/reqwest/struct.ClientBuilder.html
+
+HTTP Range and validator semantics checked 2026-10-22 against [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html), Sections 8.8.3, 13.1.5, 14.2, 14.4, and 15.3.7. The implementation adopts a stricter policy than the protocol permits by requiring the matching strong ETag to be repeated in each partial response; valid but unconfirmed continuation responses fail closed.

@@ -22,11 +22,11 @@ use tokio::{
 use url::Url;
 
 use crate::{
-    cleanup_or_original, parse_content_length, promote_no_replace, redirect_decision,
-    temp_candidate, validate_transfer_encoding, write_chunk_accounted, CancelDisposition,
-    ControlError, DownloadEngine, DownloadError, DownloadHandle, DownloadId, DownloadManager,
-    DownloadManagerConfig, DownloadRequest, DownloadState, NetworkFailureKind, OpenedTemp,
-    StartError, TempGuard,
+    cleanup_or_original, parse_content_length, parse_content_range, parse_strong_etag,
+    promote_no_replace, redirect_decision, temp_candidate, validate_transfer_encoding,
+    write_chunk_accounted, CancelDisposition, ControlError, DownloadEngine, DownloadError,
+    DownloadHandle, DownloadId, DownloadManager, DownloadManagerConfig, DownloadRequest,
+    DownloadState, NetworkFailureKind, OpenedTemp, StartError, TempGuard,
 };
 
 static DIR_ID: AtomicU64 = AtomicU64::new(0);
@@ -410,6 +410,152 @@ where
     (address, hits, task)
 }
 
+async fn serve_range_resume(
+    initial_etag: Option<&'static str>,
+    resumed_status: &'static str,
+    resumed_headers: &'static str,
+    resumed_body: &'static [u8],
+) -> (String, JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let address = listener.local_addr().expect("read listener address");
+    let task = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        let (mut first, _) = listener.accept().await.expect("accept initial request");
+        requests.push(read_request(&mut first).await);
+        let etag = initial_etag
+            .map(|etag| format!("ETag: {etag}\r\n"))
+            .unwrap_or_default();
+        let initial = response(
+            "200 OK",
+            &format!("Content-Length: 10\r\n{etag}Connection: close\r\n"),
+            b"abcde",
+        );
+        let _ = first.write_all(&initial).await;
+        let _ = first.shutdown().await;
+
+        if initial_etag.is_none() {
+            return requests;
+        }
+        let (mut resumed, _) = listener.accept().await.expect("accept range request");
+        requests.push(read_request(&mut resumed).await);
+        let reply = response(resumed_status, resumed_headers, resumed_body);
+        let _ = resumed.write_all(&reply).await;
+        let _ = resumed.shutdown().await;
+        requests
+    });
+    (format!("http://{address}/file"), task)
+}
+
+async fn serve_partial_range_sequence() -> (String, JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let address = listener.local_addr().expect("read listener address");
+    let task = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for (status, headers, body) in [
+            (
+                "200 OK",
+                "Content-Length: 10\r\nETag: \"v1\"\r\nConnection: close\r\n",
+                b"abcde".as_slice(),
+            ),
+            (
+                "206 Partial Content",
+                "Content-Range: bytes 5-7/10\r\nContent-Length: 3\r\nETag: \"v1\"\r\nConnection: close\r\n",
+                b"fgh".as_slice(),
+            ),
+            (
+                "206 Partial Content",
+                "Content-Range: bytes 8-9/10\r\nContent-Length: 2\r\nETag: \"v1\"\r\nConnection: close\r\n",
+                b"ij".as_slice(),
+            ),
+        ] {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            requests.push(read_request(&mut stream).await);
+            let reply = response(status, headers, body);
+            let _ = stream.write_all(&reply).await;
+            let _ = stream.shutdown().await;
+        }
+        requests
+    });
+    (format!("http://{address}/file"), task)
+}
+
+async fn serve_bounded_range_sequence() -> (String, JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let address = listener.local_addr().expect("read listener address");
+    let task = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for offset in 0..=3_u64 {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            requests.push(read_request(&mut stream).await);
+            let reply = if offset == 0 {
+                response(
+                    "200 OK",
+                    "Content-Length: 10\r\nETag: \"v1\"\r\nConnection: close\r\n",
+                    b"abcde",
+                )
+            } else {
+                let start = 4 + offset;
+                response(
+                    "206 Partial Content",
+                    &format!(
+                        "Content-Range: bytes {start}-{start}/10\r\nContent-Length: 1\r\nETag: \"v1\"\r\nConnection: close\r\n"
+                    ),
+                    b"x",
+                )
+            };
+            let _ = stream.write_all(&reply).await;
+            let _ = stream.shutdown().await;
+        }
+        requests
+    });
+    (format!("http://{address}/file"), task)
+}
+
+async fn serve_gated_range() -> (
+    String,
+    JoinHandle<()>,
+    oneshot::Receiver<()>,
+    oneshot::Sender<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let address = listener.local_addr().expect("read listener address");
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await.expect("accept initial GET");
+        read_request(&mut first).await;
+        let full = response(
+            "200 OK",
+            "Content-Length: 10\r\nETag: \"v1\"\r\nConnection: close\r\n",
+            b"abcde",
+        );
+        let _ = first.write_all(&full).await;
+        let _ = first.shutdown().await;
+
+        let (mut range, _) = listener.accept().await.expect("accept continuation");
+        read_request(&mut range).await;
+        let headers = b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 5-9/10\r\nContent-Length: 5\r\nETag: \"v1\"\r\nConnection: close\r\n\r\nf";
+        let _ = range.write_all(headers).await;
+        let _ = started_tx.send(());
+        let _ = release_rx.await;
+        let _ = range.shutdown().await;
+    });
+    (
+        format!("http://{address}/file"),
+        task,
+        started_rx,
+        release_tx,
+    )
+}
+
 fn test_engine(read_inactivity_ms: u64, deadline_ms: u64) -> DownloadEngine {
     DownloadEngine::with_timeouts(
         Duration::from_secs(5),
@@ -432,6 +578,214 @@ async fn download_within(
 }
 
 // ----- HTTP status / headers -------------------------------------------------
+
+#[tokio::test]
+async fn resumes_truncated_body_from_exact_offset_with_strong_etag() {
+    let (url, server) = serve_range_resume(
+        Some("\"version-1\""),
+        "206 Partial Content",
+        "Content-Range: bytes 5-9/10\r\nContent-Length: 5\r\nETag: \"version-1\"\r\nConnection: close\r\n",
+        b"fghij",
+    )
+    .await;
+    let dir = TestDir::new();
+    let target = dir.path().join("resumed.bin");
+
+    let result = DownloadEngine::new()
+        .unwrap()
+        .download(&url, &target)
+        .await
+        .unwrap();
+    let requests = server.await.unwrap();
+
+    assert_eq!(result.bytes_written, 10);
+    assert_eq!(fs::read(&target).unwrap(), b"abcdefghij");
+    assert!(requests[1]
+        .lines()
+        .any(|line| line.eq_ignore_ascii_case("range: bytes=5-")));
+    assert!(requests[1]
+        .lines()
+        .any(|line| line.eq_ignore_ascii_case("if-range: \"version-1\"")));
+    assert_eq!(entry_count(&dir), 1);
+}
+
+#[tokio::test]
+async fn does_not_resume_interrupted_body_without_strong_etag() {
+    let (url, server) = serve_range_resume(None, "", "", b"").await;
+    let dir = TestDir::new();
+    let target = dir.path().join("unvalidated.bin");
+
+    let error = DownloadEngine::new()
+        .unwrap()
+        .download(&url, &target)
+        .await
+        .unwrap_err();
+    let requests = server.await.unwrap();
+
+    assert!(matches!(error, DownloadError::IncompleteResponse { .. }));
+    assert_eq!(requests.len(), 1, "no Range request without a strong ETag");
+    assert!(!target.exists());
+    assert_eq!(entry_count(&dir), 0);
+}
+
+#[tokio::test]
+async fn continues_from_partial_content_range_without_resetting_bytes() {
+    let (url, server) = serve_partial_range_sequence().await;
+    let dir = TestDir::new();
+    let target = dir.path().join("partial-ranges.bin");
+
+    let result = DownloadEngine::new()
+        .unwrap()
+        .download(&url, &target)
+        .await
+        .unwrap();
+    let requests = server.await.unwrap();
+
+    assert_eq!(result.bytes_written, 10);
+    assert_eq!(fs::read(&target).unwrap(), b"abcdefghij");
+    assert!(requests[1]
+        .lines()
+        .any(|line| line.eq_ignore_ascii_case("range: bytes=5-")));
+    assert!(requests[2]
+        .lines()
+        .any(|line| line.eq_ignore_ascii_case("range: bytes=8-")));
+    assert_eq!(entry_count(&dir), 1);
+}
+
+#[tokio::test]
+async fn range_continuation_request_count_is_bounded() {
+    let (url, server) = serve_bounded_range_sequence().await;
+    let dir = TestDir::new();
+    let target = dir.path().join("resume-limit.bin");
+
+    let error = DownloadEngine::new()
+        .unwrap()
+        .download(&url, &target)
+        .await
+        .unwrap_err();
+    let requests = server.await.unwrap();
+
+    assert!(matches!(error, DownloadError::IncompleteResponse { .. }));
+    assert_eq!(requests.len(), 4, "one full GET plus three continuations");
+    assert!(!target.exists());
+    assert_eq!(entry_count(&dir), 0);
+}
+
+#[tokio::test]
+async fn rejects_range_resume_when_entity_tag_changes() {
+    let (url, server) = serve_range_resume(
+        Some("\"version-1\""),
+        "206 Partial Content",
+        "Content-Range: bytes 5-9/10\r\nContent-Length: 5\r\nETag: \"version-2\"\r\nConnection: close\r\n",
+        b"fghij",
+    )
+    .await;
+    let dir = TestDir::new();
+    let target = dir.path().join("changed.bin");
+
+    let error = DownloadEngine::new()
+        .unwrap()
+        .download(&url, &target)
+        .await
+        .unwrap_err();
+    server.await.unwrap();
+
+    assert!(matches!(error, DownloadError::InvalidResponse));
+    assert!(!target.exists());
+    assert_eq!(entry_count(&dir), 0);
+}
+
+#[tokio::test]
+async fn rejects_misaligned_or_ignored_range_responses_without_appending() {
+    let cases = [
+        (
+            "206 Partial Content",
+            "Content-Range: bytes 4-9/10\r\nContent-Length: 6\r\nETag: \"version-1\"\r\nConnection: close\r\n",
+            b"efghij".as_slice(),
+        ),
+        (
+            "206 Partial Content",
+            "Content-Range: bytes 5-9/11\r\nContent-Length: 5\r\nETag: \"version-1\"\r\nConnection: close\r\n",
+            b"fghij".as_slice(),
+        ),
+        (
+            "206 Partial Content",
+            "Content-Range: bytes 5-9/10\r\nContent-Length: 4\r\nETag: \"version-1\"\r\nConnection: close\r\n",
+            b"fghi".as_slice(),
+        ),
+        (
+            "206 Partial Content",
+            "Content-Range: bytes 5-9/10\r\nContent-Length: 5\r\nConnection: close\r\n",
+            b"fghij".as_slice(),
+        ),
+        (
+            "200 OK",
+            "Content-Length: 10\r\nETag: \"version-1\"\r\nConnection: close\r\n",
+            b"abcdefghij".as_slice(),
+        ),
+        (
+            "416 Range Not Satisfiable",
+            "Content-Range: bytes */10\r\nContent-Length: 0\r\nConnection: close\r\n",
+            b"".as_slice(),
+        ),
+    ];
+    for (status, headers, body) in cases {
+        let (url, server) = serve_range_resume(Some("\"version-1\""), status, headers, body).await;
+        let dir = TestDir::new();
+        let target = dir.path().join("bad-range.bin");
+        let error = DownloadEngine::new()
+            .unwrap()
+            .download(&url, &target)
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert!(matches!(error, DownloadError::InvalidResponse));
+        assert!(!target.exists());
+        assert_eq!(entry_count(&dir), 0);
+    }
+}
+
+#[test]
+fn content_range_and_strong_etag_parsers_reject_ambiguous_values() {
+    let mut headers = HeaderMap::new();
+    headers.insert("content-range", HeaderValue::from_static("bytes 4-9/10"));
+    assert_eq!(
+        parse_content_range(&headers).unwrap(),
+        crate::ContentRange {
+            start: 4,
+            end: 9,
+            total: 10
+        }
+    );
+    headers.insert("content-range", HeaderValue::from_static("bytes 9-4/10"));
+    assert!(matches!(
+        parse_content_range(&headers),
+        Err(DownloadError::InvalidResponse)
+    ));
+    headers.insert("content-range", HeaderValue::from_static("BYTES 4-9/10"));
+    assert_eq!(
+        parse_content_range(&headers).unwrap(),
+        crate::ContentRange {
+            start: 4,
+            end: 9,
+            total: 10
+        }
+    );
+    headers.remove("content-range");
+    headers.insert("etag", HeaderValue::from_static("W/\"weak\""));
+    assert_eq!(parse_strong_etag(&headers).unwrap(), None);
+    headers.insert("etag", HeaderValue::from_static("\"strong\""));
+    assert_eq!(
+        parse_strong_etag(&headers).unwrap(),
+        Some(HeaderValue::from_static("\"strong\""))
+    );
+    headers.append("etag", HeaderValue::from_static("\"second\""));
+    assert_eq!(parse_strong_etag(&headers).unwrap(), None);
+    headers.remove("etag");
+    headers.insert("etag", HeaderValue::from_static("invalid"));
+    assert_eq!(parse_strong_etag(&headers).unwrap(), None);
+}
 
 #[tokio::test]
 async fn only_status_200_is_accepted() {
@@ -1447,6 +1801,34 @@ async fn manager_completes_retains_acknowledges_and_rejects_stale_generation() {
     server.await.unwrap();
     assert_eq!(terminal.state, DownloadState::Completed);
     manager.acknowledge_terminal(&new).unwrap();
+}
+
+#[tokio::test]
+async fn manager_cancellation_during_range_continuation_cleans_partial_file() {
+    let (url, server, continuation_started, release) = serve_gated_range().await;
+    let dir = TestDir::new();
+    let target = dir.path().join("cancel-range.bin");
+    let manager = DownloadManager::new().unwrap();
+    let handle = manager
+        .start(managed_request("cancel-range", url, target.clone()))
+        .unwrap();
+
+    continuation_started.await.unwrap();
+    assert_eq!(entry_count(&dir), 1, "only the owned temp should exist");
+    assert_eq!(
+        manager.cancel(&handle).unwrap(),
+        CancelDisposition::Accepted
+    );
+    release.send(()).unwrap();
+    let terminal = wait_for_terminal(&manager, &handle).await;
+    server.await.unwrap();
+
+    assert_eq!(terminal.state, DownloadState::Cancelled);
+    assert!((5..=6).contains(&terminal.bytes_written));
+    assert!(!target.exists());
+    assert_eq!(entry_count(&dir), 0);
+    manager.acknowledge_terminal(&handle).unwrap();
+    manager.shutdown().await;
 }
 
 #[tokio::test]

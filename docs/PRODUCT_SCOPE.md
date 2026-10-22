@@ -16,17 +16,17 @@ Included:
 - HTTP and HTTPS GET for valid `http`/`https` URLs.
 - Destination validation, collision-safe output creation, safe filename derivation when the caller requests a suggested name, and explicit error reporting.
 - Phase 1 is no-clobber only: an existing destination or a finalization-time collision is an error. There is no overwrite flag; a later overwrite feature needs its own explicit semantics.
-- Bounded redirect handling, response validation, streaming writes, byte accounting, cancellation, and bounded retries for classified transient failures.
+- Bounded redirect handling, response validation, streaming writes, byte accounting, cancellation, and strict in-job Range continuation after interrupted bodies when a known length and strong ETag permit safe continuation.
 - Deterministic integration tests against an in-process/local HTTP server.
 
-Excluded from Phase 1: complete UI, browser integration, BitTorrent, segmented or parallel-range downloads, adaptive concurrency, SQLite recovery, pause/resume, scheduling, automatic update service, and cloud sync.
+Excluded from Phase 1: complete UI, browser integration, BitTorrent, segmented or parallel-range downloads, adaptive concurrency, SQLite recovery, user-controlled pause/resume, durable checkpoints, byte-zero retries, scheduling, automatic update service, and cloud sync.
 
 ## Product principles and constraints
 
 - Windows is the first release platform; the stack decision is Tauri 2, Rust, React + TypeScript, Tokio, Reqwest, and SQLite for persistent metadata.
 - Prefer local-only behavior. No network calls beyond the user-requested download and explicitly user-initiated update checks if introduced in a later phase.
 - Show progress based on bytes successfully written, not bytes merely received from the network.
-- Never imply pause/resume, recovery, or integrity verification until each behavior has defined semantics and passing tests.
+- Describe the implemented behavior narrowly: an interrupted live transfer may continue through a validator-checked Range request. Do not imply user-controlled pause/resume, process-restart recovery, or integrity verification.
 - Errors should identify the failed operation and offer a useful remedy without exposing credentials or unnecessarily echoing sensitive URL data.
 - A proposed Windows installer size of approximately 100–130 MB is a planning goal only. Installer and installed sizes require measurement on release builds and are sensitive to WebView2 packaging choices.
 
@@ -53,4 +53,4 @@ Excluded from Phase 1: complete UI, browser integration, BitTorrent, segmented o
 - Whether HTTP URLs are allowed, and whether HTTPS-to-HTTP redirects are rejected (Phase 1 decision: reject downgrade redirects).
 - Product name, publisher identity, icon, localization, and accessibility requirements.
 - Whether manually entered URLs may target loopback/private-network addresses; decide before browser integration or background URL ingestion.
-- Later-phase pause/resume policy, including how partial files and changed remote entities are handled.
+- Later-phase durable pause/resume and restart-recovery policy, including checkpoint storage and verification of partial files.

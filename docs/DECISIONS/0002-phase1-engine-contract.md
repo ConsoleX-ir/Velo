@@ -5,11 +5,11 @@
 
 ## Context
 
-The first implementation must establish correct basic HTTP/HTTPS downloads without implying mature pause, resume, recovery, or segmented transfer behavior.
+The initial implementation established correct basic HTTP/HTTPS downloads without durable pause, restart recovery, or segmented transfer behavior. A later engine hardening step adds narrowly bounded continuation of an interrupted body within the same live job.
 
 ## Decision
 
-Phase 1A provides the single-stream HTTP/HTTPS transfer primitive. Phase 1B manages one-attempt jobs using that transfer path: caller-supplied IDs, generation-bearing handles, an in-memory FIFO queue, bounded active and retained capacities, latest-value progress, cooperative cancellation, panic supervision, terminal-result acknowledgement, and idempotent shutdown. Retries are deferred; each accepted job makes exactly one attempt. No SQLite recovery is included.
+Phase 1A provides the single-stream HTTP/HTTPS transfer primitive. Phase 1B manages jobs using that transfer path: caller-supplied IDs, generation-bearing handles, an in-memory FIFO queue, bounded active and retained capacities, latest-value progress, cooperative cancellation, panic supervision, terminal-result acknowledgement, and idempotent shutdown. Each job begins with one full GET. If its response is interrupted after streaming starts, the engine may make up to three `Range` continuation requests only when the full response supplied a known length and strong ETag. Every continuation must validate status, exact byte offset, total length, response URL, and unchanged strong ETag before bytes are appended. Byte-zero retries, durable resume checkpoints, and SQLite recovery are deferred.
 
 Phase 1 remains no-clobber: existing targets are rejected and promotion fails if a target appears after validation. Cancellation and finalization are serialized; after `Finalizing` begins cancellation returns `TooLate`. A cancellation accepted earlier yields `Cancelled` only after cleanup succeeds; cleanup failure yields `Failed`. Each accepted job has one retained terminal result independent of progress delivery. Terminal publication, active-slot release, and reservation release share one idempotent registry commit path.
 
@@ -17,10 +17,10 @@ Phase 1 remains no-clobber: existing targets are rejected and promotion fails if
 
 - A process crash can leave a partial temp file; startup recovery is deferred.
 - Existing destination files are always preserved in Phase 1. There is no overwrite request option.
-- No Pause, Interrupted, Verifying, Range, or resume state is exposed.
+- No user-controlled Pause, durable Interrupted state, crash recovery, or segmented-download state is exposed. Validated in-job Range continuation stays in `Downloading` and never resets byte progress.
 - Response size may be unknown; successful EOF is the completion signal when no trustworthy length is available.
-- Only final HTTP 200 is accepted; the transfer rejects non-identity content encoding and validates Content-Length against bytes successfully written.
-- Phase 1B makes one attempt per accepted job; retries, jitter, and `Retry-After` are deferred. The transfer keeps the 10 s connect, 30 s inactivity, and 24 h request-timeout defaults documented in `DOWNLOAD_ENGINE_DESIGN.md`; these are implementation defaults, not benchmark-validated UX budgets.
+- The initial full GET accepts HTTP 200; an in-job continuation accepts HTTP 206 only after strict range, total, URL, and strong-ETag validation. Non-identity content encoding is rejected and lengths are checked against bytes successfully written.
+- Phase 1 jobs use one initial GET and at most three validator-checked Range continuations after an interrupted body. General retries from byte zero, retry classification, jitter, and `Retry-After` are deferred. Timeout defaults remain as documented in `DOWNLOAD_ENGINE_DESIGN.md`; they are implementation defaults, not benchmark-validated UX budgets.
 - Ordinary progress is at most 10 updates/second/job; state transitions are immediate and terminal outcomes are retained separately.
 - Provisional admission cap is 4 active and 100 retained job records total, including unacknowledged terminal records. Excess start calls are rejected synchronously.
 - `DownloadHandle` combines the required caller ID with an internal generation. Every manager control, lookup, snapshot, and acknowledgement validates the active generation; acknowledgement permits ID reuse without allowing stale handles to target the new job.

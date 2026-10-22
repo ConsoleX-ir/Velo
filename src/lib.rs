@@ -4,7 +4,8 @@
 //! A successful response is flushed and length-checked before a no-clobber
 //! promotion. Managed jobs use FIFO scheduling, cooperative cancellation,
 //! coalesced progress snapshots, and retained terminal results. Each accepted
-//! job runs one attempt; persistence and retries are deferred.
+//! jobs may continue interrupted bodies with bounded, validator-checked Range
+//! requests; durable checkpoints, retries from byte zero, and persistence are deferred.
 
 #[cfg(test)]
 use std::{collections::HashSet, sync::atomic::AtomicBool};
@@ -40,6 +41,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
 const JOB_DEADLINE: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_REDIRECTS: usize = 10;
+const MAX_RESUME_REQUESTS: usize = 3;
 const DEFAULT_MAX_ACTIVE: usize = 4;
 const DEFAULT_MAX_RETAINED: usize = 100;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
@@ -531,72 +533,13 @@ impl DownloadEngine {
     where
         F: FnMut(TransferEvent),
     {
-        // The wait for response headers is bounded by the same inactivity limit
-        // as body reads; otherwise a silent server would only be cut off by the
-        // 24 h job deadline while holding the destination reservation.
-        let response_result = cancellable(
-            &mut cancellation,
-            timeout(
-                self.read_inactivity,
-                self.client
-                    .get(url.clone())
-                    .header(reqwest::header::ACCEPT_ENCODING, "identity")
-                    .send(),
-            ),
-        )
-        .await;
-        let response_result = match response_result {
-            None => return Ok(TransferExit::Cancelled),
-            Some(result) => result,
-        };
-        let response = response_result
-            .map_err(|_| DownloadError::NetworkFailure(NetworkFailureKind::Timeout))?
-            .map_err(|error| {
-                if error.is_redirect() {
-                    DownloadError::RedirectRejected
-                } else {
-                    DownloadError::NetworkFailure(if error.is_timeout() {
-                        NetworkFailureKind::Timeout
-                    } else {
-                        NetworkFailureKind::RequestOrBody
-                    })
-                }
-            })?;
-        let status = response.status();
-        if status != reqwest::StatusCode::OK {
-            // Reqwest only applies the redirect policy to targets it knows how
-            // to follow. An unsupported Location (for example file: or ftp:)
-            // can therefore arrive here as an ordinary 3xx response.
-            if status.is_redirection() && response.headers().contains_key(reqwest::header::LOCATION)
-            {
-                return Err(DownloadError::RedirectRejected);
-            }
-            return Err(DownloadError::HttpStatus(status.as_u16()));
-        }
-
-        let headers = response.headers();
-        if headers.get(reqwest::header::CONTENT_RANGE).is_some() {
-            return Err(DownloadError::InvalidResponse);
-        }
-        // Inspect every header value: `get` would only see the first one.
-        for encoding in headers.get_all(reqwest::header::CONTENT_ENCODING) {
-            let encoding = encoding
-                .to_str()
-                .map_err(|_| DownloadError::InvalidResponse)?;
-            if !encoding.trim().eq_ignore_ascii_case("identity") {
-                return Err(DownloadError::InvalidResponse);
-            }
-        }
-        // The HTTP client only de-frames one `chunked` coding; other coding
-        // sequences would be written to disk still encoded. Reject ambiguous
-        // or repeated transfer codings.
-        validate_transfer_encoding(headers)?;
-        let expected = parse_content_length(headers)?;
-        progress(TransferEvent::Downloading {
-            total_bytes: expected,
-        });
         let mut written = 0_u64;
-        let mut response = response;
+        let started = Instant::now();
+        let mut resume_url = url.clone();
+        let mut expected_total = None;
+        let mut etag: Option<reqwest::header::HeaderValue> = None;
+        let mut resume_requests = 0;
+        let mut first_response = true;
 
         loop {
             if cancellation
@@ -605,69 +548,218 @@ impl DownloadEngine {
             {
                 return Ok(TransferExit::Cancelled);
             }
-            let next = cancellable(
+
+            let is_resume = !first_response;
+            let mut request = self
+                .client
+                .get(resume_url.clone())
+                .header(reqwest::header::ACCEPT_ENCODING, "identity");
+            if is_resume {
+                let validator = etag.as_ref().ok_or(DownloadError::InvalidResponse)?;
+                request = request
+                    .header(reqwest::header::RANGE, format!("bytes={written}-"))
+                    .header(reqwest::header::IF_RANGE, validator.clone());
+            }
+
+            let remaining = JOB_DEADLINE.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(DownloadError::NetworkFailure(NetworkFailureKind::Timeout));
+            }
+            let response_result = cancellable(
                 &mut cancellation,
-                timeout(self.read_inactivity, response.chunk()),
+                timeout(self.read_inactivity.min(remaining), request.send()),
             )
             .await;
-            let next = match next {
+            let response = match response_result {
                 None => return Ok(TransferExit::Cancelled),
-                Some(Err(_)) => return Err(DownloadError::BodyInactivityTimeout),
-                Some(Ok(next)) => next,
-            };
-            let chunk = match next {
-                Ok(Some(chunk)) => chunk,
-                Ok(None) => break,
-                Err(error) => {
-                    // A deadline expiry is a timeout even when a declared length
-                    // was not reached; only other failures are "short body".
-                    if error.is_timeout() {
-                        return Err(DownloadError::NetworkFailure(NetworkFailureKind::Timeout));
+                Some(Err(_)) => {
+                    if is_resume && resume_requests < MAX_RESUME_REQUESTS {
+                        resume_requests += 1;
+                        continue;
                     }
-                    if let Some(expected) = expected.filter(|expected| *expected > written) {
-                        return Err(DownloadError::IncompleteResponse {
-                            expected,
-                            received: written,
-                        });
-                    }
-                    return Err(DownloadError::NetworkFailure(
-                        NetworkFailureKind::RequestOrBody,
-                    ));
+                    return Err(DownloadError::NetworkFailure(NetworkFailureKind::Timeout));
                 }
+                Some(Ok(Err(error))) => {
+                    if is_resume && resume_requests < MAX_RESUME_REQUESTS && !error.is_redirect() {
+                        resume_requests += 1;
+                        continue;
+                    }
+                    return Err(if error.is_redirect() {
+                        DownloadError::RedirectRejected
+                    } else {
+                        DownloadError::NetworkFailure(if error.is_timeout() {
+                            NetworkFailureKind::Timeout
+                        } else {
+                            NetworkFailureKind::RequestOrBody
+                        })
+                    });
+                }
+                Some(Ok(Ok(response))) => response,
             };
 
-            let chunk_len =
-                u64::try_from(chunk.len()).map_err(|_| DownloadError::ByteCountOverflow)?;
-            let after_chunk = written
-                .checked_add(chunk_len)
-                .ok_or(DownloadError::ByteCountOverflow)?;
-            if let Some(expected) = expected {
-                if after_chunk > expected {
-                    return Err(DownloadError::IncompleteResponse {
-                        expected,
-                        received: written,
-                    });
+            let status = response.status();
+            if first_response {
+                if status != reqwest::StatusCode::OK {
+                    if status.is_redirection()
+                        && response.headers().contains_key(reqwest::header::LOCATION)
+                    {
+                        return Err(DownloadError::RedirectRejected);
+                    }
+                    return Err(DownloadError::HttpStatus(status.as_u16()));
+                }
+                if response
+                    .headers()
+                    .contains_key(reqwest::header::CONTENT_RANGE)
+                {
+                    return Err(DownloadError::InvalidResponse);
+                }
+                resume_url = response.url().clone();
+                validate_entity_headers(response.headers())?;
+                expected_total = parse_content_length(response.headers())?;
+                etag = parse_strong_etag(response.headers())?;
+                progress(TransferEvent::Downloading {
+                    total_bytes: expected_total,
+                });
+            } else {
+                // A Range request must never be appended to a full response or
+                // to a different representation/redirect target.
+                if status != reqwest::StatusCode::PARTIAL_CONTENT || response.url() != &resume_url {
+                    return Err(DownloadError::InvalidResponse);
+                }
+                validate_entity_headers(response.headers())?;
+                if parse_strong_etag(response.headers())? != etag {
+                    return Err(DownloadError::InvalidResponse);
                 }
             }
 
-            write_chunk_accounted(file, temp_path, &chunk, &mut written, |count| {
-                progress(TransferEvent::BytesWritten {
-                    bytes_written: count,
-                    total_bytes: expected,
-                });
-            })
-            .await?;
-        }
+            let response_segment_end = if first_response {
+                expected_total
+            } else {
+                let range = parse_content_range(response.headers())?;
+                let total = expected_total.ok_or(DownloadError::InvalidResponse)?;
+                if range.start != written || range.total != total {
+                    return Err(DownloadError::InvalidResponse);
+                }
+                let segment_length = range
+                    .end
+                    .checked_sub(range.start)
+                    .and_then(|length| length.checked_add(1))
+                    .ok_or(DownloadError::InvalidResponse)?;
+                if parse_content_length(response.headers())?
+                    .is_some_and(|length| length != segment_length)
+                {
+                    return Err(DownloadError::InvalidResponse);
+                }
+                Some(range.end + 1)
+            };
 
-        if let Some(expected) = expected {
-            if written != expected {
+            let mut response = response;
+            let mut body_error = None;
+            loop {
+                if cancellation
+                    .as_ref()
+                    .is_some_and(|receiver| *receiver.borrow())
+                {
+                    return Ok(TransferExit::Cancelled);
+                }
+                let remaining = JOB_DEADLINE.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    body_error = Some(DownloadError::NetworkFailure(NetworkFailureKind::Timeout));
+                    break;
+                }
+                let next = cancellable(
+                    &mut cancellation,
+                    timeout(self.read_inactivity.min(remaining), response.chunk()),
+                )
+                .await;
+                let next = match next {
+                    None => return Ok(TransferExit::Cancelled),
+                    Some(Err(_)) => {
+                        body_error = Some(DownloadError::BodyInactivityTimeout);
+                        break;
+                    }
+                    Some(Ok(next)) => next,
+                };
+                let chunk = match next {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => break,
+                    Err(error) => {
+                        body_error = Some(if error.is_timeout() {
+                            DownloadError::NetworkFailure(NetworkFailureKind::Timeout)
+                        } else if let Some(end) = response_segment_end {
+                            DownloadError::IncompleteResponse {
+                                expected: end,
+                                received: written,
+                            }
+                        } else {
+                            DownloadError::NetworkFailure(NetworkFailureKind::RequestOrBody)
+                        });
+                        break;
+                    }
+                };
+
+                let chunk_len =
+                    u64::try_from(chunk.len()).map_err(|_| DownloadError::ByteCountOverflow)?;
+                let after_chunk = written
+                    .checked_add(chunk_len)
+                    .ok_or(DownloadError::ByteCountOverflow)?;
+                if response_segment_end.is_some_and(|end| after_chunk > end) {
+                    return Err(DownloadError::InvalidResponse);
+                }
+                write_chunk_accounted(file, temp_path, &chunk, &mut written, |count| {
+                    progress(TransferEvent::BytesWritten {
+                        bytes_written: count,
+                        total_bytes: expected_total,
+                    });
+                })
+                .await?;
+            }
+
+            if let Some(error) = body_error {
+                let can_resume = expected_total.is_some_and(|total| written < total)
+                    && etag.is_some()
+                    && resume_requests < MAX_RESUME_REQUESTS;
+                if can_resume {
+                    resume_requests += 1;
+                    first_response = false;
+                    continue;
+                }
+                return Err(error);
+            }
+
+            if let Some(end) = response_segment_end {
+                if written != end {
+                    let error = DownloadError::IncompleteResponse {
+                        expected: end,
+                        received: written,
+                    };
+                    let can_resume = expected_total.is_some_and(|total| written < total)
+                        && etag.is_some()
+                        && resume_requests < MAX_RESUME_REQUESTS;
+                    if can_resume {
+                        resume_requests += 1;
+                        first_response = false;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
+
+            if expected_total.is_some_and(|total| written == total) {
+                return Ok(TransferExit::Complete(written));
+            }
+            if expected_total.is_none() {
+                return Ok(TransferExit::Complete(written));
+            }
+            if etag.is_none() || resume_requests >= MAX_RESUME_REQUESTS {
                 return Err(DownloadError::IncompleteResponse {
-                    expected,
+                    expected: expected_total.unwrap_or(written),
                     received: written,
                 });
             }
+            resume_requests += 1;
+            first_response = false;
         }
-        Ok(TransferExit::Complete(written))
     }
 }
 
@@ -1650,6 +1742,106 @@ fn parse_content_length(
         }
         _ => Err(DownloadError::InvalidResponse),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContentRange {
+    start: u64,
+    end: u64,
+    total: u64,
+}
+
+fn parse_content_range(
+    headers: &reqwest::header::HeaderMap,
+) -> Result<ContentRange, DownloadError> {
+    let values: Vec<_> = headers
+        .get_all(reqwest::header::CONTENT_RANGE)
+        .iter()
+        .collect();
+    let [value] = values.as_slice() else {
+        return Err(DownloadError::InvalidResponse);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| DownloadError::InvalidResponse)?
+        .trim();
+    let (unit, range) = value
+        .split_once(' ')
+        .ok_or(DownloadError::InvalidResponse)?;
+    if !unit.eq_ignore_ascii_case("bytes") || range.is_empty() {
+        return Err(DownloadError::InvalidResponse);
+    }
+    let (span, total) = range
+        .split_once('/')
+        .ok_or(DownloadError::InvalidResponse)?;
+    if total == "*" {
+        return Err(DownloadError::InvalidResponse);
+    }
+    let (start, end) = span.split_once('-').ok_or(DownloadError::InvalidResponse)?;
+    let parse = |value: &str| {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(DownloadError::InvalidResponse);
+        }
+        value
+            .parse::<u64>()
+            .map_err(|_| DownloadError::InvalidResponse)
+    };
+    let result = ContentRange {
+        start: parse(start)?,
+        end: parse(end)?,
+        total: parse(total)?,
+    };
+    if result.start > result.end || result.end >= result.total {
+        return Err(DownloadError::InvalidResponse);
+    }
+    Ok(result)
+}
+
+/// Resume only with one syntactically strong entity tag. Weak validators are
+/// useful for cache validation but cannot safely identify byte-for-byte ranges.
+fn parse_strong_etag(
+    headers: &reqwest::header::HeaderMap,
+) -> Result<Option<reqwest::header::HeaderValue>, DownloadError> {
+    let values: Vec<_> = headers.get_all(reqwest::header::ETAG).iter().collect();
+    match values.as_slice() {
+        [] => Ok(None),
+        [value] => {
+            let Ok(text) = value.to_str() else {
+                return Ok(None);
+            };
+            let text = text.trim();
+            if text.starts_with("W/") {
+                return Ok(None);
+            }
+            let bytes = text.as_bytes();
+            if bytes.len() < 2
+                || bytes.first() != Some(&b'"')
+                || bytes.last() != Some(&b'"')
+                || bytes[1..bytes.len() - 1].contains(&b'"')
+                || bytes.iter().any(|byte| *byte < 0x21 || *byte == 0x7f)
+            {
+                return Ok(None);
+            }
+            Ok(Some((*value).clone()))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn validate_entity_headers(headers: &reqwest::header::HeaderMap) -> Result<(), DownloadError> {
+    // Inspect every header value: `get` would only see the first one.
+    for encoding in headers.get_all(reqwest::header::CONTENT_ENCODING) {
+        let encoding = encoding
+            .to_str()
+            .map_err(|_| DownloadError::InvalidResponse)?;
+        if !encoding.trim().eq_ignore_ascii_case("identity") {
+            return Err(DownloadError::InvalidResponse);
+        }
+    }
+    // The HTTP client only de-frames one `chunked` coding; other coding
+    // sequences would be written to disk still encoded. Reject ambiguous
+    // or repeated transfer codings.
+    validate_transfer_encoding(headers)
 }
 
 fn validate_transfer_encoding(headers: &reqwest::header::HeaderMap) -> Result<(), DownloadError> {
