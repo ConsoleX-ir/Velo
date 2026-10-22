@@ -28,7 +28,8 @@ describe("download presentation model", () => {
   });
 
   it("projects only supported queue and completed states", () => {
-    const items = [item(), item({ id: "queued", state: "queued" }), item({ id: "done", state: "completed" })];
+    const items = [item(), item({ id: "cancelling", state: "cancelling" }), item({ id: "queued", state: "queued" }), item({ id: "done", state: "completed" })];
+    expect(selectDownloads(items, "downloads", "active").map((download) => download.id)).toEqual(["job-1", "cancelling"]);
     expect(selectDownloads(items, "queue", "all").map((download) => download.id)).toEqual(["queued"]);
     expect(selectDownloads(items, "completed", "all").map((download) => download.id)).toEqual(["done"]);
     expect(selectDownloads(items, "categories", "all")).toEqual([]);

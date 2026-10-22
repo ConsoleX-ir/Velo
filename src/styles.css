@@ -42,7 +42,7 @@
   --surface-soft: #edf2fa;
   --text: #182440;
   --text-secondary: #53627d;
-  --text-muted: #7e8ba3;
+  --text-muted: #626f86;
   --border: rgba(38, 58, 99, .11);
   --border-strong: rgba(38, 58, 99, .2);
   --cyan: #078ba8;
@@ -199,6 +199,7 @@ h1, h2, p { margin-top: 0; }
 .statusbar { min-height: 33px; display: flex; align-items: center; justify-content: space-between; gap: 15px; padding: 0 25px; border-top: 1px solid var(--border); color: var(--text-muted); background: var(--surface-soft); font-size: 8px; font-weight: 750; letter-spacing: 1px; }
 .statusbar > div { display: flex; align-items: center; gap: 8px; }
 .status-orb { width: 5px; height: 5px; flex-basis: 5px; }
+.status-orb-offline { background: var(--text-muted); box-shadow: none; }
 .status-divider { color: var(--border-strong); }
 .version-label { color: var(--text-secondary); }
 .connection-banner { max-width: 1120px; display: flex; align-items: center; gap: 10px; padding: 11px 13px; margin: -18px auto 20px; border: 1px solid rgba(255,124,145,.2); border-radius: 10px; color: var(--red); background: rgba(255,124,145,.07); font-size: 11px; }

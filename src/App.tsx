@@ -64,6 +64,7 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [dialogOpen, setDialogOpen] = useState(false);
   const [ready, setReady] = useState(false);
+  const [engineConnected, setEngineConnected] = useState(false);
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [theme, setTheme] = useState(() => localStorage.getItem("velo-theme") === "light" ? "light" : "dark");
   const [reducedMotion, setReducedMotion] = useState(() => localStorage.getItem("velo-motion") === "reduced");
@@ -92,11 +93,13 @@ export default function App() {
         const initial = await invoke<DownloadDto[]>("list_downloads");
         if (alive) {
           setDownloads((current) => mergeDownloads(current, initial));
+          setEngineConnected(true);
           setReady(true);
           setConnectionError(null);
         }
       } catch (error) {
         if (alive) {
+          setEngineConnected(false);
           setConnectionError(errorText(error));
           setReady(true);
         }
@@ -261,9 +264,9 @@ export default function App() {
             </>
           )}
         </section>
-        <footer className="statusbar"><div><span className="status-orb" /> Engine ready <span className="status-divider">·</span> Local-only transfers</div><div>NO ACCOUNT <span className="status-divider">·</span> NO TELEMETRY <span className="status-divider">·</span> <span className="version-label">VELO 0.2</span></div></footer>
+        <footer className="statusbar"><div><span className={`status-orb ${engineConnected ? "" : "status-orb-offline"}`} /> {!ready ? "Connecting to engine" : engineConnected ? "Engine connected" : "Engine unavailable"} <span className="status-divider">·</span> Local-only transfers</div><div>NO ACCOUNT <span className="status-divider">·</span> NO TELEMETRY <span className="status-divider">·</span> <span className="version-label">VELO 0.2</span></div></footer>
       </main>
-      {dialogOpen && <AddDownloadDialog onClose={() => setDialogOpen(false)} onStarted={(item) => { setDownloads((current) => mergeDownloads(current, [item])); setDialogOpen(false); setView("downloads"); setFilter("all"); }} />}
+      {dialogOpen && <AddDownloadDialog onClose={() => setDialogOpen(false)} onStarted={(item) => { setDownloads((current) => mergeDownloads(current, [item])); setEngineConnected(true); setConnectionError(null); setDialogOpen(false); setView("downloads"); setFilter("all"); }} />}
     </div>
   );
 }
@@ -341,6 +344,13 @@ function AddDownloadDialog({ onClose, onStarted }: { onClose: () => void; onStar
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const urlError = url.trim() ? validateUrl(url) : null;
+  const previouslyFocused = useRef<HTMLElement | null>(document.activeElement instanceof HTMLElement ? document.activeElement : null);
+
+  useEffect(() => {
+    return () => {
+      if (previouslyFocused.current?.isConnected) previouslyFocused.current.focus();
+    };
+  }, []);
 
   useEffect(() => {
     const escape = (event: KeyboardEvent) => { if (event.key === "Escape" && !busy) onClose(); };

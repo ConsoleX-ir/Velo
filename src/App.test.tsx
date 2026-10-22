@@ -7,6 +7,8 @@ const { invokeMock, listenMock } = vi.hoisted(() => ({
   listenMock: vi.fn(),
 }));
 
+let eventListener: ((event: { payload: import("./model").DownloadDto }) => void) | undefined;
+
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: listenMock }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ save: vi.fn() }));
@@ -22,7 +24,10 @@ describe("application preferences", () => {
     document.documentElement.removeAttribute("data-theme");
     document.documentElement.removeAttribute("data-motion");
     invokeMock.mockResolvedValue([]);
-    listenMock.mockResolvedValue(() => undefined);
+    listenMock.mockImplementation(async (_event, callback) => {
+      eventListener = callback as (event: { payload: import("./model").DownloadDto }) => void;
+      return () => undefined;
+    });
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -62,5 +67,36 @@ describe("application preferences", () => {
     expect(document.documentElement.dataset.motion).toBe("reduced");
     expect(localStorage.getItem("velo-motion")).toBe("reduced");
     expect(motion?.getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("returns keyboard focus to the opener when the add dialog closes", async () => {
+    const add = [...container.querySelectorAll("button")].find((button) => button.textContent?.includes("Add download"));
+    expect(add).toBeDefined();
+    await act(async () => { add?.focus(); add?.click(); });
+    const cancel = [...container.querySelectorAll("button")].find((button) => button.textContent === "Cancel");
+    expect(cancel).toBeDefined();
+    await act(async () => cancel?.click());
+    expect(document.activeElement).toBe(add);
+  });
+
+  it("keeps a newer event when the initial snapshot arrives afterward", async () => {
+    await act(async () => root.unmount());
+    let resolveSnapshot!: (items: import("./model").DownloadDto[]) => void;
+    invokeMock.mockImplementation(() => new Promise((resolve) => { resolveSnapshot = resolve; }));
+    root = createRoot(container);
+    await act(async () => {
+      root.render(createElement(App));
+      await Promise.resolve();
+    });
+
+    const download = (revision: number, bytesWritten: number): import("./model").DownloadDto => ({
+      id: "job-1", generation: 1, revision, order: 1, fileName: "archive.zip", state: "downloading",
+      bytesWritten, totalBytes: 10, speedBytesPerSecond: null, etaSeconds: null, error: null,
+    });
+    await act(async () => eventListener?.({ payload: download(2, 8) }));
+    await act(async () => resolveSnapshot([download(1, 2)]));
+
+    expect(container.textContent).toContain("8 B of 10 B");
+    expect(container.textContent).not.toContain("2 B of 10 B");
   });
 });

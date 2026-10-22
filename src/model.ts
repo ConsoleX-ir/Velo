@@ -45,7 +45,7 @@ export function selectDownloads(items: DownloadDto[], view: DownloadView, filter
   if (view !== "downloads") return [];
   switch (filter) {
     case "active":
-      return items.filter((item) => item.state === "downloading" || item.state === "preparing" || item.state === "finalizing");
+      return items.filter((item) => item.state === "downloading" || item.state === "preparing" || item.state === "cancelling" || item.state === "finalizing");
     case "queued":
       return items.filter((item) => item.state === "queued");
     case "completed":
