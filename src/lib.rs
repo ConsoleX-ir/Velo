@@ -222,7 +222,7 @@ pub enum DownloadError {
         #[source]
         source: io::Error,
     },
-    #[error("HTTP server returned status {0}; only 200 OK is accepted")]
+    #[error("HTTP server returned unexpected status {0}")]
     HttpStatus(u16),
     #[error("HTTP response uses unsupported or invalid content semantics")]
     InvalidResponse,
@@ -329,6 +329,7 @@ async fn cancellable<F: std::future::Future>(
 #[derive(Clone)]
 pub struct DownloadEngine {
     client: reqwest::Client,
+    range_client: reqwest::Client,
     #[cfg(test)]
     reservations: Arc<Mutex<HashSet<PathBuf>>>,
     read_inactivity: Duration,
@@ -366,9 +367,19 @@ impl DownloadEngine {
             ))
             .build()
             .map_err(|_| DownloadError::ClientInitialization)?;
+        // Continuations go directly to the effective URL established by the
+        // initial request. Do not forward Range/If-Range to a redirect target.
+        let range_client = reqwest::Client::builder()
+            .connect_timeout(connect)
+            .timeout(deadline)
+            .referer(false)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| DownloadError::ClientInitialization)?;
 
         Ok(Self {
             client,
+            range_client,
             #[cfg(test)]
             reservations: Arc::new(Mutex::new(HashSet::new())),
             read_inactivity,
@@ -550,8 +561,12 @@ impl DownloadEngine {
             }
 
             let is_resume = !first_response;
-            let mut request = self
-                .client
+            let client = if is_resume {
+                &self.range_client
+            } else {
+                &self.client
+            };
+            let mut request = client
                 .get(resume_url.clone())
                 .header(reqwest::header::ACCEPT_ENCODING, "identity");
             if is_resume {
@@ -623,7 +638,18 @@ impl DownloadEngine {
             } else {
                 // A Range request must never be appended to a full response or
                 // to a different representation/redirect target.
-                if status != reqwest::StatusCode::PARTIAL_CONTENT || response.url() != &resume_url {
+                if response.status().is_redirection() {
+                    return Err(DownloadError::RedirectRejected);
+                }
+                if status == reqwest::StatusCode::OK {
+                    // A server that ignores If-Range or reports a changed
+                    // representation must never have its full body appended.
+                    return Err(DownloadError::InvalidResponse);
+                }
+                if status != reqwest::StatusCode::PARTIAL_CONTENT {
+                    return Err(DownloadError::HttpStatus(status.as_u16()));
+                }
+                if response.url() != &resume_url {
                     return Err(DownloadError::InvalidResponse);
                 }
                 validate_entity_headers(response.headers())?;
@@ -1829,6 +1855,12 @@ fn parse_strong_etag(
 }
 
 fn validate_entity_headers(headers: &reqwest::header::HeaderMap) -> Result<(), DownloadError> {
+    if headers.contains_key(reqwest::header::CONTENT_LENGTH)
+        && headers.contains_key(reqwest::header::TRANSFER_ENCODING)
+    {
+        // RFC 9112 says this framing ambiguity ought to be treated as an error.
+        return Err(DownloadError::InvalidResponse);
+    }
     // Inspect every header value: `get` would only see the first one.
     for encoding in headers.get_all(reqwest::header::CONTENT_ENCODING) {
         let encoding = encoding
@@ -1972,9 +2004,9 @@ fn promote_no_replace(temp: &Path, destination: &Path) -> Result<(), DownloadErr
     if source[..source.len() - 1].contains(&0) || target[..target.len() - 1].contains(&0) {
         return Err(DownloadError::InvalidDestination(destination.to_path_buf()));
     }
-    // UNVERIFIED on Windows (needs Windows CI): the same-directory temporary
-    // file should make this a same-volume move, and MoveFileW should fail when
-    // the destination name already exists instead of replacing it.
+    // The same-directory temporary file makes this a same-volume move.
+    // MoveFileW fails when the destination name already exists; Windows tests
+    // exercise promotion and preservation of an existing target.
     let result = unsafe { MoveFileW(source.as_ptr(), target.as_ptr()) };
     if result != 0 {
         Ok(())

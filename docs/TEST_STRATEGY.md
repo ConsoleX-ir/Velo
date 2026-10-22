@@ -1,6 +1,6 @@
 # Test Strategy
 
-**Status:** Phase 1A/1B test suite implemented; Windows validation passed 62 tests on 2026-10-22
+**Status:** Phase 1A/1B suite with Phase 1D adversarial HTTP coverage; Windows validation passed 65 tests on 2026-10-22
 **Research checked:** 2026-10-22
 
 ## Phase 1 test layers
@@ -40,7 +40,7 @@
 - Compare output byte-for-byte with 0-byte, 1 MiB, and 64 MiB fixtures; all successful cases must have exact expected length when known.
 - For a scripted sequence that ends in a terminal result, assert exactly one terminal result per accepted job. Rejected `start` requests are not jobs and receive a synchronous start error.
 - Assert progress snapshots coalesce to the latest value, ordinary updates are at most 10 per second/job, and state transitions publish immediately. A slow subscriber cannot block transfer or lose a separately queryable terminal result.
-- Each job starts with one full GET and may make at most three in-job Range continuations after an interrupted body. Validate exact offset, unchanged strong ETag and total, final URL, segment length, bounded continuation count, and no promotion after a rejected range. Byte-zero retry behavior remains deferred.
+- Each job starts with one full GET and may make at most three in-job Range continuations after an interrupted body. Validate exact offset, unchanged strong ETag and total, final URL, redirect rejection without contacting the target, segment length/overrun, ambiguous framing rejection, bounded continuation count, and no promotion after a rejected range. Byte-zero retry behavior remains deferred.
 - For every failure/cancellation test, assert an existing final file is byte-identical and any undeleted temporary path is included in a `Failed` result.
 - Reject all final statuses except 200; accept absent Content-Length only after successful EOF, and reject both short and long bodies when Content-Length is present.
 - Assert non-200 response bodies are neither saved nor retained in diagnostics; a full response with `Content-Range` or non-identity content encoding is rejected.

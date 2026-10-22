@@ -3,7 +3,7 @@
 **Status:** Phase 1B managed Rust core; Tauri and frontend remain planned
 **Research checked:** 2026-10-21
 
-**Implementation update (2026-10-22):** The root-level Rust library includes the Phase 1A HTTP/HTTPS transfer core and Phase 1B `DownloadManager`, with FIFO admission, generation-bearing handles, cancellation, coalesced progress, retained terminal results, shutdown, and bounded strong-ETag-validated Range continuation after interrupted bodies. The core remains independent of Tauri; the application service, frontend, and Tauri shell are not present. On Windows, the full test suite passed, including no-clobber promotion and case-insensitive destination reservation tests (62 passed, 0 failed).
+**Implementation update (2026-10-22):** The root-level Rust library includes the Phase 1A HTTP/HTTPS transfer core and Phase 1B `DownloadManager`, with FIFO admission, generation-bearing handles, cancellation, coalesced progress, retained terminal results, shutdown, and bounded strong-ETag-validated Range continuation after interrupted bodies. Phase 1D hardening rejects ambiguous Content-Length/Transfer-Encoding framing and prevents Range metadata from crossing redirects. The core remains independent of Tauri; the application service, frontend, and Tauri shell are not present. On Windows, the full test suite passed, including no-clobber promotion and case-insensitive destination reservation tests (65 passed, 0 failed).
 
 ## Chosen stack
 

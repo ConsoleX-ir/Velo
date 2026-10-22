@@ -23,10 +23,11 @@ use url::Url;
 
 use crate::{
     cleanup_or_original, parse_content_length, parse_content_range, parse_strong_etag,
-    promote_no_replace, redirect_decision, temp_candidate, validate_transfer_encoding,
-    write_chunk_accounted, CancelDisposition, ControlError, DownloadEngine, DownloadError,
-    DownloadHandle, DownloadId, DownloadManager, DownloadManagerConfig, DownloadRequest,
-    DownloadState, NetworkFailureKind, OpenedTemp, StartError, TempGuard,
+    promote_no_replace, redirect_decision, temp_candidate, validate_entity_headers,
+    validate_transfer_encoding, write_chunk_accounted, CancelDisposition, ControlError,
+    DownloadEngine, DownloadError, DownloadHandle, DownloadId, DownloadManager,
+    DownloadManagerConfig, DownloadRequest, DownloadState, NetworkFailureKind, OpenedTemp,
+    StartError, TempGuard,
 };
 
 static DIR_ID: AtomicU64 = AtomicU64::new(0);
@@ -556,6 +557,49 @@ async fn serve_gated_range() -> (
     )
 }
 
+async fn serve_range_redirect() -> (String, JoinHandle<()>, JoinHandle<Option<String>>) {
+    let source = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind source server");
+    let source_address = source.local_addr().expect("read source address");
+    let redirected = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind redirect target");
+    let redirected_address = redirected.local_addr().expect("read redirect address");
+    let source_task = tokio::spawn(async move {
+        let (mut first, _) = source.accept().await.expect("accept initial GET");
+        read_request(&mut first).await;
+        let initial = response(
+            "200 OK",
+            "Content-Length: 10\r\nETag: \"v1\"\r\nConnection: close\r\n",
+            b"abcde",
+        );
+        let _ = first.write_all(&initial).await;
+        let _ = first.shutdown().await;
+
+        let (mut range, _) = source.accept().await.expect("accept continuation");
+        read_request(&mut range).await;
+        let redirect = response(
+            "302 Found",
+            &format!("Location: http://{redirected_address}/other\r\nContent-Length: 0\r\nConnection: close\r\n"),
+            b"",
+        );
+        let _ = range.write_all(&redirect).await;
+        let _ = range.shutdown().await;
+    });
+    let target_task = tokio::spawn(async move {
+        match tokio::time::timeout(Duration::from_millis(250), redirected.accept()).await {
+            Ok(Ok((mut stream, _))) => Some(read_request(&mut stream).await),
+            _ => None,
+        }
+    });
+    (
+        format!("http://{source_address}/file"),
+        source_task,
+        target_task,
+    )
+}
+
 fn test_engine(read_inactivity_ms: u64, deadline_ms: u64) -> DownloadEngine {
     DownloadEngine::with_timeouts(
         Duration::from_secs(5),
@@ -696,6 +740,29 @@ async fn rejects_range_resume_when_entity_tag_changes() {
 }
 
 #[tokio::test]
+async fn range_redirect_is_rejected_without_contacting_the_redirect_target() {
+    let (url, source, target) = serve_range_redirect().await;
+    let dir = TestDir::new();
+    let destination = dir.path().join("redirect-range.bin");
+
+    let error = DownloadEngine::new()
+        .unwrap()
+        .download(&url, &destination)
+        .await
+        .unwrap_err();
+    source.await.unwrap();
+    let target_request = target.await.unwrap();
+
+    assert!(matches!(error, DownloadError::RedirectRejected));
+    assert!(
+        target_request.is_none(),
+        "range headers must not cross redirects"
+    );
+    assert!(!destination.exists());
+    assert_eq!(entry_count(&dir), 0);
+}
+
+#[tokio::test]
 async fn rejects_misaligned_or_ignored_range_responses_without_appending() {
     let cases = [
         (
@@ -715,6 +782,11 @@ async fn rejects_misaligned_or_ignored_range_responses_without_appending() {
         ),
         (
             "206 Partial Content",
+            "Content-Range: bytes 5-9/10\r\nTransfer-Encoding: chunked\r\nETag: \"version-1\"\r\nConnection: close\r\n",
+            b"6\r\nfghijk\r\n0\r\n\r\n".as_slice(),
+        ),
+        (
+            "206 Partial Content",
             "Content-Range: bytes 5-9/10\r\nContent-Length: 5\r\nConnection: close\r\n",
             b"fghij".as_slice(),
         ),
@@ -726,6 +798,11 @@ async fn rejects_misaligned_or_ignored_range_responses_without_appending() {
         (
             "416 Range Not Satisfiable",
             "Content-Range: bytes */10\r\nContent-Length: 0\r\nConnection: close\r\n",
+            b"".as_slice(),
+        ),
+        (
+            "503 Service Unavailable",
+            "Retry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n",
             b"".as_slice(),
         ),
     ];
@@ -740,7 +817,15 @@ async fn rejects_misaligned_or_ignored_range_responses_without_appending() {
             .unwrap_err();
         server.await.unwrap();
 
-        assert!(matches!(error, DownloadError::InvalidResponse));
+        match status {
+            "416 Range Not Satisfiable" => {
+                assert!(matches!(error, DownloadError::HttpStatus(416)));
+            }
+            "503 Service Unavailable" => {
+                assert!(matches!(error, DownloadError::HttpStatus(503)));
+            }
+            _ => assert!(matches!(error, DownloadError::InvalidResponse)),
+        }
         assert!(!target.exists());
         assert_eq!(entry_count(&dir), 0);
     }
@@ -785,6 +870,35 @@ fn content_range_and_strong_etag_parsers_reject_ambiguous_values() {
     headers.remove("etag");
     headers.insert("etag", HeaderValue::from_static("invalid"));
     assert_eq!(parse_strong_etag(&headers).unwrap(), None);
+}
+
+#[test]
+fn entity_headers_reject_content_length_and_transfer_encoding_together() {
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_LENGTH, HeaderValue::from_static("4"));
+    headers.insert(TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
+    assert!(matches!(
+        validate_entity_headers(&headers),
+        Err(DownloadError::InvalidResponse)
+    ));
+}
+
+#[tokio::test]
+async fn rejects_ambiguous_content_length_and_transfer_encoding_response() {
+    let (url, server) = serve_once(response(
+        "200 OK",
+        "Content-Length: 4\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n",
+        b"4\r\ndata\r\n0\r\n\r\n",
+    ))
+    .await;
+    let dir = TestDir::new();
+    let target = dir.path().join("ambiguous-framing.bin");
+    let result = DownloadEngine::new().unwrap().download(&url, &target).await;
+    server.await.unwrap();
+
+    assert!(matches!(result, Err(DownloadError::InvalidResponse)));
+    assert!(!target.exists());
+    assert_eq!(entry_count(&dir), 0);
 }
 
 #[tokio::test]
