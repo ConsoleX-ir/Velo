@@ -306,3 +306,34 @@ h1, h2, p { margin-top: 0; }
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
 :root[data-motion="reduced"] *, :root[data-motion="reduced"] *::before, :root[data-motion="reduced"] *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+
+/* --- Task 5 component-system additions (additive only) ------------------- */
+
+/* Retrying state: scheduled auto-retry reads as amber, like interrupted. */
+.state-pill.retrying { color: var(--amber); border-color: color-mix(in srgb, var(--amber) 32%, var(--border)); }
+.state-retrying .card-secondary { color: var(--amber); }
+
+/* SegmentedControl marks the selected option with `.selected`; give the
+   chips-like filter row the same selected look as `.filter-chip.active`. */
+.filter-chip.selected { color: var(--text); border-color: var(--border-strong); background: var(--surface); box-shadow: inset 0 1px var(--glass-highlight), 0 1px 3px var(--glass-shadow); }
+
+/* Tooltip bubble: absolute above the trigger inside its relative wrapper. */
+.tooltip-bubble { position: absolute; z-index: 15; bottom: calc(100% + 7px); left: 50%; padding: 5px 8px; border: 1px solid var(--border-strong); border-radius: 7px; background: var(--surface-raised); color: var(--text-secondary); font-size: 10px; font-weight: 620; white-space: nowrap; box-shadow: 0 5px 14px var(--glass-shadow); transform: translate(-50%, 0); animation: tooltip-in .16s ease-out both; pointer-events: none; }
+
+/* Toast viewport: fixed top-right of the main area, below the topbar; sits
+   above the dialog scrim (z-index 10) so command errors stay readable. */
+.toast-viewport { position: fixed; z-index: 20; top: 86px; right: 24px; display: grid; gap: 8px; width: min(340px, calc(100vw - 280px)); pointer-events: none; }
+.toast-card { pointer-events: auto; display: flex; align-items: flex-start; gap: 9px; padding: 11px 12px; border: 1px solid var(--border-strong); border-radius: 10px; background: color-mix(in srgb, var(--surface) 96%, transparent); box-shadow: var(--shadow); -webkit-backdrop-filter: blur(14px) saturate(115%); backdrop-filter: blur(14px) saturate(115%); animation: toast-in .24s cubic-bezier(.22, 1, .36, 1) both; }
+.toast-dot { width: 6px; height: 6px; flex: 0 0 6px; margin-top: 5px; border-radius: 50%; background: var(--cyan); }
+.toast-card.success .toast-dot { background: var(--green); }
+.toast-card.error { border-color: color-mix(in srgb, var(--red) 30%, var(--border)); }
+.toast-card.error .toast-dot { background: var(--red); }
+.toast-card.error .toast-title { color: var(--red); }
+.toast-copy { flex: 1; min-width: 0; display: grid; gap: 3px; }
+.toast-title { margin: 0; color: var(--text); font-size: 11px; font-weight: 650; line-height: 1.45; }
+.toast-description { margin: 0; color: var(--text-muted); font-size: 10px; line-height: 1.5; }
+.toast-close { flex: 0 0 auto; width: 22px; height: 22px; display: grid; place-items: center; border: 0; border-radius: 6px; color: var(--text-muted); background: transparent; cursor: pointer; }
+.toast-close:hover { color: var(--text); background: var(--surface-raised); }
+
+@keyframes tooltip-in { from { opacity: 0; transform: translate(-50%, 3px); } to { opacity: 1; transform: translate(-50%, 0); } }
+@keyframes toast-in { from { opacity: 0; transform: translateY(-7px); } to { opacity: 1; transform: translateY(0); } }

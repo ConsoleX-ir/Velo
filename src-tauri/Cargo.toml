@@ -1,6 +1,6 @@
 [package]
 name = "consolex-velo"
-version = "0.2.0"
+version = "0.3.0"
 description = "A free, private desktop download manager"
 authors = ["ConsoleX"]
 edition = "2021"

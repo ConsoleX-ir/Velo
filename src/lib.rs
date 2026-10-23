@@ -71,6 +71,29 @@ pub struct DownloadRequest {
     pub id: DownloadId,
     pub url: String,
     pub destination: PathBuf,
+    /// Optional partial-transfer state persisted by a previous session.
+    /// Every field is re-verified on disk and against the server before any
+    /// byte is appended; an invalid checkpoint degrades to a fresh transfer.
+    pub resume: Option<DurableResume>,
+}
+
+/// Persisted partial-transfer state handed back to the manager after a
+/// process restart. `persisted_bytes` is a lower bound on the temporary
+/// file's length: progress may have outpaced the last persisted snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableResume {
+    pub temp_path: PathBuf,
+    pub persisted_bytes: u64,
+    pub checkpoint: Option<ResumeCheckpoint>,
+}
+
+/// Durable-resume metadata observed for an in-flight job so the application
+/// service can persist it between sessions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeInfo {
+    pub temp_path: PathBuf,
+    pub bytes_written: u64,
+    pub checkpoint: Option<ResumeCheckpoint>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,7 +126,7 @@ pub enum DownloadState {
 }
 
 impl DownloadState {
-    fn is_terminal(self) -> bool {
+    pub fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
     }
 }
@@ -328,6 +351,26 @@ fn interrupted_transfer(
     }
 }
 
+/// Checkpoint visible to the registry after the first response. Requires the
+/// same trio as every other resume: a strong entity tag, a known total, and
+/// the effective (post-redirect) URL.
+fn live_checkpoint(
+    effective_url: &Url,
+    total_bytes: Option<u64>,
+    etag: Option<&reqwest::header::HeaderValue>,
+) -> Option<ResumeCheckpoint> {
+    let total_bytes = total_bytes?;
+    if total_bytes == 0 {
+        return None;
+    }
+    let strong_etag = etag?.to_str().ok()?.to_owned();
+    Some(ResumeCheckpoint {
+        effective_url: effective_url.as_str().to_owned(),
+        strong_etag,
+        total_bytes,
+    })
+}
+
 struct CatchUnwind<F>(Pin<Box<F>>);
 
 impl<F> Unpin for CatchUnwind<F> {}
@@ -347,7 +390,9 @@ impl<F: Future> Future for CatchUnwind<F> {
 
 enum TransferEvent {
     Downloading {
-        total_bytes: Option<u64>,
+        /// Validator checkpoint learned from the first response, published
+        /// before any body byte is written so a crash cannot lose it.
+        checkpoint: Option<ResumeCheckpoint>,
     },
     BytesWritten {
         bytes_written: u64,
@@ -723,7 +768,7 @@ impl DownloadEngine {
                 expected_total = parse_content_length(response.headers())?;
                 etag = parse_strong_etag(response.headers())?;
                 progress(TransferEvent::Downloading {
-                    total_bytes: expected_total,
+                    checkpoint: live_checkpoint(&resume_url, expected_total, etag.as_ref()),
                 });
             } else {
                 // A Range request must never be appended to a full response or
@@ -950,6 +995,7 @@ struct JobRecord {
     active_slot_held: bool,
     temp_path: Option<PathBuf>,
     checkpoint: Option<ResumeCheckpoint>,
+    resume: Option<DurableResume>,
     promoted: bool,
     terminal: Option<Arc<TerminalResult>>,
     task: Option<JoinHandle<()>>,
@@ -1088,10 +1134,14 @@ impl DownloadManager {
             .next_generation
             .checked_add(1)
             .ok_or(StartError::GenerationExhausted)?;
+        // A durable resume is metadata only: nothing is verified against the
+        // filesystem here so admission stays synchronous. The worker verifies
+        // every field before appending a single byte.
+        let durable_bytes = request.resume.as_ref().map(|resume| resume.persisted_bytes);
         let initial = ProgressSnapshot {
             id: request.id.clone(),
             state: DownloadState::Queued,
-            bytes_written: 0,
+            bytes_written: durable_bytes.unwrap_or(0),
             total_bytes: None,
         };
         let (progress_tx, progress_rx) = watch::channel(initial);
@@ -1107,7 +1157,7 @@ impl DownloadManager {
                 url,
                 destination,
                 state: DownloadState::Queued,
-                bytes_written: 0,
+                bytes_written: durable_bytes.unwrap_or(0),
                 total_bytes: None,
                 last_progress_at: Instant::now(),
                 progress_tx,
@@ -1116,6 +1166,7 @@ impl DownloadManager {
                 active_slot_held: false,
                 temp_path: None,
                 checkpoint: None,
+                resume: request.resume,
                 promoted: false,
                 terminal: None,
                 task: None,
@@ -1249,6 +1300,22 @@ impl DownloadManager {
         Ok(record.terminal.clone())
     }
 
+    /// Durable-resume metadata for an in-flight job, for the application
+    /// service to persist between sessions. `None` before a temporary file
+    /// exists and once the job is terminal (its partial file is gone).
+    pub fn resume_info(&self, handle: &DownloadHandle) -> Result<Option<ResumeInfo>, ControlError> {
+        let registry = lock_registry(&self.core);
+        let record = registered_record(&registry, handle)?;
+        if record.terminal.is_some() {
+            return Ok(None);
+        }
+        Ok(record.temp_path.as_ref().map(|temp_path| ResumeInfo {
+            temp_path: temp_path.clone(),
+            bytes_written: record.bytes_written,
+            checkpoint: record.checkpoint.clone(),
+        }))
+    }
+
     pub fn acknowledge_terminal(&self, handle: &DownloadHandle) -> Result<(), ControlError> {
         let mut registry = lock_registry(&self.core);
         let record = registered_record(&registry, handle)?;
@@ -1379,6 +1446,14 @@ fn dispatch_locked(core: &Arc<ManagerCore>, registry: &mut Registry) {
             id: id.clone(),
             generation: record.generation,
         };
+        // Consume the durable resume exactly once: after the first dispatch
+        // the adopted state lives in `temp_path`/`checkpoint` like any other
+        // in-flight job, so a later pause/resume cycle cannot re-adopt a
+        // stale persisted path.
+        let durable = record.resume.take();
+        if let Some(resume) = &durable {
+            record.checkpoint = resume.checkpoint.clone();
+        }
         let url = record.url.clone();
         let destination = record.destination.clone();
         let temp_path = record.temp_path.clone();
@@ -1399,6 +1474,7 @@ fn dispatch_locked(core: &Arc<ManagerCore>, registry: &mut Registry) {
                 destination,
                 temp_path,
                 checkpoint,
+                durable,
                 bytes_written,
                 control_rx,
             )));
@@ -1446,14 +1522,27 @@ async fn prepare_managed_transfer(
     destination: PathBuf,
     existing_temp: Option<PathBuf>,
     checkpoint: Option<ResumeCheckpoint>,
+    durable: Option<DurableResume>,
     existing_bytes: u64,
     mut control_rx: watch::Receiver<WorkerControl>,
 ) -> WorkerOutput {
-    let opened = match open_or_create_temp(&destination, existing_temp, existing_bytes).await {
+    // A durable resume names the persisted partial file from a previous
+    // session; same-session continuation uses the in-memory temp path. The
+    // worker adopts a persisted file only after verifying it on disk, and
+    // never trusts the persisted byte counter over the file's real length.
+    let (requested_temp, expected_len, checkpoint) = match durable {
+        Some(resume) => (
+            Some(resume.temp_path),
+            resume.persisted_bytes,
+            resume.checkpoint.or(checkpoint),
+        ),
+        None => (existing_temp, existing_bytes, checkpoint),
+    };
+    let opened = match open_or_create_temp(&destination, requested_temp, expected_len).await {
         Ok(created) => created,
         Err(error) => return WorkerOutput::Failed { error, temp: None },
     };
-    let (temp_path, mut guard, file, can_resume) = opened;
+    let (temp_path, mut guard, file, can_resume, adopted_len) = opened;
     {
         let mut registry = lock_registry(&core);
         if let Some(record) = registry.jobs.get_mut(&token.id) {
@@ -1477,9 +1566,13 @@ async fn prepare_managed_transfer(
     }
 
     let mut file = file;
-    let resume_checkpoint = checkpoint.filter(|_| can_resume);
+    // A partial file that already reaches (or exceeds) the recorded total
+    // cannot be verified by a range request, so its content is never trusted;
+    // drop the checkpoint and restart from byte zero.
+    let resume_checkpoint =
+        checkpoint.filter(|checkpoint| can_resume && checkpoint.total_bytes > adopted_len);
     let initial_bytes = if resume_checkpoint.is_some() {
-        existing_bytes
+        adopted_len
     } else {
         0
     };
@@ -1510,8 +1603,8 @@ async fn prepare_managed_transfer(
             resume_checkpoint.clone(),
             initial_bytes,
             |event| match event {
-                TransferEvent::Downloading { total_bytes } => {
-                    set_downloading(&progress_core, &progress_token, total_bytes);
+                TransferEvent::Downloading { checkpoint } => {
+                    set_downloading(&progress_core, &progress_token, checkpoint);
                 }
                 TransferEvent::BytesWritten {
                     bytes_written,
@@ -1540,8 +1633,8 @@ async fn prepare_managed_transfer(
                         None,
                         0,
                         |event| match event {
-                            TransferEvent::Downloading { total_bytes } => {
-                                set_downloading(&progress_core, &progress_token, total_bytes)
+                            TransferEvent::Downloading { checkpoint } => {
+                                set_downloading(&progress_core, &progress_token, checkpoint)
                             }
                             TransferEvent::BytesWritten {
                                 bytes_written,
@@ -1651,6 +1744,7 @@ async fn supervise_job(
     destination: PathBuf,
     temp_path: Option<PathBuf>,
     checkpoint: Option<ResumeCheckpoint>,
+    durable: Option<DurableResume>,
     bytes_written: u64,
     control_rx: watch::Receiver<WorkerControl>,
 ) {
@@ -1665,6 +1759,7 @@ async fn supervise_job(
         destination.clone(),
         temp_path,
         checkpoint,
+        durable,
         bytes_written,
         control_rx,
     )
@@ -1939,7 +2034,11 @@ fn mark_shutdown_done(core: &ManagerCore, registry: &Registry) {
     }
 }
 
-fn set_downloading(core: &Arc<ManagerCore>, token: &JobToken, total_bytes: Option<u64>) {
+fn set_downloading(
+    core: &Arc<ManagerCore>,
+    token: &JobToken,
+    checkpoint: Option<ResumeCheckpoint>,
+) {
     let registry = lock_registry(core);
     if let Some(record) = registry.jobs.get(&token.id) {
         if record.generation != token.generation || record.state.is_terminal() {
@@ -1955,7 +2054,10 @@ fn set_downloading(core: &Arc<ManagerCore>, token: &JobToken, total_bytes: Optio
         } else {
             DownloadState::Downloading
         };
-        record.total_bytes = total_bytes;
+        record.total_bytes = checkpoint.as_ref().map(|saved| saved.total_bytes);
+        // Publish the validator before any body byte is written so a crash
+        // right after the response headers still leaves a usable checkpoint.
+        record.checkpoint = checkpoint;
         publish_state(record);
     }
 }
@@ -2184,6 +2286,7 @@ fn parse_strong_etag(
                 return Ok(None);
             };
             let text = text.trim();
+
             if text.starts_with("W/") {
                 return Ok(None);
             }
@@ -2294,40 +2397,100 @@ async fn create_temp(
     })
 }
 
+/// Outcome of trying to adopt an existing partial file under this process.
+enum AdoptError {
+    /// The file vanished or is owned elsewhere (rename failed). Leave it
+    /// alone and continue with a fresh temporary file.
+    Unavailable,
+}
+
+/// Continues into the caller-known temporary file when it still validates, or
+/// creates a fresh exclusive temporary file otherwise.
+///
+/// `expected_len` is the byte count recorded when the partial file was last
+/// persisted. An adoptable file must be a regular file in the destination's
+/// directory of at least that length: it may be longer because progress can
+/// outpace the persisted snapshot, but never shorter. Adoption also renames
+/// the file into a process-owned name, so two workers can never own the same
+/// partial file. Returns the adopted byte length (0 for a fresh file).
 async fn open_or_create_temp(
     destination: &Path,
     existing: Option<PathBuf>,
     expected_len: u64,
-) -> Result<(PathBuf, TempGuard, tokio::fs::File, bool), DownloadError> {
+) -> Result<(PathBuf, TempGuard, tokio::fs::File, bool, u64), DownloadError> {
     if let Some(path) = existing {
         let parent = destination.parent().unwrap_or_else(|| Path::new("."));
         let same_parent = path.parent().is_some_and(|candidate| candidate == parent);
         if same_parent {
-            let metadata = tokio::fs::symlink_metadata(&path).await;
-            if let Ok(metadata) = metadata {
-                if metadata.file_type().is_file() && metadata.len() == expected_len {
-                    match tokio::fs::OpenOptions::new()
-                        .write(true)
-                        .append(true)
-                        .open(&path)
-                        .await
-                    {
-                        Ok(file) => return Ok((path.clone(), TempGuard::new(path), file, true)),
-                        Err(source) => {
-                            return Err(DownloadError::Filesystem {
+            let metadata = tokio::fs::symlink_metadata(&path).await.ok();
+            // `symlink_metadata` never follows a link, so a symlinked or
+            // directory entry is rejected by the `is_file` check.
+            let adoptable = metadata.as_ref().is_some_and(|metadata| {
+                metadata.file_type().is_file() && metadata.len() >= expected_len
+            });
+            if adoptable {
+                match adopt_existing_temp(parent, destination, &path).await {
+                    Ok((adopted_path, adopted_len)) => {
+                        return match tokio::fs::OpenOptions::new()
+                            .write(true)
+                            .append(true)
+                            .open(&adopted_path)
+                            .await
+                        {
+                            Ok(file) => Ok((
+                                adopted_path.clone(),
+                                TempGuard::new(adopted_path),
+                                file,
+                                true,
+                                adopted_len,
+                            )),
+                            Err(source) => Err(DownloadError::Filesystem {
                                 operation: "reopen temporary file",
-                                path,
+                                path: adopted_path,
                                 source,
-                            })
-                        }
+                            }),
+                        };
                     }
+                    Err(AdoptError::Unavailable) => {}
                 }
+            } else if metadata.is_some() {
+                // The partial file shrank, changed kind, or is not a regular
+                // file: it can no longer be trusted, so remove it and start
+                // from byte zero.
+                let _ = cleanup_only(&path);
             }
-            let _ = cleanup_only(&path);
         }
     }
     let (path, guard, file) = create_temp(destination).await?;
-    Ok((path, guard, file, false))
+    Ok((path, guard, file, false, 0))
+}
+
+/// Renames a verified partial file into a fresh process-owned temporary name.
+/// The rename is the ownership handoff: it succeeds for exactly one worker,
+/// and a lost race leaves the winner's file untouched.
+async fn adopt_existing_temp(
+    parent: &Path,
+    destination: &Path,
+    path: &Path,
+) -> Result<(PathBuf, u64), AdoptError> {
+    let length = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata.len(),
+        Err(_) => return Err(AdoptError::Unavailable),
+    };
+    for _ in 0..128 {
+        let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let Some(candidate) = temp_candidate(parent, destination, std::process::id(), id) else {
+            continue;
+        };
+        match tokio::fs::rename(path, &candidate).await {
+            Ok(()) => return Ok((candidate, length)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(AdoptError::Unavailable)
+            }
+            Err(_) => return Err(AdoptError::Unavailable),
+        }
+    }
+    Err(AdoptError::Unavailable)
 }
 
 fn temp_candidate(parent: &Path, destination: &Path, pid: u32, id: u64) -> Option<PathBuf> {

@@ -1,6 +1,6 @@
 # Test Strategy
 
-**Status:** Engine, UI/IPC, pause/resume, persistence, and recovery coverage; Windows engine validation passed 65 tests on 2026-10-22
+**Status:** Engine, UI/IPC, pause/resume, durable cross-restart resume, hardened persistence, and bounded-retry coverage; Windows engine validation passed 65 tests on 2026-10-22; Phase X pass adds engine (71), service-harness (14), and frontend (21) suites on Linux 2026-10-23
 **Research checked:** 2026-10-22
 
 ## Phase 1 test layers
@@ -9,7 +9,7 @@
 2. **Engine integration tests:** use a loopback ephemeral-port HTTP server with scripted responses; no public internet. Compare output bytes directly so no hash dependency is needed for the fixture gate.
 3. **Filesystem integration tests:** temporary directories; exact bytes, collision behavior, failure cleanup, existing-file preservation, no-replace promotion, and finalization behavior.
 4. **Windows-specific tests:** reserved/device names, Unicode and long paths where supported, ACL/permission failure, junction/reparse-point cases, concurrent destination reservation, installer smoke test when packaging exists.
-5. **Frontend/IPC tests:** model tests cover revision-based merging, filtering, formatting, URL/name validation, bounded one-second speed-history sampling, and sparkline geometry; app tests cover preferences, pause/resume/retry actions, stale initial snapshots, chart rendering, terminal metric suppression, and focus return. Tauri service tests cover command validation, safe errors, loopback download, and history storage. DPAPI roundtrip runs on Windows. Capability restrictions and packaged WebView behavior remain manual release checks.
+5. **Frontend/IPC tests:** model tests cover revision-based merging, filtering, formatting, URL/name validation, bounded one-second speed-history sampling, sparkline geometry, and the `retrying` state's filter/terminal semantics; app tests cover preferences, pause/resume/retry actions, stale initial snapshots, chart rendering, terminal metric suppression, focus return, the local component set (dialog, tooltip, segmented control, switch, toast, state pill, progress, empty state) including keyboard access and live-region behavior, command-failure toasts, and the one-shot history notice. Tauri service tests run through a tauri-free harness crate that compiles `service.rs`/`persistence.rs` verbatim against the real engine, covering command validation, safe errors, loopback download, history storage, versioned snapshot envelopes (v1 compatibility), corrupt-snapshot sidecars and repair, checkpoint adoption validation, cross-restart checkpoint continuation, bounded transient-only auto-retry (including cancel-during-backoff and no-retry for non-transient failures), and snapshot permissions. DPAPI roundtrip runs on Windows. Capability restrictions and packaged WebView behavior remain manual release checks.
 
 ## Required scenario matrix
 
@@ -22,7 +22,9 @@
 | Incomplete | declared larger/smaller, connection reset mid-body | fail; do not promote; accurate partial-byte/cleanup result |
 | Cancellation | queued, connect, headers, body, backoff, race with finalization | accepted cancel yields Cancelled only after cleanup; cancel after Finalizing returns TooLate; exactly one terminal outcome |
 | Pause/resume | queued pause, body-boundary pause, resume with valid ETag/total, resume after validator mismatch | same-session resume uses exact offset and If-Range; unsupported checkpoints safely restart from zero |
-| Persistence/recovery | snapshot replacement, malformed history, protected URL roundtrip, app restart with active/paused/completed rows | snapshots remain readable; URLs decrypt only for the protecting Windows account; unfinished jobs become Interrupted and retry from zero; missing/size-changed completed files are flagged |
+| Cross-restart resume | valid persisted partial+checkpoint, shrunk/missing/oversized partial, changed resource, 200-after-Range, two-worker adoption | partial adopted only after on-disk re-verification and server revalidation (206 + Content-Range start == real length + If-Range); adoption hands off to a process-owned temp name; every failure falls back to byte zero without appending |
+| Persistence/recovery | snapshot replacement, malformed history, versioned envelope, truncated array, protected URL roundtrip, app restart with active/paused/completed rows | snapshots remain readable; unreadable snapshots are sidecar-backed-up and surfaced, never silently discarded; v1 arrays still load; URLs decrypt only for the protecting Windows account; unfinished jobs become Interrupted and restore checkpoint-continue or byte-zero messaging honestly; missing/size-changed completed files are flagged |
+| Automatic retry | transient connect/timeout/inactivity/incomplete/5xx, permanent 4xx, user cancellation during backoff, retry budget exhaustion | only transient classes auto-retry with bounded injectable backoff (max 2); cancellation stops the timer and never produces a network retry; exhaustion surfaces a normal failure with manual retry preserved; error text never includes sensitive URLs |
 | Managed jobs | duplicate IDs, destination conflicts, retained capacity, FIFO order, configured concurrency, acknowledgement, stale handles | admission is atomic; retained capacity includes queued and terminal-unacknowledged records; stale generations cannot act on reused IDs |
 | Shutdown and worker failure | repeated/concurrent shutdown, queued cancellation, active cancellation, finalizing job, worker panic | admission closes once; no new dispatch after close; panic becomes one retained terminal failure; cleanup failure is preserved |
 | Destination | existing file, two jobs same path, external target created before promotion, invalid/sanitized name, disk write failure, cleanup failure | no unintended clobber; exactly one same-process reservation winner; deterministic error and cleanup path |
@@ -31,7 +33,7 @@
 ## Determinism and test hygiene
 
 - Bind only loopback and use ephemeral ports. Ensure server tasks and temp directories are shut down in cleanup, including on test failure.
-- Use deterministic server gates and state inspection instead of timing-sensitive sleeps where practical. Retry-clock/jitter injection is deferred with retry implementation.
+- Use deterministic server gates and state inspection instead of timing-sensitive sleeps where practical. Retry backoff timing is injectable, so scheduled-retry tests assert the schedule and cancellation semantics without real-time waits.
 - Assert state transitions as an allowed sequence, not timing-sensitive exact timestamps.
 - Avoid depending on public endpoints, DNS, external certificates, or uncontrolled bandwidth.
 - Use fixed byte fixtures and exact byte comparisons; do not add a digest dependency solely for test convenience.
@@ -57,8 +59,9 @@ The ignored local performance harness is opt-in and is not part of ordinary `car
 
 ## Later-phase tests
 
-- SQLite migrations, interrupted-write recovery, WAL sidecar handling, DB corruption/migration fallback, and user-data deletion.
-- Durable resume across process restart (current recovery deliberately retries from byte zero).
+- SQLite migrations, interrupted-write recovery, WAL sidecar handling, DB corruption/migration fallback, and user-data deletion (only if the JSON snapshot model is ever replaced; the versioned JSON envelope, corruption sidecar, and repair behavior are covered today by the service harness).
+- Packaged Windows validation: DPAPI roundtrip on a real Windows account, promotion/reservation runtime tests, installer smoke test as a standard user, and interactive GUI/accessibility review remain the release gate; the Linux sandbox cannot execute them.
+- Cross-restart resume is covered by the engine adoption tests and the service harness (valid continuation, shrunk/missing/oversized partials, changed resource, 200-after-Range rejection, live-checkpoint publication); a full unforced process-restart drill in a packaged build remains part of the Windows release gate.
 - Segmented download assembly correctness, range overlap/gap detection, and bounded per-host concurrency.
 - Packaged Windows upgrade/uninstall and WebView2 online/offline distribution paths.
 

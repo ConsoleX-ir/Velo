@@ -32,6 +32,6 @@ The native Tauri crate depends on the root `consolex-download-engine` library by
 
 ## Current product limits
 
-Downloads and terminal history are in memory for the current application session. HTTP and HTTPS are supported. Pause/resume, durable history/recovery, user-controlled retries, segmented transfers, categories, and file-opening actions are not available. The engine may continue an interrupted body using its bounded, validator-checked Range behavior; this is not durable resume.
+HTTP and HTTPS are supported with queueing, bounded concurrency, pause/resume, and durable local history (URLs DPAPI-protected). Interrupted transfers restart across app launches: when the server supports strong validators, the retry continues from the last verified checkpoint; otherwise it restarts from byte zero. Transient network failures are retried automatically with a bounded, backed-off schedule (cancellations and permanent failures are never retried automatically). Segmented (multi-stream) transfers, categories, and file-opening actions are not available.
 
 See [the architecture](docs/ARCHITECTURE.md), [security requirements](docs/SECURITY_AND_PRIVACY.md), and [roadmap](docs/ROADMAP.md) for boundaries and remaining release work.

@@ -50,7 +50,7 @@ Current application surface: the default capability enables Tauri core defaults 
 - Never log request headers, URL credentials, raw sensitive query strings, or file contents.
 - Keep diagnostics bounded and sanitize CR/LF/control characters.
 - Do not make download URLs or history available to the webview except when needed for the UI.
-- Later SQLite database should use per-user app data ACLs, schema migrations, and safe backup/restore handling. Data-at-rest encryption and secure credential storage are unresolved because credentials are out of Phase 1.
+- The JSON history snapshot is written with restrictive permissions (owner-only 0600 on Unix; the per-user app-data ACL protects it on Windows), and unreadable snapshots are preserved in a timestamped sidecar rather than deleted, so recovery never silently discards user history. A later SQLite database, if introduced, must keep the same guarantees: per-user app data ACLs, schema migrations, and safe backup/restore handling. Data-at-rest encryption and secure credential storage are unresolved because credentials are out of Phase 1.
 
 ## Security review gates
 

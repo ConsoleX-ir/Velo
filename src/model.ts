@@ -9,7 +9,8 @@ export type DownloadState =
   | "completed"
   | "failed"
   | "cancelled"
-  | "interrupted";
+  | "interrupted"
+  | "retrying";
 
 export type DownloadDto = {
   id: string;
@@ -81,7 +82,7 @@ export function selectDownloads(items: DownloadDto[], view: DownloadView, filter
   if (view !== "downloads") return [];
   switch (filter) {
     case "active":
-      return items.filter((item) => item.state === "downloading" || item.state === "preparing" || item.state === "pausing" || item.state === "paused" || item.state === "cancelling" || item.state === "finalizing");
+      return items.filter((item) => item.state === "downloading" || item.state === "preparing" || item.state === "pausing" || item.state === "paused" || item.state === "cancelling" || item.state === "finalizing" || item.state === "retrying");
     case "queued":
       return items.filter((item) => item.state === "queued");
     case "paused":

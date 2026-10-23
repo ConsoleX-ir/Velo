@@ -1,6 +1,6 @@
 # Roadmap
 
-**Status:** Phase 0 and Phase 1A/1B complete; Phase 2 desktop application implemented, target Windows validation pending
+**Status:** Phase 0, Phase 1A/1B, Phase 2 desktop application, and the Phase X hardening pass (durable cross-restart resume, hardened JSON persistence, bounded auto-retry, UI component system) implemented; Windows target validation pending
 **Research checked:** 2026-10-21
 
 ## Phase 0 — Specifications and plan (completed)
@@ -24,10 +24,10 @@
 
 ### Next milestones
 
-1. **Phase 1C — Retry policy (deferred):** define classification, backoff/Retry-After, byte-zero restart, and deterministic timing tests before implementation.
+1. **Phase 1C — Retry policy (implemented in the Phase X pass):** bounded automatic retry (max 2 attempts, injectable 2s/8s backoff) for transient network-failure classes and HTTP 5xx only; user cancellation and permanent failures are never retried automatically; manual retry is preserved. Retry-After handling remains a future refinement.
 2. **Phase 2 — Desktop shell (implementation present; close after target validation):** Tauri 2 + React/TypeScript shell, narrow IPC commands, CSP/capabilities, and a user workflow connected to the tested manager. Verify packaged Windows behavior and keyboard/accessibility behavior before release.
-3. **Phase 3 — Durable metadata:** SQLite migrations and startup recovery with honest interrupted-job semantics.
-4. **Phase 4 — Durable resume and transfer concurrency:** define checkpoint and restart-recovery semantics; consider segmentation only after correctness and measurement.
+3. **Phase 3 — Durable metadata (implemented in the Phase X pass, without SQLite):** versioned JSON snapshot envelopes with atomic synced writes, corruption sidecars, truncated-record repair, and startup recovery with honest interrupted-job semantics; SQLite stays deferred unless scale or query needs demand it (per ADR 0003 and ADR 0006).
+4. **Phase 4 — Durable resume and transfer concurrency (single-stream resume implemented in the Phase X pass):** persisted checkpoint/temp adoption with full file and server revalidation, documented byte-zero fallback; segmented downloads and adaptive concurrency remain behind measured evidence.
 5. **Phase 5 — Release hardening and integrations:** signing, upgrades, accessibility, performance budgets, browser integration, and a separate BitTorrent security/product decision.
 
 ## Phase 2 — Desktop shell and minimal user workflow
@@ -36,19 +36,20 @@
 - Connect UI to tested engine; test event ordering/backpressure and packaged standard-user behavior.
 - Decide exact Windows support matrix, installer type, WebView2 strategy, app identity, signing, and distribution.
 
-Implementation now present: local Tauri shell, responsive Aurora Stream UI, native save-dialog workflow, typed command DTOs, manager-backed list/start/cancel/pause/resume/retry/dismiss flow, theme and reduced-motion preferences, persisted local history with DPAPI-protected URLs, plus frontend and native service tests. Restarted in-progress jobs are marked Interrupted and retry from byte zero. Categories and file opening remain unsupported. Windows installer smoke testing and interactive GUI validation remain release gates.
+Implementation now present: local Tauri shell, responsive Aurora Stream UI rebuilt on a local dependency-free component set (dialog, tooltip, segmented control, switch, toast, state pill, progress, spinner, empty state) with keyboard accessibility and reduced-motion support, native save-dialog workflow, typed command DTOs, manager-backed list/start/cancel/pause/resume/retry/dismiss flow, theme and reduced-motion preferences, persisted local history with DPAPI-protected URLs, plus frontend and native service tests. Restarted in-progress jobs are marked Interrupted; manual retry re-verifies the persisted partial and checkpoint and continues from the verified offset when the server allows it, falling back to byte zero otherwise. Transient failures auto-retry on a bounded backoff schedule. Categories and file opening remain unsupported. Windows installer smoke testing and interactive GUI validation remain release gates.
 
-## Phase 3 — Durable metadata and startup recovery
+## Phase 3 — Durable metadata and startup recovery (implemented without SQLite)
 
-- Add SQLite in per-user application data with versioned migrations and transaction policy.
-- Persist user intent and terminal outcomes; model process interruption honestly.
-- Design recovery for partial files without claiming resumability until remote validator/range rules are implemented. Test crash points and database/sidecar handling.
+- Ship a versioned JSON snapshot envelope under per-user application data with atomic synced replacement, restrictive permissions, corruption sidecars, truncated-record repair, and a one-shot recovery notice in the UI (ADR 0006).
+- Persist user intent, terminal outcomes, and durable-resume metadata; model process interruption honestly.
+- Partial files are never trusted implicitly: adoption requires on-disk re-verification plus server revalidation before any append, with a documented byte-zero fallback.
+- SQLite remains deferred unless filtering/query volume or concurrent writers outgrow the snapshot model.
 
 ## Phase 4 — Resume and concurrency
 
-- Specify ETag/Last-Modified/Range behavior, validators, server incompatibilities, atomic assembly, retry semantics, and integrity expectations.
-- Implement reliable single-stream resume first, then consider segmented downloads behind measured evidence.
-- Revisit user/global/host concurrency limits and adaptive behavior only after benchmarks and clear resource budgets; Phase 1 already has a fixed provisional admission cap.
+- Single-stream durable resume is implemented: persisted temp/checkpoint adoption validated on disk (same directory, regular file, length at or beyond the persisted counter, below the recorded total) and revalidated with the server (`If-Range`, `206`, matching `Content-Range`); every failure mode falls back to a documented byte-zero restart.
+- Segmented downloads and adaptive concurrency remain future work and only behind measured evidence.
+- Revisit user/global/host concurrency limits only after benchmarks and clear resource budgets; Phase 1 already has a fixed provisional admission cap.
 
 ## Phase 5 — Release hardening and ecosystem integrations
 

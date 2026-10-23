@@ -21,6 +21,7 @@ use tokio::{
 };
 use url::Url;
 
+#[cfg_attr(not(windows), allow(unused_imports))]
 use crate::{
     cleanup_or_original, parse_content_length, parse_content_range, parse_strong_etag,
     promote_no_replace, redirect_decision, temp_candidate, validate_entity_headers,
@@ -1845,6 +1846,7 @@ fn managed_request(id: &str, url: String, destination: PathBuf) -> DownloadReque
         id: DownloadId::new(id).unwrap(),
         url,
         destination,
+        resume: None,
     }
 }
 
@@ -2768,4 +2770,301 @@ async fn manager_reserves_windows_destinations_case_insensitively() {
     );
     server.await.unwrap();
     manager.acknowledge_terminal(&first).unwrap();
+}
+
+// --- Durable cross-restart resume ------------------------------------------
+
+use crate::{DurableResume, ResumeCheckpoint};
+
+fn durable_resume(
+    temp_path: PathBuf,
+    persisted_bytes: u64,
+    effective_url: &str,
+    strong_etag: &str,
+    total_bytes: u64,
+) -> DurableResume {
+    DurableResume {
+        temp_path,
+        persisted_bytes,
+        checkpoint: Some(ResumeCheckpoint {
+            effective_url: effective_url.to_owned(),
+            strong_etag: strong_etag.to_owned(),
+            total_bytes,
+        }),
+    }
+}
+
+#[tokio::test]
+async fn manager_adopts_a_persisted_partial_and_resumes_cross_restart() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        // Only the range request should arrive: the partial bytes were
+        // persisted by the previous session, so no initial GET is made.
+        let (mut range, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut range).await;
+        let lowered = request.to_ascii_lowercase();
+        assert!(lowered.contains("range: bytes=5-"));
+        assert!(lowered.contains("if-range: \"stable\""));
+        let tail = response(
+            "206 Partial Content",
+            "Content-Range: bytes 5-9/10\r\nContent-Length: 5\r\nETag: \"stable\"\r\nConnection: close\r\n",
+            b"fghij",
+        );
+        range.write_all(&tail).await.unwrap();
+        range.shutdown().await.unwrap();
+    });
+
+    let dir = TestDir::new();
+    let persisted = dir.path().join(".consolex-previous-session-7.part");
+    fs::write(&persisted, b"abcde").unwrap();
+    let url = format!("http://{address}/file");
+    let manager = DownloadManager::new().unwrap();
+    let handle = manager
+        .start(DownloadRequest {
+            id: DownloadId::new("durable-resume").unwrap(),
+            url: url.clone(),
+            destination: dir.path().join("durable.bin"),
+            resume: Some(durable_resume(persisted.clone(), 5, &url, "\"stable\"", 10)),
+        })
+        .unwrap();
+
+    // Adoption moves the partial into a process-owned temporary name.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(info) = manager.resume_info(&handle).unwrap() {
+                if info.temp_path != persisted {
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the persisted partial should be adopted under a new name");
+    assert!(!persisted.exists(), "adoption must rename, not copy");
+
+    let terminal = wait_for_terminal(&manager, &handle).await;
+    server.await.unwrap();
+    assert_eq!(terminal.state, DownloadState::Completed);
+    assert_eq!(terminal.bytes_written, 10);
+    assert_eq!(
+        fs::read(dir.path().join("durable.bin")).unwrap(),
+        b"abcdefghij"
+    );
+    assert!(manager.resume_info(&handle).unwrap().is_none());
+    manager.acknowledge_terminal(&handle).unwrap();
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn manager_discards_a_shrunk_persisted_partial_and_restarts_from_zero() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut fresh, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut fresh).await;
+        // The partial is shorter than its persisted counter, so no Range
+        // request may be sent: the transfer restarts from byte zero.
+        assert!(!request.to_ascii_lowercase().contains("range:"));
+        let full = response(
+            "200 OK",
+            "Content-Length: 10\r\nETag: \"stable\"\r\nConnection: close\r\n",
+            b"abcdefghij",
+        );
+        fresh.write_all(&full).await.unwrap();
+        fresh.shutdown().await.unwrap();
+    });
+
+    let dir = TestDir::new();
+    let persisted = dir.path().join(".consolex-shrunk-3.part");
+    fs::write(&persisted, b"abc").unwrap();
+    let url = format!("http://{address}/file");
+    let manager = DownloadManager::new().unwrap();
+    let handle = manager
+        .start(DownloadRequest {
+            id: DownloadId::new("shrunk-partial").unwrap(),
+            url,
+            destination: dir.path().join("shrunk.bin"),
+            resume: Some(durable_resume(
+                persisted.clone(),
+                6,
+                &format!("http://{address}/file"),
+                "\"stable\"",
+                10,
+            )),
+        })
+        .unwrap();
+
+    let terminal = wait_for_terminal(&manager, &handle).await;
+    server.await.unwrap();
+    assert_eq!(terminal.state, DownloadState::Completed);
+    let final_bytes = fs::read(dir.path().join("shrunk.bin")).unwrap();
+    assert_eq!(final_bytes, b"abcdefghij");
+    assert!(!persisted.exists(), "the untrustworthy partial is removed");
+    manager.acknowledge_terminal(&handle).unwrap();
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn manager_restarts_from_zero_when_a_persisted_partial_meets_the_total() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut fresh, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut fresh).await;
+        assert!(!request.to_ascii_lowercase().contains("range:"));
+        let full = response(
+            "200 OK",
+            "Content-Length: 10\r\nETag: \"stable\"\r\nConnection: close\r\n",
+            b"abcdefghij",
+        );
+        fresh.write_all(&full).await.unwrap();
+        fresh.shutdown().await.unwrap();
+    });
+
+    let dir = TestDir::new();
+    let persisted = dir.path().join(".consolex-complete-10.part");
+    fs::write(&persisted, b"0123456789").unwrap();
+    let url = format!("http://{address}/file");
+    let manager = DownloadManager::new().unwrap();
+    let handle = manager
+        .start(DownloadRequest {
+            id: DownloadId::new("overlong-partial").unwrap(),
+            url,
+            destination: dir.path().join("overlong.bin"),
+            resume: Some(durable_resume(
+                persisted.clone(),
+                10,
+                &format!("http://{address}/file"),
+                "\"stable\"",
+                10,
+            )),
+        })
+        .unwrap();
+
+    let terminal = wait_for_terminal(&manager, &handle).await;
+    server.await.unwrap();
+    assert_eq!(terminal.state, DownloadState::Completed);
+    // The unverifiable tail is never trusted: the file is the server's body.
+    assert_eq!(
+        fs::read(dir.path().join("overlong.bin")).unwrap(),
+        b"abcdefghij"
+    );
+    manager.acknowledge_terminal(&handle).unwrap();
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn manager_continues_normally_when_the_persisted_partial_is_missing() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut fresh, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut fresh).await;
+        assert!(!request.to_ascii_lowercase().contains("range:"));
+        let full = response(
+            "200 OK",
+            "Content-Length: 5\r\nConnection: close\r\n",
+            b"hello",
+        );
+        fresh.write_all(&full).await.unwrap();
+        fresh.shutdown().await.unwrap();
+    });
+
+    let dir = TestDir::new();
+    let missing = dir.path().join(".consolex-gone-1.part");
+    let url = format!("http://{address}/file");
+    let manager = DownloadManager::new().unwrap();
+    let handle = manager
+        .start(DownloadRequest {
+            id: DownloadId::new("missing-partial").unwrap(),
+            url,
+            destination: dir.path().join("missing.bin"),
+            resume: Some(DurableResume {
+                temp_path: missing,
+                persisted_bytes: 2,
+                checkpoint: None,
+            }),
+        })
+        .unwrap();
+
+    let terminal = wait_for_terminal(&manager, &handle).await;
+    server.await.unwrap();
+    assert_eq!(terminal.state, DownloadState::Completed);
+    assert_eq!(fs::read(dir.path().join("missing.bin")).unwrap(), b"hello");
+    manager.acknowledge_terminal(&handle).unwrap();
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn resume_info_publishes_a_live_checkpoint_before_body_bytes_arrive() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (range_seen_tx, range_seen_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut initial, _) = listener.accept().await.unwrap();
+        read_request(&mut initial).await;
+        let head = response(
+            "200 OK",
+            "Content-Length: 10\r\nETag: \"stable\"\r\nConnection: close\r\n",
+            b"abcde",
+        );
+        initial.write_all(&head).await.unwrap();
+        let _ = initial.shutdown().await;
+
+        // The engine must continue in-job from byte five; by the time this
+        // request arrives, the checkpoint for the first response is already
+        // visible to the registry.
+        let (mut range, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut range).await;
+        assert!(request.to_ascii_lowercase().contains("range: bytes=5-"));
+        let _ = range_seen_tx.send(());
+        let tail = response(
+            "206 Partial Content",
+            "Content-Range: bytes 5-9/10\r\nContent-Length: 5\r\nETag: \"stable\"\r\nConnection: close\r\n",
+            b"fghij",
+        );
+        range.write_all(&tail).await.unwrap();
+        range.shutdown().await.unwrap();
+    });
+
+    let dir = TestDir::new();
+    let url = format!("http://{address}/file");
+    let manager = DownloadManager::new().unwrap();
+    let handle = manager
+        .start(managed_request(
+            "live-checkpoint",
+            url.clone(),
+            dir.path().join("live.bin"),
+        ))
+        .unwrap();
+    range_seen_rx.await.unwrap();
+
+    let info = manager.resume_info(&handle).unwrap();
+    let info = info.expect("an in-flight job with a temporary file reports resume info");
+    assert!(info.temp_path.starts_with(dir.path()));
+    assert!(info
+        .temp_path
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with(".consolex-")));
+    assert_eq!(info.bytes_written, 5);
+    let checkpoint = info
+        .checkpoint
+        .expect("the first response published a live checkpoint");
+    assert_eq!(checkpoint.strong_etag, "\"stable\"");
+    assert_eq!(checkpoint.total_bytes, 10);
+    let effective = Url::parse(&url).unwrap();
+    assert_eq!(checkpoint.effective_url, effective.as_str());
+
+    let terminal = wait_for_terminal(&manager, &handle).await;
+    server.await.unwrap();
+    assert_eq!(terminal.state, DownloadState::Completed);
+    assert_eq!(
+        fs::read(dir.path().join("live.bin")).unwrap(),
+        b"abcdefghij"
+    );
+    assert!(manager.resume_info(&handle).unwrap().is_none());
+    manager.acknowledge_terminal(&handle).unwrap();
+    manager.shutdown().await;
 }

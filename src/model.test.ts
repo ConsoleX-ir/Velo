@@ -37,6 +37,15 @@ describe("download presentation model", () => {
     expect(isTerminal("downloading")).toBe(false);
   });
 
+  it("treats retrying as non-terminal and active-only", () => {
+    expect(isTerminal("retrying")).toBe(false);
+    const items = [item({ id: "retrying", state: "retrying" }), item({ id: "failed", state: "failed" }), item({ id: "queued", state: "queued" })];
+    expect(selectDownloads(items, "downloads", "active").map((download) => download.id)).toEqual(["retrying"]);
+    expect(selectDownloads(items, "downloads", "failed").map((download) => download.id)).toEqual(["failed"]);
+    expect(selectDownloads(items, "downloads", "queued").map((download) => download.id)).toEqual(["queued"]);
+    expect(selectDownloads(items, "downloads", "all").map((download) => download.id)).toEqual(["retrying", "failed", "queued"]);
+  });
+
   it("formats sizes and validates URL schemes and credentials", () => {
     expect(formatBytes(0)).toBe("0 B");
     expect(formatBytes(1024)).toBe("1.0 KB");
