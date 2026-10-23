@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { emptySpeedHistory, formatBytes, formatRate, isTerminal, mergeDownloads, progressPercent, recordSpeedSample, selectDownloads, speedHistoryPoints, suggestedFileName, validateUrl, type DownloadDto } from "./model";
+import { destinationDirectory, emptySpeedHistory, formatBytes, formatRate, isTerminal, mergeDownloads, progressPercent, recordSpeedSample, selectDownloads, speedHistoryPoints, suggestedFileName, validateUrl, type DownloadDto } from "./model";
 
 const item = (patch: Partial<DownloadDto> = {}): DownloadDto => ({
   id: "job-1",
@@ -7,6 +7,7 @@ const item = (patch: Partial<DownloadDto> = {}): DownloadDto => ({
   revision: 1,
   order: 1,
   fileName: "archive.zip",
+  destination: "C:\\Users\\me\\Downloads\\archive.zip",
   state: "downloading",
   bytesWritten: 5,
   totalBytes: 10,
@@ -32,7 +33,7 @@ describe("download presentation model", () => {
     expect(selectDownloads(items, "downloads", "active").map((download) => download.id)).toEqual(["job-1", "cancelling"]);
     expect(selectDownloads(items, "queue", "all").map((download) => download.id)).toEqual(["queued"]);
     expect(selectDownloads(items, "completed", "all").map((download) => download.id)).toEqual(["done"]);
-    expect(selectDownloads(items, "categories", "all")).toEqual([]);
+    expect(selectDownloads(items, "settings", "all")).toEqual([]);
     expect(isTerminal("completed")).toBe(true);
     expect(isTerminal("downloading")).toBe(false);
   });
@@ -79,7 +80,13 @@ describe("download presentation model", () => {
 
   it("maps speed history into a bounded sparkline and handles zero or missing values", () => {
     expect(speedHistoryPoints([])).toBe("");
-    expect(speedHistoryPoints([0])).toBe("66.0,39.0");
-    expect(speedHistoryPoints([0, 10, 5])).toBe("0.0,39.0 66.0,3.0 132.0,21.0");
+    expect(speedHistoryPoints([0])).toBe("42.0,18.0");
+    expect(speedHistoryPoints([0, 10, 5])).toBe("0.0,18.0 42.0,2.0 84.0,10.0");
+  });
+
+  it("shows the containing folder for a destination", () => {
+    expect(destinationDirectory("C:\\Users\\me\\Downloads\\archive.zip")).toBe("C:\\Users\\me\\Downloads");
+    expect(destinationDirectory("/home/me/archive.zip")).toBe("/home/me");
+    expect(destinationDirectory("archive.zip")).toBe("archive.zip");
   });
 });

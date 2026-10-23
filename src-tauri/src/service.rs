@@ -75,6 +75,11 @@ pub(crate) struct DownloadDto {
     pub(crate) revision: u64,
     pub(crate) order: u64,
     pub(crate) file_name: String,
+    /// The absolute destination the transfer was started with, shown in the
+    /// UI. `default` keeps older snapshots (which stored the destination
+    /// separately) loading without change.
+    #[serde(default)]
+    pub(crate) destination: String,
     pub(crate) state: UiDownloadState,
     pub(crate) bytes_written: u64,
     pub(crate) total_bytes: Option<u64>,
@@ -160,6 +165,11 @@ impl AppState {
                 for record in loaded.records {
                     let mut download = record.download;
                     next_order = next_order.max(download.order.saturating_add(1));
+                    // Records written before the DTO carried the destination
+                    // (or any record missing it) still know it on the store.
+                    if download.destination.is_empty() {
+                        download.destination = record.destination.clone();
+                    }
                     let url = restore_url(&record.encrypted_url).ok();
                     if matches!(download.state, UiDownloadState::Completed)
                         && fs::metadata(&record.destination)
@@ -325,6 +335,7 @@ impl AppState {
             revision: 1,
             order,
             file_name,
+            destination: destination.clone(),
             state: snapshot.state.into(),
             bytes_written: snapshot.bytes_written,
             total_bytes: snapshot.total_bytes,
@@ -374,9 +385,25 @@ impl AppState {
     pub(crate) fn begin_download(
         &self,
         url: String,
-        destination: String,
+        directory: String,
+        file_name: String,
     ) -> Result<DownloadDto, CommandError> {
-        let (download, handle) = self.start(url, destination, None)?;
+        // The webview hands over a folder plus a bare file name; the native
+        // side composes and validates the final path so the engine keeps
+        // receiving one absolute destination under its own safety rules.
+        let destination = super::settings::join_destination(&directory, &file_name).map_err(
+            |error| match error {
+                super::settings::JoinDestinationError::InvalidDirectory => CommandError::new(
+                    "invalid_destination",
+                    "Choose a valid folder for this download.",
+                ),
+                super::settings::JoinDestinationError::InvalidFileName(message) => {
+                    CommandError::new("invalid_file_name", message)
+                }
+            },
+        )?;
+        let destination_text = destination.to_string_lossy().into_owned();
+        let (download, handle) = self.start(url, destination_text, None)?;
         tokio::spawn({
             let state = self.clone();
             async move { state.monitor(handle).await }
@@ -1084,6 +1111,28 @@ pub(crate) mod tests {
         assert!(validate_url_input("https://user:secret@example.test/file").is_err());
     }
 
+    #[tokio::test]
+    async fn begin_download_rejects_unsafe_destination_composition() {
+        let dir = std::env::temp_dir().join(format!(
+            "velo-join-guard-{}-{}",
+            std::process::id(),
+            TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let (state, _updates, _removals) =
+            test_state(dir.join("history.json"), Duration::from_millis(20));
+        let error = state
+            .begin_download(
+                "https://example.test/file".into(),
+                dir.to_string_lossy().into_owned(),
+                "../escape.bin".into(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_file_name");
+        state.manager.shutdown().await;
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn command_error_mapping_never_includes_sensitive_url_or_path() {
         let error = DownloadError::Filesystem {
@@ -1299,8 +1348,12 @@ pub(crate) mod tests {
             serve_retry_sequence(&["503 Service Unavailable", "502 Bad Gateway"]).await;
         let (state, updates, _removals) =
             test_state(dir.join("history.json"), Duration::from_millis(20));
-        let download = state
-            .begin_download(url, dir.join("out.bin").to_string_lossy().into_owned())
+        state
+            .begin_download(
+                url,
+                dir.to_string_lossy().into_owned(),
+                "out.bin".to_owned(),
+            )
             .unwrap();
         let terminal = wait_for_terminal_state(&updates, UiDownloadState::Completed).await;
         server.await.unwrap();
@@ -1351,7 +1404,11 @@ pub(crate) mod tests {
         });
         let url = format!("http://{address}/missing.bin");
         let download = state
-            .begin_download(url, dir.join("out.bin").to_string_lossy().into_owned())
+            .begin_download(
+                url,
+                dir.to_string_lossy().into_owned(),
+                "out.bin".to_owned(),
+            )
             .unwrap();
         let terminal = wait_for_terminal_state(&updates, UiDownloadState::Failed).await;
         server.await.unwrap();
@@ -1377,7 +1434,11 @@ pub(crate) mod tests {
             Duration::from_millis(60_000), // long enough to always win the race
         );
         let download = state
-            .begin_download(url, dir.join("out.bin").to_string_lossy().into_owned())
+            .begin_download(
+                url,
+                dir.to_string_lossy().into_owned(),
+                "out.bin".to_owned(),
+            )
             .unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {

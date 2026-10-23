@@ -18,6 +18,8 @@ export type DownloadDto = {
   revision: number;
   order: number;
   fileName: string;
+  /** Absolute destination path the transfer writes to. */
+  destination: string;
   state: DownloadState;
   bytesWritten: number;
   totalBytes: number | null;
@@ -26,9 +28,23 @@ export type DownloadDto = {
   error: string | null;
 };
 
-export type DownloadView = "downloads" | "queue" | "completed" | "categories" | "settings";
+export type DownloadView = "downloads" | "queue" | "completed" | "settings";
 export type Filter = "all" | "active" | "queued" | "paused" | "completed" | "failed";
 export type SpeedHistory = { sampledAt: number | null; samples: number[] };
+
+/** Snapshot of the persisted application settings (see src-tauri settings.rs). */
+export type SettingsDto = {
+  /** The user's saved default download directory, when one was chosen. */
+  defaultDownloadDir: string | null;
+  /** Whether the saved directory still exists and is writable right now. */
+  storedDirValid: boolean;
+  /** The operating system's Downloads folder, when resolvable. */
+  osDefaultDownloadDir: string | null;
+  /** Where downloads go without an override: saved default while valid, else OS folder. */
+  effectiveDownloadDir: string | null;
+};
+
+export const APP_VERSION = "0.4.0";
 
 export const SPEED_SAMPLE_INTERVAL_MS = 1_000;
 export const SPEED_HISTORY_LIMIT = 36;
@@ -50,11 +66,12 @@ export function recordSpeedSample(
   };
 }
 
-export function speedHistoryPoints(samples: number[], width = 132, height = 42): string {
+/** Points for a small inline sparkline (10:1 aspect by default). */
+export function speedHistoryPoints(samples: number[], width = 84, height = 20): string {
   if (!samples.length || width <= 0 || height <= 0) return "";
   const valid = samples.map((value) => Math.max(0, Number.isFinite(value) ? value : 0));
   const max = Math.max(...valid);
-  const pad = 3;
+  const pad = 2;
   return valid.map((value, index) => {
     const x = valid.length === 1 ? width / 2 : (index / (valid.length - 1)) * width;
     const y = height - pad - (max > 0 ? (value / max) * (height - pad * 2) : 0);
@@ -124,6 +141,17 @@ export function formatEta(seconds: number | null): string | null {
   if (minutes < 60) return `${minutes} min left`;
   const hours = Math.floor(minutes / 60);
   return `${hours} hr ${minutes % 60} min left`;
+}
+
+/**
+ * The containing directory of a download destination, for row metadata
+ * ("C:\\Users\\me\\Downloads\\file.zip" -> "C:\\Users\\me\\Downloads").
+ */
+export function destinationDirectory(destination: string): string {
+  const trimmed = destination.replace(/[\\/]+$/, "");
+  const slash = Math.max(trimmed.lastIndexOf("\\"), trimmed.lastIndexOf("/"));
+  if (slash <= 0) return trimmed;
+  return trimmed.slice(0, slash);
 }
 
 export function validateUrl(value: string): string | null {

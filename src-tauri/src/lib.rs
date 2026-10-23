@@ -1,21 +1,45 @@
 //! Tauri shell for the ConsoleX Velo download service.
 //!
 //! All state, recovery, retry, and persistence logic lives in the tauri-free
-//! `service` module so it can be tested without the webview, mirroring the
-//! engine's boundary. This file only adapts the webview's commands and
-//! lifecycle events onto that service.
+//! `service` and `settings` modules so it can be tested without the webview,
+//! mirroring the engine's boundary. This file only adapts the webview's
+//! commands and lifecycle events onto those services, and owns the desktop
+//! integration surfaces: the custom-frame window lifecycle, the system tray,
+//! and the single-instance guard.
 
 mod persistence;
 mod service;
+mod settings;
 
 use std::sync::Arc;
 
 use consolex_download_engine::DownloadManager;
 use service::{AppState, UiEvent};
-use tauri::{Emitter, Manager, RunEvent, State};
+use settings::SettingsState;
+use tauri::{
+    menu::{Menu, MenuItem, PredefinedMenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    Emitter, Manager, RunEvent, State, WindowEvent,
+};
 
 const DOWNLOAD_UPDATED_EVENT: &str = "download-updated";
 const DOWNLOAD_REMOVED_EVENT: &str = "download-removed";
+const MAIN_WINDOW: &str = "main";
+const TRAY_ID: &str = "velo-tray";
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn hide_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
+        let _ = window.hide();
+    }
+}
 
 #[tauri::command]
 fn list_downloads(state: State<'_, AppState>) -> Vec<service::DownloadDto> {
@@ -26,9 +50,13 @@ fn list_downloads(state: State<'_, AppState>) -> Vec<service::DownloadDto> {
 async fn start_download(
     state: State<'_, AppState>,
     url: String,
-    destination: String,
+    directory: String,
+    file_name: String,
 ) -> Result<service::DownloadDto, service::CommandError> {
-    state.inner().clone().begin_download(url, destination)
+    state
+        .inner()
+        .clone()
+        .begin_download(url, directory, file_name)
 }
 
 /// User-facing one-shot message when the saved history needed repair.
@@ -82,12 +110,80 @@ fn acknowledge_download(
     state.inner().clone().acknowledge_download(&id, generation)
 }
 
+#[tauri::command]
+fn get_settings(settings: State<'_, SettingsState>) -> settings::SettingsDto {
+    settings.get()
+}
+
+#[tauri::command]
+fn set_default_directory(
+    settings: State<'_, SettingsState>,
+    directory: String,
+) -> Result<settings::SettingsDto, settings::SettingsError> {
+    settings.set_default(&directory)
+}
+
+#[tauri::command]
+fn clear_default_directory(
+    settings: State<'_, SettingsState>,
+) -> Result<settings::SettingsDto, settings::SettingsError> {
+    settings.clear_default()
+}
+
+fn build_tray(app: &tauri::App) -> tauri::Result<()> {
+    let show = MenuItem::with_id(app, "velo-show", "Show Velo", true, None::<&str>)?;
+    let hide = MenuItem::with_id(app, "velo-hide", "Hide Velo", true, None::<&str>)?;
+    let separator = PredefinedMenuItem::separator(app)?;
+    let exit = MenuItem::with_id(app, "velo-exit", "Exit Velo", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &hide, &separator, &exit])?;
+
+    let mut builder = TrayIconBuilder::with_id(TRAY_ID)
+        .menu(&menu)
+        // Left click restores the window; the menu is a right-click affair,
+        // matching established Windows download managers.
+        .show_menu_on_left_click(false)
+        .tooltip("ConsoleX Velo")
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "velo-show" => show_main_window(app),
+            "velo-hide" => hide_main_window(app),
+            // An explicit, orderly exit: the ExitRequested handler below
+            // shuts the engine down before the process really ends.
+            "velo-exit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if matches!(
+                event,
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                }
+            ) {
+                show_main_window(tray.app_handle());
+            }
+        });
+    // The bundled window icon doubles as the tray icon, so no separate asset
+    // has to stay legible at both window and tray sizes by hand.
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    }
+    builder.build(app)?;
+    Ok(())
+}
+
 pub fn run() {
     tauri::Builder::default()
+        // Must be the first plugin: a second launch focuses the running
+        // window instead of starting a second engine, tray, or history file.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let manager = tauri::async_runtime::block_on(async { DownloadManager::new() })?;
-            let store_path = app.path().app_data_dir()?.join("downloads.json");
+            let data_dir = app.path().app_data_dir()?;
+            let store_path = data_dir.join("downloads.json");
             let handle = app.handle().clone();
             let publish: Arc<dyn Fn(UiEvent) + Send + Sync> = Arc::new(move |event| match event {
                 UiEvent::Updated(download) => {
@@ -107,6 +203,12 @@ pub fn run() {
                 publish,
                 service::RETRY_BACKOFF_BASE,
             ));
+            let os_downloads = app.path().download_dir().ok();
+            app.manage(SettingsState::build(
+                data_dir.join("settings.json"),
+                os_downloads,
+            ));
+            build_tray(app)?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -117,8 +219,19 @@ pub fn run() {
             pause_download,
             resume_download,
             retry_download,
-            acknowledge_download
+            acknowledge_download,
+            get_settings,
+            set_default_directory,
+            clear_default_directory
         ])
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                // Closing the window hides it to the tray while active
+                // downloads keep running; the tray's Exit entry ends the app.
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .build(tauri::generate_context!())
         .expect("failed to build ConsoleX Velo")
         .run(|app, event| {

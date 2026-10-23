@@ -1,7 +1,15 @@
 # Roadmap
 
-**Status:** Phase 0, Phase 1A/1B, Phase 2 desktop application, and the Phase X hardening pass (durable cross-restart resume, hardened JSON persistence, bounded auto-retry, UI component system) implemented; Windows target validation pending
+**Status:** Phase 0, Phase 1A/1B, Phase 2 desktop application (including the 0.4.0 shell-integration pass), and the Phase X hardening pass (durable cross-restart resume, hardened JSON persistence, bounded auto-retry, UI component system) implemented; Windows target validation pending
 **Research checked:** 2026-10-21
+
+## 0.4.0 — Desktop shell integration (implemented)
+
+- Custom integrated title bar (`decorations: false`) with real window controls, dragging, and accurate maximize state.
+- System tray (Show/Hide/Exit) with left-click restore; closing the window hides Velo while downloads continue; Exit performs the orderly engine shutdown; single-instance guard via `tauri-plugin-single-instance`.
+- Persistent default download directory (`settings.json`, Rust-validated, OS Downloads fallback with visible recovery path) and per-download destination override through the native folder dialog; destinations are composed and validated natively.
+- Full UI rebuild: new navigation without placeholder sections, download rows with destination metadata and inline speed sparklines, per-download context menu, redesigned add-download and settings flows, dark/light themes, reduced-motion support.
+- Browser integration remains explicitly out of scope; no browser-related code, permissions, or placeholders were added.
 
 ## Phase 0 — Specifications and plan (completed)
 

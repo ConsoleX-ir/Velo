@@ -145,14 +145,25 @@ pub(super) fn save(path: &Path, downloads: &[StoredDownload]) -> io::Result<()> 
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "store path has no parent"))?;
     fs::create_dir_all(parent)?;
-    let temporary = path.with_extension("json.tmp");
-    let store = StoreFile {
+    let bytes = serde_json::to_vec(&StoreFile {
         version: STORE_VERSION,
         downloads: downloads.to_vec(),
-    };
-    let bytes = serde_json::to_vec(&store)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let saved = write_snapshot(&temporary, &bytes);
+    })
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    write_atomic(path, &bytes)
+}
+
+/// Serializes `bytes` into a synced temporary file next to `path`, then
+/// durably replaces `path` with it. Shared by the download-history snapshot
+/// and the settings store so both survive an interrupted process.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let temporary = path.with_extension(format!(
+        "{}.tmp",
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("store")
+    ));
+    let saved = write_snapshot(&temporary, bytes);
     if saved.is_err() {
         let _ = fs::remove_file(&temporary);
         return saved;
@@ -292,6 +303,7 @@ pub(super) fn unprotect_url(value: &[u8]) -> io::Result<String> {
 }
 
 #[cfg(not(windows))]
+#[allow(dead_code)]
 pub(super) fn protect_url(_value: &str) -> io::Result<Vec<u8>> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -300,6 +312,7 @@ pub(super) fn protect_url(_value: &str) -> io::Result<Vec<u8>> {
 }
 
 #[cfg(not(windows))]
+#[allow(dead_code)]
 pub(super) fn unprotect_url(_value: &[u8]) -> io::Result<String> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -345,6 +358,7 @@ mod tests {
                 revision: 1,
                 order: 1,
                 file_name: "sample.bin".into(),
+                destination: "C:\\Downloads\\sample.bin".into(),
                 state: UiDownloadState::Interrupted,
                 bytes_written: 0,
                 total_bytes: Some(10),
