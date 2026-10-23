@@ -1043,22 +1043,22 @@ async fn schedule_retry_timer(state: AppState, id: String, generation: u64, dela
 }
 
 fn store_url(value: &str) -> std::io::Result<Vec<u8>> {
-    #[cfg(all(test, not(windows)))]
+    #[cfg(test)]
     {
         persistence::test_protection::protect(value)
     }
-    #[cfg(not(all(test, not(windows))))]
+    #[cfg(not(test))]
     {
         persistence::protect_url(value)
     }
 }
 
 fn restore_url(value: &[u8]) -> std::io::Result<String> {
-    #[cfg(all(test, not(windows)))]
+    #[cfg(test)]
     {
         persistence::test_protection::unprotect(value)
     }
-    #[cfg(not(all(test, not(windows))))]
+    #[cfg(not(test))]
     {
         persistence::unprotect_url(value)
     }
@@ -1416,6 +1416,11 @@ pub(crate) mod tests {
             TEST_ID.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&dir).unwrap();
+        // Canonicalize so the parent directory matches the UNC path the engine
+        // derives from fs::canonicalize inside canonical_destination. Without
+        // this, open_or_create_temp rejects the partial because the regular
+        // C:\ parent doesn't equal the \\?\ canonical parent.
+        let dir = fs::canonicalize(&dir).unwrap();
         let partial = dir.join(".consolex-persisted-42.part");
         fs::write(&partial, b"01234").unwrap();
         let destination = dir.join("restored.bin");

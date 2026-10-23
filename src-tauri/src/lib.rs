@@ -23,7 +23,7 @@ fn list_downloads(state: State<'_, AppState>) -> Vec<service::DownloadDto> {
 }
 
 #[tauri::command]
-fn start_download(
+async fn start_download(
     state: State<'_, AppState>,
     url: String,
     destination: String,
@@ -65,7 +65,7 @@ fn resume_download(
 }
 
 #[tauri::command]
-fn retry_download(
+async fn retry_download(
     state: State<'_, AppState>,
     id: String,
     generation: u64,

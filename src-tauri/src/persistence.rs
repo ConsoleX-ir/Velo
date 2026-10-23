@@ -307,9 +307,9 @@ pub(super) fn unprotect_url(_value: &[u8]) -> io::Result<String> {
     ))
 }
 
-/// Test-only stand-in so service-level tests on non-Windows hosts can exercise
-/// history restoration without DPAPI. Production always uses DPAPI.
-#[cfg(all(test, not(windows)))]
+/// Test-only stand-in so service-level tests can exercise history restoration
+/// without DPAPI. Production always uses DPAPI on Windows.
+#[cfg(test)]
 pub(crate) mod test_protection {
     use std::io;
 
