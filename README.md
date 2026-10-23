@@ -2,6 +2,10 @@
 
 ConsoleX Velo is a Windows-first desktop download manager. The UI is a Tauri 2 webview built with React and TypeScript; the native Rust application service calls the existing independent Rust download engine.
 
+## ScreenShot
+
+![Velo Main Window](ScreenShot/Velo.png)
+
 ## Run locally
 
 Prerequisites: Node.js/npm, Rust with the MSVC Windows target and Visual C++ Build Tools, and the WebView2 runtime/development prerequisites required by Tauri.
