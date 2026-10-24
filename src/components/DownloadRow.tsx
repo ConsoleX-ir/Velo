@@ -87,7 +87,17 @@ export const DownloadRow = memo(function DownloadRow({
         onOpenMenu(event);
       }}
     >
-      <div className={`row-icon ${terminal ? item.state : "live"}`} aria-hidden="true">
+      {/* Tiles carry the pill's hue: red for genuinely moving transfers,
+          amber while finishing/retrying, slate while queued, neutral when
+          paused. Terminal states keep their own semantic tile. */}
+      <div
+        className={`row-icon ${
+          ["downloading", "preparing", "pausing", "cancelling"].includes(item.state)
+            ? "live"
+            : item.state
+        }`}
+        aria-hidden="true"
+      >
         <Icon name={STATE_ICON[item.state]} size={19} />
       </div>
 

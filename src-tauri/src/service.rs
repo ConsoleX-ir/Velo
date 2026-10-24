@@ -752,7 +752,7 @@ impl AppState {
     /// one that adopts the verified partial data. No-ops if the user cancelled
     /// or dismissed the pending retry while the timer was sleeping.
     fn fire_scheduled_retry(&self, id: &str, generation: u64) {
-        let (url, destination, resume, old_handle) = {
+        let (url, destination, resume, old_handle, carried_auto_retries) = {
             let mut jobs = lock_jobs(&self.jobs);
             let Some(job) = jobs.get_mut(id) else {
                 return;
@@ -771,6 +771,7 @@ impl AppState {
                 job.destination.clone(),
                 resume,
                 job.handle.take(),
+                job.auto_retries,
             )
         };
         if let Some(handle) = old_handle {
@@ -789,6 +790,11 @@ impl AppState {
                 {
                     let mut jobs = lock_jobs(&self.jobs);
                     jobs.remove(id);
+                    // Carry forward the retry budget so a replacement download
+                    // doesn't get a fresh auto_retries: 0.
+                    if let Some(new_job) = jobs.get_mut(&download.id) {
+                        new_job.auto_retries = carried_auto_retries;
+                    }
                 }
                 self.emit(UiEvent::Removed {
                     id: id.to_owned(),

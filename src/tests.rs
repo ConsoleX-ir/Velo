@@ -43,6 +43,13 @@ impl TestDir {
             DIR_ID.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&path).expect("create unique test directory");
+        // Canonicalize so the returned path matches the UNC form that
+        // canonical_destination produces on Windows. Without this, path
+        // comparisons in open_or_create_temp (same_parent) and assertions
+        // (starts_with) fail because dir.path() is C:\... while
+        // canonical_destination returns \\?\C:\...
+        #[cfg(windows)]
+        let path = fs::canonicalize(&path).expect("canonicalize test directory");
         Self(path)
     }
 

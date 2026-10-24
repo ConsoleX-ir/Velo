@@ -4,7 +4,7 @@ type EmptyStateProps = {
   /** Hero mark image source; defaults to Velo's brand mark. */
   markSrc?: string;
   eyebrow?: string;
-  /** Heading content; wrap emphasis in `<em>` for the cyan accent. */
+  /** Heading content; wrap emphasis in `<em>` for the red accent. */
   title: ReactNode;
   description: string;
   action?: ReactNode;

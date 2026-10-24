@@ -257,9 +257,9 @@ pub(crate) fn join_destination(
             "The file name contains characters Windows does not allow.",
         ));
     }
-    if name.ends_with('.') || name.ends_with(' ') {
+    if name.ends_with('.') {
         return Err(JoinDestinationError::InvalidFileName(
-            "The file name cannot end with a dot or a space.",
+            "The file name cannot end with a dot.",
         ));
     }
     if is_reserved_windows_name(name) {

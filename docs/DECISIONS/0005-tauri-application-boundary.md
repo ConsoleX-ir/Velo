@@ -14,7 +14,7 @@ The tested Rust download engine had no desktop shell or user-facing workflow. Th
 - Let the Tauri service own manager integration, URL/path validation, stable UI identifiers, DTO mapping, lifecycle event publication, cancellation, and terminal acknowledgement.
 - Use explicit Tauri commands and a save-dialog capability. Do not expose generic filesystem or shell access.
 - Keep UI download records in memory for the app session. Acknowledge terminal outcomes only on explicit dismissal; do not imply persistence or recovery.
-- Use CSS tokens for the Aurora Stream themes and motion effects; avoid a UI framework and animation dependency.
+- Use CSS tokens for the Charcoal & signal red themes and motion effects; avoid a UI framework and animation dependency.
 
 ## Consequences
 

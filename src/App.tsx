@@ -266,6 +266,7 @@ function VeloApp() {
       retryDownload(item.id, item.generation)
         .then((replacement) => {
           latestRevision.current.delete(key);
+          keyStates.current.delete(key);
           projectDownload(replacement);
         })
         .catch((error) => push({ title: errorText(error), kind: "error" }))

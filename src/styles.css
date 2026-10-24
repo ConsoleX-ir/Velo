@@ -1,11 +1,15 @@
 @import "tailwindcss";
 
 /*
-  Velo design system — "Aurora, restrained".
-  Deep blue-graphite surfaces, one cyan accent family, violet as counterpoint.
-  Depth comes from hairline borders and small shadows, not glass blur; every
-  interactive element has hover/pressed/focus/disabled states and a pointer
-  cursor. Light theme shares the same token names.
+  Velo design system — "Charcoal & signal red".
+  Neutral charcoal surfaces with warm depth, one restrained red accent family
+  reserved for primary actions, active transfers, selection, and focus.
+  Status colors stay unambiguous: green = completed, amber = waiting/retrying,
+  slate blue = queued, red = failed/cancelled (the same family as the brand
+  accent, disambiguated by icon, label, and context). Depth comes from
+  hairline borders and small shadows — no glass blur, no decorative gradients.
+  Every interactive element has hover/pressed/focus/disabled states and a
+  pointer cursor. Light theme shares the same token names.
 */
 
 @theme inline {
@@ -27,34 +31,36 @@
   font-synthesis: none;
   text-rendering: optimizeLegibility;
 
-  --bg: #0b1017;
-  --surface: #121926;
-  --surface-raised: #182131;
-  --surface-soft: #131c2b;
-  --surface-hover: #1b2637;
-  --titlebar: #0a0f16;
-  --text: #eef3f8;
-  --text-secondary: #b3bfcc;
-  --text-muted: #7f8c9b;
-  --border: rgba(154, 171, 189, 0.13);
-  --border-strong: rgba(154, 171, 189, 0.24);
-  --accent: #5fc7d0;
-  --accent-strong: #7fd8de;
-  --accent-ink: #07242a;
-  --accent-soft: rgba(95, 199, 208, 0.12);
-  --blue: #7fa7d4;
+  --bg: #131316;
+  --surface: #1a1a1f;
+  --surface-raised: #212127;
+  --surface-soft: #17171b;
+  --surface-hover: #26262d;
+  --titlebar: #0f0f12;
+  --text: #f2f3f5;
+  --text-secondary: #babbc4;
+  --text-muted: #84858e;
+  --border: rgba(255, 255, 255, 0.075);
+  --border-strong: rgba(255, 255, 255, 0.14);
+  --accent: #e5484d;
+  --accent-strong: #ee5b60;
+  --accent-ink: #ffffff;
+  --accent-soft: rgba(229, 72, 77, 0.12);
+  --ambient: rgba(229, 72, 77, 0.055);
+  --blue: #8296bc;
+  --blue-soft: rgba(130, 150, 188, 0.13);
   --violet: #a396d6;
-  --violet-soft: rgba(163, 150, 214, 0.14);
-  --green: #63bd93;
-  --green-soft: rgba(99, 189, 147, 0.13);
-  --amber: #d5ad75;
-  --amber-soft: rgba(213, 173, 117, 0.13);
-  --red: #e0848c;
-  --red-soft: rgba(224, 132, 140, 0.12);
-  --focus: #8fd8de;
-  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.24), 0 6px 20px rgba(0, 0, 0, 0.18);
-  --shadow-pop: 0 4px 12px rgba(0, 0, 0, 0.32), 0 16px 44px rgba(0, 0, 0, 0.34);
-  --scrim: rgba(4, 8, 13, 0.58);
+  --violet-soft: rgba(163, 150, 214, 0.13);
+  --green: #58b36f;
+  --green-soft: rgba(88, 179, 111, 0.13);
+  --amber: #d9a552;
+  --amber-soft: rgba(217, 165, 82, 0.13);
+  --red: #e5484d;
+  --red-soft: rgba(229, 72, 77, 0.12);
+  --focus: #ee5b60;
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.28), 0 6px 20px rgba(0, 0, 0, 0.2);
+  --shadow-pop: 0 4px 12px rgba(0, 0, 0, 0.35), 0 16px 44px rgba(0, 0, 0, 0.38);
+  --scrim: rgba(8, 8, 10, 0.6);
   --radius-sm: 8px;
   --radius-md: 12px;
   --radius-lg: 14px;
@@ -65,34 +71,36 @@
 
 :root[data-theme="light"] {
   color-scheme: light;
-  --bg: #eef1f5;
+  --bg: #f2f2f4;
   --surface: #ffffff;
-  --surface-raised: #f5f7fa;
-  --surface-soft: #f2f5f9;
-  --surface-hover: #ecf0f5;
-  --titlebar: #e4e8ee;
-  --text: #1a2531;
-  --text-secondary: #455465;
-  --text-muted: #62707f;
-  --border: rgba(24, 38, 52, 0.13);
-  --border-strong: rgba(24, 38, 52, 0.24);
-  --accent: #0e7c88;
-  --accent-strong: #0a6a75;
+  --surface-raised: #fafafb;
+  --surface-soft: #f6f6f8;
+  --surface-hover: #ececef;
+  --titlebar: #e8e8eb;
+  --text: #1d1d21;
+  --text-secondary: #54555d;
+  --text-muted: #80818a;
+  --border: rgba(22, 22, 26, 0.1);
+  --border-strong: rgba(22, 22, 26, 0.18);
+  --accent: #c93a40;
+  --accent-strong: #b02f35;
   --accent-ink: #ffffff;
-  --accent-soft: rgba(14, 124, 136, 0.1);
-  --blue: #426d9f;
-  --violet: #625b8c;
-  --violet-soft: rgba(98, 91, 140, 0.11);
-  --green: #237b53;
-  --green-soft: rgba(35, 123, 83, 0.1);
-  --amber: #8a5c00;
-  --amber-soft: rgba(138, 92, 0, 0.1);
-  --red: #ab3c47;
-  --red-soft: rgba(171, 60, 71, 0.09);
-  --focus: #0e7c88;
-  --shadow-card: 0 1px 2px rgba(23, 38, 52, 0.08), 0 6px 18px rgba(23, 38, 52, 0.08);
-  --shadow-pop: 0 4px 12px rgba(23, 38, 52, 0.14), 0 16px 40px rgba(23, 38, 52, 0.16);
-  --scrim: rgba(15, 24, 34, 0.4);
+  --accent-soft: rgba(201, 58, 64, 0.09);
+  --ambient: rgba(201, 58, 64, 0.045);
+  --blue: #4a628f;
+  --blue-soft: rgba(74, 98, 143, 0.1);
+  --violet: #625c8f;
+  --violet-soft: rgba(98, 92, 143, 0.1);
+  --green: #1f7a3d;
+  --green-soft: rgba(31, 122, 61, 0.1);
+  --amber: #8f6400;
+  --amber-soft: rgba(143, 100, 0, 0.1);
+  --red: #c0393f;
+  --red-soft: rgba(192, 57, 63, 0.09);
+  --focus: #c93a40;
+  --shadow-card: 0 1px 2px rgba(24, 24, 30, 0.06), 0 6px 18px rgba(24, 24, 30, 0.07);
+  --shadow-pop: 0 4px 12px rgba(24, 24, 30, 0.12), 0 16px 40px rgba(24, 24, 30, 0.14);
+  --scrim: rgba(15, 15, 18, 0.38);
 }
 
 * { box-sizing: border-box; }
@@ -143,16 +151,14 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
   position: relative;
   isolation: isolate;
 }
-/* One quiet aurora, top right. No blur stack. */
+/* One very quiet ember, top right. No blur stack, no second hue. */
 .app-shell::before {
   content: "";
   position: absolute;
   inset: 0;
   z-index: -1;
   pointer-events: none;
-  background:
-    radial-gradient(38rem 20rem at 88% -6%, var(--accent-soft), transparent 68%),
-    radial-gradient(30rem 18rem at -4% 104%, var(--violet-soft), transparent 70%);
+  background: radial-gradient(44rem 22rem at 92% -10%, var(--ambient), transparent 62%);
 }
 
 .app-body {
@@ -241,13 +247,25 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
 .side-nav-item:active { background: var(--surface-soft); }
 .side-nav-item.selected { background: var(--accent-soft); color: var(--text); }
 .side-nav-item.selected svg { color: var(--accent); }
+/* Signal-red rail marking the active destination. */
+.side-nav-item.selected::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 7px;
+  bottom: 7px;
+  width: 3px;
+  border-radius: 999px;
+  background: var(--accent);
+}
 .side-nav-item span:nth-of-type(1) { flex: 1; }
 .side-nav-badge {
   min-width: 20px;
   padding: 1px 6px;
   border-radius: 999px;
-  background: var(--violet-soft);
-  color: var(--violet);
+  border: 1px solid var(--border);
+  background: var(--surface-raised);
+  color: var(--text-secondary);
   font-size: 11px;
   font-weight: 650;
   text-align: center;
@@ -413,8 +431,8 @@ kbd {
 .row-icon.live { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 30%, var(--border)); background: var(--accent-soft); }
 .row-icon.completed { color: var(--green); background: var(--green-soft); border-color: transparent; }
 .row-icon.failed, .row-icon.cancelled { color: var(--red); background: var(--red-soft); border-color: transparent; }
-.row-icon.interrupted { color: var(--amber); background: var(--amber-soft); border-color: transparent; }
-.row-icon.queued { color: var(--violet); background: var(--violet-soft); border-color: transparent; }
+.row-icon.interrupted, .row-icon.retrying, .row-icon.finalizing { color: var(--amber); background: var(--amber-soft); border-color: transparent; }
+.row-icon.queued { color: var(--blue); background: var(--blue-soft); border-color: transparent; }
 
 .row-main { min-width: 0; display: grid; gap: 5px; }
 .row-top { display: flex; align-items: center; gap: 9px; min-width: 0; }
@@ -480,7 +498,7 @@ kbd {
   color: var(--text-muted);
   transition: background 0.12s ease, color 0.12s ease;
 }
-.row-action:hover { background: var(--surface-hover); color: var(--accent); }
+.row-action:hover { background: var(--surface-hover); color: var(--text); }
 .row-action.cancel:hover { background: var(--red-soft); color: var(--red); }
 
 /* progress track */
@@ -499,6 +517,11 @@ kbd {
   transition: width 0.3s ease;
 }
 .progress-track.complete > span { background: var(--green); }
+/* State-tinted fills: paused cools down, waiting goes neutral, retry warms. */
+.download-row.state-paused .progress-track > span { background: color-mix(in srgb, var(--accent) 45%, var(--surface-hover)); }
+.download-row.state-queued .progress-track > span { background: var(--border-strong); }
+.download-row.state-retrying .progress-track > span,
+.download-row.state-interrupted .progress-track > span { background: var(--amber); }
 
 /* state pill */
 .state-pill {
@@ -517,7 +540,7 @@ kbd {
 }
 .pill-dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
 .state-pill.downloading, .state-pill.preparing { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 32%, var(--border)); background: var(--accent-soft); }
-.state-pill.queued { color: var(--violet); background: var(--violet-soft); border-color: transparent; }
+.state-pill.queued { color: var(--blue); background: var(--blue-soft); border-color: transparent; }
 .state-pill.completed { color: var(--green); background: var(--green-soft); border-color: transparent; }
 .state-pill.failed, .state-pill.cancelled { color: var(--red); background: var(--red-soft); border-color: transparent; }
 .state-pill.interrupted, .state-pill.retrying { color: var(--amber); background: var(--amber-soft); border-color: transparent; }
@@ -744,11 +767,11 @@ kbd {
   border: 1px solid transparent;
   color: var(--accent-ink);
   background: var(--accent);
-  box-shadow: inset 0 1px rgba(255, 255, 255, 0.14), 0 1px 3px rgba(0, 0, 0, 0.2);
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.16), 0 1px 3px rgba(0, 0, 0, 0.22);
 }
 .primary-button:hover:not(:disabled) { background: var(--accent-strong); }
 .primary-button:active:not(:disabled) { background: var(--accent); }
-:root[data-theme="light"] .primary-button { box-shadow: 0 1px 3px rgba(14, 124, 136, 0.35); }
+:root[data-theme="light"] .primary-button { box-shadow: 0 1px 3px rgba(201, 58, 64, 0.32); }
 .secondary-button {
   border: 1px solid var(--border-strong);
   color: var(--text-secondary);
@@ -780,7 +803,7 @@ kbd {
   color: var(--accent);
   background: var(--accent-soft);
 }
-.settings-icon.behavior { color: var(--blue); background: color-mix(in srgb, var(--blue) 12%, transparent); }
+.settings-icon.behavior { color: var(--blue); background: var(--blue-soft); }
 .settings-icon.appearance { color: var(--amber); background: var(--amber-soft); }
 .settings-icon.motion { color: var(--violet); background: var(--violet-soft); }
 .settings-copy { flex: 1; min-width: 0; display: grid; gap: 3px; }
@@ -845,8 +868,8 @@ kbd {
   background: var(--text-muted);
   transition: transform 0.18s ease, background 0.18s ease;
 }
-.toggle.on { border-color: var(--accent); background: var(--accent-soft); }
-.toggle.on span { transform: translateX(16px); background: var(--accent); }
+.toggle.on { border-color: var(--accent); background: var(--accent); }
+.toggle.on span { transform: translateX(16px); background: #ffffff; }
 
 .privacy-note {
   display: flex;
@@ -865,8 +888,8 @@ kbd {
   display: grid;
   place-items: center;
   border-radius: 9px;
-  color: var(--accent);
-  background: var(--accent-soft);
+  color: var(--green);
+  background: var(--green-soft);
 }
 .privacy-note div:last-child { display: grid; gap: 3px; }
 .privacy-note strong { font-size: 12px; }

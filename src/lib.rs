@@ -2113,7 +2113,7 @@ fn destination_equal(left: &Path, right: &Path) -> bool {
                 1,
             )
         };
-        comparison == 2 || comparison == 0
+        comparison == 2
     }
     #[cfg(not(windows))]
     {

@@ -44,7 +44,7 @@ export type SettingsDto = {
   effectiveDownloadDir: string | null;
 };
 
-export const APP_VERSION = "0.4.0";
+export const APP_VERSION = "0.5.0";
 
 export const SPEED_SAMPLE_INTERVAL_MS = 1_000;
 export const SPEED_HISTORY_LIMIT = 36;
