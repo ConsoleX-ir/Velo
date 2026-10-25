@@ -13,6 +13,7 @@ import { Spinner } from "./components/ui/spinner";
 import { ToastProvider, useToast } from "./components/ui/toast";
 import { Button } from "./components/ui/button";
 import { Icon } from "./components/icons";
+import { errorText } from "./lib/utils";
 import {
   acknowledgeDownload,
   cancelDownload as cancelDownloadCommand,
@@ -52,11 +53,6 @@ const VIEW_COPY: Record<Exclude<DownloadView, "settings">, { title: string; subt
   queue: { title: "Queue", subtitle: "Waiting for one of the available transfer slots." },
   completed: { title: "Completed", subtitle: "Files saved to disk. The list is stored locally." },
 };
-
-function errorText(error: unknown): string {
-  if (typeof error === "object" && error !== null && "message" in error) return String(error.message);
-  return typeof error === "string" ? error : "Something went wrong. Please try again.";
-}
 
 export default function App() {
   return (

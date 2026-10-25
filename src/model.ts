@@ -44,7 +44,7 @@ export type SettingsDto = {
   effectiveDownloadDir: string | null;
 };
 
-export const APP_VERSION = "0.5.0";
+export const APP_VERSION = "0.6.0";
 
 export const SPEED_SAMPLE_INTERVAL_MS = 1_000;
 export const SPEED_HISTORY_LIMIT = 36;
@@ -99,7 +99,7 @@ export function selectDownloads(items: DownloadDto[], view: DownloadView, filter
   if (view !== "downloads") return [];
   switch (filter) {
     case "active":
-      return items.filter((item) => item.state === "downloading" || item.state === "preparing" || item.state === "pausing" || item.state === "paused" || item.state === "cancelling" || item.state === "finalizing" || item.state === "retrying");
+      return items.filter((item) => item.state === "downloading" || item.state === "preparing" || item.state === "pausing" || item.state === "cancelling" || item.state === "finalizing" || item.state === "retrying");
     case "queued":
       return items.filter((item) => item.state === "queued");
     case "paused":

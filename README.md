@@ -53,7 +53,7 @@ npm ci
 npm run tauri build
 ```
 
-The NSIS installer is written to `src-tauri\target\release\bundle\nsis\ConsoleX Velo_0.4.0_x64-setup.exe`. See [scripts/build-windows-installer.ps1](scripts/build-windows-installer.ps1) for prerequisite checks and options.
+The NSIS installer is written to `src-tauri\target\release\bundle\nsis\ConsoleX Velo_0.6.0_x64-setup.exe`. See [scripts/build-windows-installer.ps1](scripts/build-windows-installer.ps1) for prerequisite checks and options.
 
 ## Current product limits
 

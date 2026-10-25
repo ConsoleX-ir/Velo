@@ -6,3 +6,8 @@
 export function cn(...inputs: Array<string | false | null | undefined>): string {
   return inputs.filter(Boolean).join(" ");
 }
+
+export function errorText(error: unknown): string {
+  if (typeof error === "object" && error !== null && "message" in error) return String(error.message);
+  return typeof error === "string" ? error : "Something went wrong. Please try again.";
+}

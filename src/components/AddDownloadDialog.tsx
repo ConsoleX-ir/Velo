@@ -10,11 +10,7 @@ import {
   type DownloadDto,
   type SettingsDto,
 } from "../model";
-
-function errorText(error: unknown): string {
-  if (typeof error === "object" && error !== null && "message" in error) return String(error.message);
-  return typeof error === "string" ? error : "Something went wrong. Please try again.";
-}
+import { errorText } from "../lib/utils";
 
 type AddDownloadDialogProps = {
   settings: SettingsDto | null;
