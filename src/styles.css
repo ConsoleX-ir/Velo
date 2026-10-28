@@ -9,8 +9,8 @@
   completed, amber = waiting/retrying, slate blue = queued, red =
   failed/cancelled (disambiguated from the accent by icon, label, and
   context). Depth comes from layered surfaces, hairline borders, small
-  shadows and — deliberately, sparingly — the living aurora canvas behind
-  the main area. Every interactive element has hover/pressed/focus/disabled
+  shadows and — deliberately, sparingly — the static aurora field behind
+  the main area, whose pointer spotlight is the only moving light. Every interactive element has hover/pressed/focus/disabled
   states and a pointer cursor. The light theme is its own composition: an
   ice-mist daytime palette where the aurora reads as a cool sky wash, not an
   inverted dark theme. Token names are shared between both themes.
@@ -68,7 +68,6 @@
   --accent-strong: #6bd7fa;
   --accent-ink: #04121e;
   --accent-soft: rgba(70, 200, 242, 0.12);
-  --ambient: rgba(93, 110, 255, 0.075);
   --blue: #7fa3e8;
   --blue-soft: rgba(127, 163, 232, 0.13);
   --violet: #a08df0;
@@ -109,7 +108,6 @@
   --accent-strong: #056aa6;
   --accent-ink: #ffffff;
   --accent-soft: rgba(7, 121, 189, 0.1);
-  --ambient: rgba(88, 118, 235, 0.07);
   --blue: #3f639b;
   --blue-soft: rgba(63, 99, 155, 0.1);
   --violet: #6a5fd0;
@@ -176,22 +174,10 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
   isolation: isolate;
 }
 /*
-  Atmospheric base layer. The integrated ShaderBackground canvas (when motion
-  is allowed) renders the living aurora; these two pseudo-layers keep the
-  composition grounded without it — a two-hue ambient glow as the reduced-
-  motion fallback, and a top/bottom scrim that lets chrome and content sit
-  calmly over either backdrop.
+  Atmospheric base layer. The aurora field (AuroraBackground) paints the
+  static turquoise/violet composition; this scrim sits above it and lets
+  chrome and content sit calmly over the backdrop.
 */
-.app-shell::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  z-index: -1;
-  pointer-events: none;
-  background:
-    radial-gradient(46rem 26rem at 88% -12%, var(--ambient), transparent 62%),
-    radial-gradient(34rem 20rem at -10% 112%, var(--accent-soft), transparent 58%);
-}
 .app-shell::after {
   content: "";
   position: absolute;
@@ -202,18 +188,74 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
     linear-gradient(180deg, color-mix(in srgb, var(--bg) 66%, transparent), transparent 30%),
     linear-gradient(0deg, color-mix(in srgb, var(--bg) 52%, transparent), transparent 24%);
 }
-/* The aurora canvas itself. Mounted behind everything, faded so type and
-   surfaces stay dominant; the light theme reads it as a cool sky wash. */
-.shader-backdrop {
+
+/* --------------------------------------------------------------- aurora */
+
+/*
+  "Aurora Stream" backdrop — pure CSS, no canvas, no animation loop. Static
+  duotone fields: turquoise streams from the upper right, violet pools low
+  left, a faint cyan wash along the top edge; painted once on a single
+  element and themed through custom properties, so an idle background costs
+  nothing. The light theme keeps the same composition as a much fainter cool
+  wash rather than turning the scene dark.
+*/
+.aurora-bg {
+  --aurora-cyan: rgba(70, 200, 242, 0.14);
+  --aurora-violet: rgba(160, 141, 240, 0.12);
+  --aurora-wash: rgba(70, 200, 242, 0.05);
+  --aurora-spot-cyan: rgba(70, 200, 242, 0.17);
+  --aurora-spot-violet: rgba(160, 141, 240, 0.14);
   position: absolute;
   inset: 0;
   z-index: -1;
+  overflow: hidden;
   pointer-events: none;
-  opacity: 0.5;
+  /* Contain pointer-driven style work to this subtree. */
+  contain: layout paint;
+  background:
+    radial-gradient(46rem 30rem at 84% -12%, var(--aurora-cyan), transparent 64%),
+    radial-gradient(40rem 26rem at -12% 110%, var(--aurora-violet), transparent 62%),
+    radial-gradient(36rem 9rem at 46% -6%, var(--aurora-wash), transparent 72%);
 }
-:root[data-theme="light"] .shader-backdrop {
-  opacity: 0.26;
-  filter: saturate(1.12) brightness(1.4);
+:root[data-theme="light"] .aurora-bg {
+  --aurora-cyan: rgba(7, 121, 189, 0.07);
+  --aurora-violet: rgba(106, 95, 208, 0.06);
+  --aurora-wash: rgba(7, 121, 189, 0.03);
+  --aurora-spot-cyan: rgba(7, 121, 189, 0.08);
+  --aurora-spot-violet: rgba(106, 95, 208, 0.07);
+}
+
+/*
+  Pointer spotlight: one shared duotone glow centred on the pointer via a
+  composited transform driven by --spot-x/--spot-y, which AuroraBackground
+  writes straight to this element (never React state). The transform
+  transition provides the soft trailing follow and finishes on its own when
+  the pointer settles; opacity fades the light in and out around window
+  entry, exit, and focus loss. Reduced-motion environments never mount it.
+*/
+.aurora-spot {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 46rem;
+  height: 46rem;
+  margin: -23rem 0 0 -23rem;
+  border-radius: 50%;
+  pointer-events: none;
+  background:
+    radial-gradient(closest-side at 40% 40%, var(--aurora-spot-cyan), transparent 68%),
+    radial-gradient(closest-side at 62% 62%, var(--aurora-spot-violet), transparent 74%);
+  transform: translate3d(var(--spot-x, 50vw), var(--spot-y, 40vh), 0);
+  opacity: 0;
+  transition: transform 0.55s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.6s ease;
+  will-change: transform;
+}
+.aurora-spot[data-shown="true"] { opacity: 1; }
+/* First sighting snaps under the pointer — position only; the fade still runs. */
+.aurora-spot.aurora-spot-snap { transition-property: opacity; }
+/* OS-level reduced motion: keep the static field, drop the moving light. */
+@media (prefers-reduced-motion: reduce) {
+  .aurora-spot { display: none; }
 }
 
 .app-body {
@@ -270,7 +312,7 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
   flex-direction: column;
   padding: 14px 10px 12px;
   border-right: 1px solid var(--border);
-  /* Liquid-glass rail: the aurora canvas smears through a cool tinted pane.
+  /* Liquid-glass rail: the aurora field smears through a cool tinted pane.
      Saturating blur keeps the smear luminous without stealing contrast, and
      a hairline catch-light on the trailing edge crisps the glass rim. */
   background: color-mix(in srgb, var(--surface-soft) 46%, transparent);
@@ -472,7 +514,7 @@ kbd {
 
 /*
   "Stream glass" download card. Each row is its own frosted pane over the
-  aurora canvas: a saturating blur puts the aurora out of focus behind the
+  aurora field: a saturating blur puts the aurora out of focus behind the
   card, a translucent surface keeps type dominant, and a top catch-light
   rims the pane like polished glass. Actively moving transfers (downloading /
   preparing) are the special case — their glass picks up an accent tint and

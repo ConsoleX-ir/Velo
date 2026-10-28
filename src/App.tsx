@@ -12,7 +12,7 @@ import { EmptyState, FilteredEmpty } from "./components/ui/empty-state";
 import { AILoader } from "./components/ui/ai-loader";
 import { DateTimeField } from "./components/ui/date-time-picker";
 import { LiquidNavbar } from "./components/ui/liquid-glass-navbar";
-import { ShaderBackground } from "./components/ui/manu";
+import { AuroraBackground } from "./components/ui/aurora-background";
 import type { SegmentedOption } from "./components/ui/segmented";
 import { ToastProvider, useToast } from "./components/ui/toast";
 import { Button } from "./components/ui/button";
@@ -350,7 +350,9 @@ function VeloApp() {
 
   return (
     <div className="app-shell">
-      {!reducedMotion && <ShaderBackground className="shader-backdrop" />}
+      {/* Static CSS aurora field; the pointer-reactive spotlight layer is
+          mounted only when motion is allowed. Replaces the WebGL shader. */}
+      <AuroraBackground interactive={!reducedMotion} />
       <TitleBar />
       <div className="app-body">
         <Sidebar view={view} onView={setView} downloads={downloads} />
