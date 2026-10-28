@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use super::persistence;
 
-const SETTINGS_VERSION: u32 = 1;
+const SETTINGS_VERSION: u32 = 2;
 
 /// What the settings store can hold today. Bump `SETTINGS_VERSION` and add a
 /// `#[serde(default)]` field when the shape grows.
@@ -29,6 +29,8 @@ struct StoredSettings {
     version: u32,
     #[serde(default)]
     default_download_dir: Option<String>,
+    #[serde(default)]
+    global_speed_limit_bytes_per_second: Option<u64>,
 }
 
 impl Default for StoredSettings {
@@ -36,6 +38,7 @@ impl Default for StoredSettings {
         Self {
             version: SETTINGS_VERSION,
             default_download_dir: None,
+            global_speed_limit_bytes_per_second: None,
         }
     }
 }
@@ -54,6 +57,7 @@ pub(crate) struct SettingsDto {
     /// Where new downloads go without a per-download override: the saved
     /// default while it stays valid, otherwise the OS Downloads folder.
     pub(crate) effective_download_dir: Option<String>,
+    pub(crate) global_speed_limit_bytes_per_second: Option<u64>,
 }
 
 /// Command-shaped error so the Tauri shell can pass it to the webview
@@ -78,6 +82,13 @@ impl SettingsError {
             code: "settings_unavailable",
             message: "Velo could not save the settings. The choice applies to this session only."
                 .into(),
+        }
+    }
+
+    fn invalid_setting(message: impl Into<String>) -> Self {
+        Self {
+            code: "invalid_setting",
+            message: message.into(),
         }
     }
 }
@@ -139,6 +150,21 @@ impl SettingsState {
         Ok(self.snapshot(&inner))
     }
 
+    pub(crate) fn set_speed_limit(&self, limit: Option<u64>) -> Result<SettingsDto, SettingsError> {
+        if limit == Some(0) || limit.is_some_and(|value| value > 1_073_741_824) {
+            return Err(SettingsError::invalid_setting(
+                "Choose a speed limit from 1 byte/s to 1 GiB/s, or turn the limit off.",
+            ));
+        }
+        let mut inner = self.lock();
+        inner.global_speed_limit_bytes_per_second = limit;
+        save(&self.store_path, &inner).map_err(|error| {
+            eprintln!("Could not save the Velo settings: {error}");
+            SettingsError::store_unavailable()
+        })?;
+        Ok(self.snapshot(&inner))
+    }
+
     fn snapshot(&self, inner: &StoredSettings) -> SettingsDto {
         let stored_dir_valid = inner
             .default_download_dir
@@ -154,6 +180,7 @@ impl SettingsState {
                 .as_deref()
                 .map(|path| path.to_string_lossy().into_owned()),
             effective_download_dir,
+            global_speed_limit_bytes_per_second: inner.global_speed_limit_bytes_per_second,
         }
     }
 
@@ -184,12 +211,15 @@ fn load(path: &Path) -> std::io::Result<StoredSettings> {
     };
     let stored = serde_json::from_slice::<StoredSettings>(&bytes)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    if stored.version != SETTINGS_VERSION {
+    if stored.version > SETTINGS_VERSION || stored.version == 0 {
         // Unknown future shape: keep nothing rather than guess. The user can
         // pick the directory again; downloads are unaffected.
         return Ok(StoredSettings::default());
     }
-    Ok(stored)
+    Ok(StoredSettings {
+        version: SETTINGS_VERSION,
+        ..stored
+    })
 }
 
 fn save(path: &Path, stored: &StoredSettings) -> std::io::Result<()> {
@@ -329,6 +359,55 @@ mod tests {
     }
 
     #[test]
+    fn global_speed_limit_persists_and_can_be_disabled() {
+        let dir = test_dir();
+        let path = store_path(&dir);
+        let state = SettingsState::build(path.clone(), None);
+        assert_eq!(
+            state
+                .set_speed_limit(Some(256 * 1024))
+                .unwrap()
+                .global_speed_limit_bytes_per_second,
+            Some(256 * 1024)
+        );
+        let restarted = SettingsState::build(path.clone(), None);
+        assert_eq!(
+            restarted.get().global_speed_limit_bytes_per_second,
+            Some(256 * 1024)
+        );
+        assert_eq!(
+            restarted
+                .set_speed_limit(None)
+                .unwrap()
+                .global_speed_limit_bytes_per_second,
+            None
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn version_one_settings_migrate_without_losing_the_folder() {
+        let dir = test_dir();
+        let path = store_path(&dir);
+        fs::write(
+            &path,
+            serde_json::json!({ "version": 1, "default_download_dir": dir.to_string_lossy() })
+                .to_string(),
+        )
+        .unwrap();
+        let state = SettingsState::build(path.clone(), None);
+        assert_eq!(
+            state.get().default_download_dir.as_deref(),
+            Some(dir.to_string_lossy().as_ref())
+        );
+        assert_eq!(state.get().global_speed_limit_bytes_per_second, None);
+        state.set_speed_limit(Some(1024)).unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(stored["version"], 2);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn missing_store_starts_with_the_os_default() {
         let dir = test_dir();
         let os_default = dir.join("system-downloads");
@@ -379,6 +458,7 @@ mod tests {
         let broken = StoredSettings {
             version: SETTINGS_VERSION,
             default_download_dir: Some(dir.join("gone-velo").to_string_lossy().into_owned()),
+            global_speed_limit_bytes_per_second: None,
         };
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, serde_json::to_vec(&broken).unwrap()).unwrap();

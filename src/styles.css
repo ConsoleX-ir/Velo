@@ -541,6 +541,7 @@ kbd {
 .pill-dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
 .state-pill.downloading, .state-pill.preparing { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 32%, var(--border)); background: var(--accent-soft); }
 .state-pill.queued { color: var(--blue); background: var(--blue-soft); border-color: transparent; }
+.state-pill.scheduled { color: var(--amber); background: var(--amber-soft); border-color: transparent; }
 .state-pill.completed { color: var(--green); background: var(--green-soft); border-color: transparent; }
 .state-pill.failed, .state-pill.cancelled { color: var(--red); background: var(--red-soft); border-color: transparent; }
 .state-pill.interrupted, .state-pill.retrying { color: var(--amber); background: var(--amber-soft); border-color: transparent; }

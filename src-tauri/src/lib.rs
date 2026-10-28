@@ -52,11 +52,43 @@ async fn start_download(
     url: String,
     directory: String,
     file_name: String,
+    speed_limit_bytes_per_second: Option<u64>,
 ) -> Result<service::DownloadDto, service::CommandError> {
     state
         .inner()
         .clone()
-        .begin_download(url, directory, file_name)
+        .begin_download(url, directory, file_name, speed_limit_bytes_per_second)
+}
+
+#[tauri::command]
+fn schedule_download(
+    state: State<'_, AppState>,
+    url: String,
+    directory: String,
+    file_name: String,
+    scheduled_at_unix_ms: u64,
+    speed_limit_bytes_per_second: Option<u64>,
+) -> Result<service::DownloadDto, service::CommandError> {
+    state.inner().clone().schedule_download(
+        url,
+        directory,
+        file_name,
+        scheduled_at_unix_ms,
+        speed_limit_bytes_per_second,
+    )
+}
+
+#[tauri::command]
+fn edit_download_schedule(
+    state: State<'_, AppState>,
+    id: String,
+    generation: u64,
+    scheduled_at_unix_ms: u64,
+) -> Result<service::DownloadDto, service::CommandError> {
+    state
+        .inner()
+        .clone()
+        .edit_schedule(&id, generation, scheduled_at_unix_ms)
 }
 
 /// User-facing one-shot message when the saved history needed repair.
@@ -130,6 +162,17 @@ fn clear_default_directory(
     settings.clear_default()
 }
 
+#[tauri::command]
+fn set_global_speed_limit(
+    state: State<'_, AppState>,
+    settings: State<'_, SettingsState>,
+    bytes_per_second: Option<u64>,
+) -> Result<settings::SettingsDto, settings::SettingsError> {
+    let updated = settings.set_speed_limit(bytes_per_second)?;
+    state.set_speed_limit(bytes_per_second);
+    Ok(updated)
+}
+
 fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "velo-show", "Show Velo", true, None::<&str>)?;
     let hide = MenuItem::with_id(app, "velo-hide", "Hide Velo", true, None::<&str>)?;
@@ -184,6 +227,13 @@ pub fn run() {
             let manager = tauri::async_runtime::block_on(async { DownloadManager::new() })?;
             let data_dir = app.path().app_data_dir()?;
             let store_path = data_dir.join("downloads.json");
+            let settings = SettingsState::build(
+                data_dir.join("settings.json"),
+                app.path().download_dir().ok(),
+            );
+            manager.set_global_speed_limit_bytes_per_second(
+                settings.get().global_speed_limit_bytes_per_second,
+            );
             let handle = app.handle().clone();
             let publish: Arc<dyn Fn(UiEvent) + Send + Sync> = Arc::new(move |event| match event {
                 UiEvent::Updated(download) => {
@@ -197,23 +247,17 @@ pub fn run() {
                     );
                 }
             });
-            app.manage(AppState::build(
-                manager,
-                store_path,
-                publish,
-                service::RETRY_BACKOFF_BASE,
-            ));
-            let os_downloads = app.path().download_dir().ok();
-            app.manage(SettingsState::build(
-                data_dir.join("settings.json"),
-                os_downloads,
-            ));
+            let state = AppState::build(manager, store_path, publish, service::RETRY_BACKOFF_BASE);
+            app.manage(state);
+            app.manage(settings);
             build_tray(app)?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             list_downloads,
             start_download,
+            schedule_download,
+            edit_download_schedule,
             get_history_notice,
             cancel_download,
             pause_download,
@@ -222,7 +266,8 @@ pub fn run() {
             acknowledge_download,
             get_settings,
             set_default_directory,
-            clear_default_directory
+            clear_default_directory,
+            set_global_speed_limit
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {

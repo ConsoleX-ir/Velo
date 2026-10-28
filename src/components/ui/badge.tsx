@@ -6,6 +6,7 @@ import type { DownloadState } from "../../model";
  */
 export const STATE_LABELS: Record<DownloadState, string> = {
   queued: "Queued",
+  scheduled: "Scheduled",
   preparing: "Preparing",
   downloading: "Downloading",
   pausing: "Pausing",

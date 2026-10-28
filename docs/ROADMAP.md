@@ -44,7 +44,7 @@
 - Connect UI to tested engine; test event ordering/backpressure and packaged standard-user behavior.
 - Decide exact Windows support matrix, installer type, WebView2 strategy, app identity, signing, and distribution.
 
-Implementation now present: local Tauri shell, responsive Charcoal & signal red UI rebuilt on a local dependency-free component set (dialog, tooltip, segmented control, switch, toast, state pill, progress, spinner, empty state) with keyboard accessibility and reduced-motion support, native save-dialog workflow, typed command DTOs, manager-backed list/start/cancel/pause/resume/retry/dismiss flow, theme and reduced-motion preferences, persisted local history with DPAPI-protected URLs, plus frontend and native service tests. Restarted in-progress jobs are marked Interrupted; manual retry re-verifies the persisted partial and checkpoint and continues from the verified offset when the server allows it, falling back to byte zero otherwise. Transient failures auto-retry on a bounded backoff schedule. Categories and file opening remain unsupported. Windows installer smoke testing and interactive GUI validation remain release gates.
+Implementation now present: local Tauri shell, responsive Charcoal & signal red UI, typed IPC, manager-backed list/start/cancel/pause/resume/retry/dismiss flow, user schedules with edit/cancel and startup restoration, persisted aggregate bandwidth cap, durable history with DPAPI-protected URLs, and bounded concurrent HTTP Range downloads with strict validation and single-stream fallback. Restarted in-progress jobs are marked Interrupted; manual retry re-verifies partial/checkpoint state and uses a byte-zero fallback when needed. Transient failures auto-retry with bounded backoff. Categories and file opening remain unsupported. Windows packaging and interactive GUI validation remain release gates.
 
 ## Phase 3 — Durable metadata and startup recovery (implemented without SQLite)
 
@@ -53,11 +53,13 @@ Implementation now present: local Tauri shell, responsive Charcoal & signal red 
 - Partial files are never trusted implicitly: adoption requires on-disk re-verification plus server revalidation before any append, with a documented byte-zero fallback.
 - SQLite remains deferred unless filtering/query volume or concurrent writers outgrow the snapshot model.
 
-## Phase 4 — Resume and concurrency
+## Phase 4 — Resume and concurrency (implemented)
 
 - Single-stream durable resume is implemented: persisted temp/checkpoint adoption validated on disk (same directory, regular file, length at or beyond the persisted counter, below the recorded total) and revalidated with the server (`If-Range`, `206`, matching `Content-Range`); every failure mode falls back to a documented byte-zero restart.
-- Segmented downloads and adaptive concurrency remain future work and only behind measured evidence.
-- Revisit user/global/host concurrency limits only after benchmarks and clear resource budgets; Phase 1 already has a fixed provisional admission cap.
+- Large fresh jobs use up to four validated concurrent HTTP Range requests and assemble into an exclusive temporary output; unsupported or unsafe responses fall back to a full GET. Segmentation is disabled when the global rate cap is active.
+- The persisted global bandwidth cap is enforced as one aggregate limit across active jobs; users can set an additional per-download cap in the add dialog.
+- User-controlled scheduled jobs persist in the history snapshot and submit through the same active/retained limits when due.
+- Adaptive or host-specific concurrency remains future work pending benchmarks and resource budgets; admission defaults remain four active transfers and 100 retained records.
 
 ## Phase 5 — Release hardening and ecosystem integrations
 

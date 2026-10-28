@@ -160,8 +160,37 @@ describe("application shell", () => {
       url: "https://example.test/setup.exe",
       directory: "C:\\Users\\me\\Downloads",
       fileName: "setup.exe",
+      speedLimitBytesPerSecond: null,
     });
     expect(container.textContent).toContain("Download started");
+  });
+
+  it("schedules downloads through the native command with a local time converted to an absolute instant", async () => {
+    await act(async () => {
+      [...container.querySelectorAll("button")].find((button) => button.textContent?.includes("Add download"))?.click();
+    });
+    const url = container.querySelector<HTMLInputElement>("#download-url");
+    await act(async () => typeInput(url!, "https://example.test/nightly.zip"));
+    const date = new Date(Date.now() + 3_600_000);
+    const pad = (part: number) => String(part).padStart(2, "0");
+    const localValue = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+    const schedule = container.querySelector<HTMLInputElement>("#download-schedule");
+    await act(async () => typeInput(schedule!, localValue));
+    await act(async () => typeInput(container.querySelector<HTMLInputElement>("#download-speed-limit")!, "64"));
+    const expectedMs = new Date(localValue).getTime();
+    invokeMock.mockResolvedValueOnce(download({ id: "scheduled", state: "scheduled", scheduledAtUnixMs: expectedMs }));
+    await act(async () => {
+      container.querySelector("form")?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      await Promise.resolve();
+    });
+    expect(invokeMock).toHaveBeenCalledWith("schedule_download", {
+      url: "https://example.test/nightly.zip",
+      directory: "C:\\Users\\me\\Downloads",
+      fileName: "nightly.zip",
+      scheduledAtUnixMs: expectedMs,
+      speedLimitBytesPerSecond: 64 * 1024,
+    });
+    expect(container.textContent).toContain("Download scheduled");
   });
 
   it("lets one download override the folder without touching the default", async () => {
@@ -188,6 +217,7 @@ describe("application shell", () => {
       url: "https://example.test/pack.zip",
       directory: "D:\\Archive",
       fileName: "pack.zip",
+      speedLimitBytesPerSecond: null,
     });
   });
 
@@ -294,6 +324,28 @@ describe("application shell", () => {
     await act(async () => retry?.click());
     expect(invokeMock).toHaveBeenCalledWith("retry_download", { id: "job-7", generation: 2 });
     expect(container.querySelector('[role="menu"]')).toBeNull();
+  });
+
+  it("edits a scheduled download through the context menu and native command", async () => {
+    const scheduledAtUnixMs = Date.now() + 3_600_000;
+    await act(async () => eventListener?.({ payload: download({ state: "scheduled", scheduledAtUnixMs }) }));
+    const row = container.querySelector("article.download-row");
+    await act(async () => row?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 40, clientY: 60 })));
+    const edit = [...container.querySelectorAll<HTMLButtonElement>('[role="menu"] button')].find((button) => button.textContent?.includes("Edit schedule"));
+    await act(async () => edit?.click());
+    const input = container.querySelector<HTMLInputElement>("#edit-schedule-time");
+    expect(input).toBeDefined();
+    const date = new Date(Date.now() + 7_200_000);
+    const pad = (part: number) => String(part).padStart(2, "0");
+    const localValue = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+    await act(async () => typeInput(input!, localValue));
+    const expectedMs = new Date(localValue).getTime();
+    invokeMock.mockResolvedValueOnce(download({ state: "scheduled", revision: 2, scheduledAtUnixMs: expectedMs }));
+    await act(async () => {
+      container.querySelector("form")?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      await Promise.resolve();
+    });
+    expect(invokeMock).toHaveBeenCalledWith("edit_download_schedule", { id: "job-1", generation: 1, scheduledAtUnixMs: expectedMs });
   });
 
   it("moves the downloads filter when ArrowRight is pressed on the selected radio", async () => {

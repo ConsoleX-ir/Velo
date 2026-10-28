@@ -6,7 +6,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc, Barrier,
+        Arc, Barrier, Mutex,
     },
     task::{Context, Poll},
     time::{Duration, Instant},
@@ -1854,6 +1854,8 @@ fn managed_request(id: &str, url: String, destination: PathBuf) -> DownloadReque
         url,
         destination,
         resume: None,
+        speed_limit_bytes_per_second: None,
+        segmented: false,
     }
 }
 
@@ -1872,6 +1874,67 @@ async fn wait_for_terminal(
     })
     .await
     .expect("terminal result should be committed")
+}
+
+#[tokio::test]
+async fn manager_enforces_a_per_download_speed_limit() {
+    let payload = vec![7_u8; 24 * 1024];
+    let (url, server) = serve_once(response(
+        "200 OK",
+        &format!("Content-Length: {}\r\nConnection: close\r\n", payload.len()),
+        &payload,
+    ))
+    .await;
+    let dir = TestDir::new();
+    let manager = DownloadManager::new().unwrap();
+    let mut request = managed_request("rate-limited", url, dir.path().join("limited.bin"));
+    request.speed_limit_bytes_per_second = Some(12 * 1024);
+    let started = Instant::now();
+    let handle = manager.start(request).unwrap();
+    let result = wait_for_terminal(&manager, &handle).await;
+    server.await.unwrap();
+    assert_eq!(result.state, DownloadState::Completed);
+    assert!(started.elapsed() >= Duration::from_millis(1_700));
+    assert_eq!(fs::read(dir.path().join("limited.bin")).unwrap(), payload);
+}
+
+#[tokio::test]
+async fn global_speed_limit_is_shared_across_concurrent_downloads() {
+    let payload = vec![9_u8; 24 * 1024];
+    let (url_a, server_a) = serve_once(response(
+        "200 OK",
+        &format!("Content-Length: {}\r\nConnection: close\r\n", payload.len()),
+        &payload,
+    ))
+    .await;
+    let (url_b, server_b) = serve_once(response(
+        "200 OK",
+        &format!("Content-Length: {}\r\nConnection: close\r\n", payload.len()),
+        &payload,
+    ))
+    .await;
+    let dir = TestDir::new();
+    let manager = DownloadManager::new().unwrap();
+    manager.set_global_speed_limit_bytes_per_second(Some(12 * 1024));
+    let mut request_a = managed_request("global-a", url_a, dir.path().join("a.bin"));
+    let mut request_b = managed_request("global-b", url_b, dir.path().join("b.bin"));
+    request_a.segmented = true;
+    request_b.segmented = true;
+    let a = manager.start(request_a).unwrap();
+    let b = manager.start(request_b).unwrap();
+    let started = Instant::now();
+    let (result_a, result_b) = tokio::join!(
+        wait_for_terminal(&manager, &a),
+        wait_for_terminal(&manager, &b)
+    );
+    server_a.await.unwrap();
+    server_b.await.unwrap();
+    assert_eq!(result_a.state, DownloadState::Completed);
+    assert_eq!(result_b.state, DownloadState::Completed);
+    assert!(
+        started.elapsed() >= Duration::from_millis(3_500),
+        "global cap must not be multiplied by active jobs"
+    );
 }
 
 async fn serve_generated_body(
@@ -1915,6 +1978,206 @@ async fn serve_generated_body(
         }
     });
     (address, peak_active, server)
+}
+
+async fn serve_segmented_resource() -> (String, Arc<AtomicUsize>, JoinHandle<Vec<String>>, Vec<u8>)
+{
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let payload: Vec<u8> = (0..4 * 1024 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    let shared_payload = Arc::new(payload.clone());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let server_requests = requests.clone();
+    let server_active = active.clone();
+    let server_peak = peak.clone();
+    let server_body = shared_payload.clone();
+    let task = tokio::spawn(async move {
+        let mut workers = tokio::task::JoinSet::new();
+        for _ in 0..5 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let observed = server_requests.clone();
+            let active = server_active.clone();
+            let peak = server_peak.clone();
+            let body = server_body.clone();
+            workers.spawn(async move {
+                let mut stream = stream;
+                let request = read_request(&mut stream).await;
+                observed.lock().unwrap().push(request.clone());
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(current, Ordering::SeqCst);
+                let range = request.lines().find_map(|line| {
+                    line.to_ascii_lowercase().strip_prefix("range: bytes=").map(str::to_owned)
+                }).expect("Range header is sent");
+                let (start, end) = range.split_once('-').unwrap();
+                let start: usize = start.parse().unwrap();
+                let end: usize = end.parse().unwrap();
+                let response_body = &body[start..=end];
+                let headers = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\nETag: \"stable\"\r\nConnection: close\r\n\r\n",
+                    body.len(), response_body.len()
+                );
+                stream.write_all(headers.as_bytes()).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                stream.write_all(response_body).await.unwrap();
+                let _ = stream.shutdown().await;
+                active.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+        while workers.join_next().await.is_some() {}
+        requests.lock().unwrap().clone()
+    });
+    (format!("http://{address}/large"), peak, task, payload)
+}
+
+#[tokio::test]
+async fn manager_downloads_large_resources_with_bounded_parallel_ranges() {
+    let (url, peak, server, payload) = serve_segmented_resource().await;
+    let dir = TestDir::new();
+    let manager = DownloadManager::new().unwrap();
+    let mut request = managed_request("segmented", url, dir.path().join("segmented.bin"));
+    request.segmented = true;
+    let handle = manager.start(request).unwrap();
+    let result = wait_for_terminal(&manager, &handle).await;
+    let requests = server.await.unwrap();
+    assert_eq!(result.state, DownloadState::Completed, "{:?}", result.error);
+    assert_eq!(fs::read(dir.path().join("segmented.bin")).unwrap(), payload);
+    assert_eq!(
+        requests.len(),
+        5,
+        "one probe and four bounded segment requests"
+    );
+    assert!(peak.load(Ordering::SeqCst) >= 2, "segments should overlap");
+    assert!(
+        peak.load(Ordering::SeqCst) <= 4,
+        "segment concurrency is bounded"
+    );
+}
+
+#[tokio::test]
+async fn segmented_download_falls_back_to_a_full_get_when_range_is_ignored() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let payload = vec![3_u8; 4 * 1024 * 1024];
+    let served_payload = payload.clone();
+    let server = tokio::spawn(async move {
+        let (mut probe, _) = listener.accept().await.unwrap();
+        let probe_request = read_request(&mut probe).await;
+        probe
+            .write_all(&response(
+                "200 OK",
+                &format!(
+                    "Content-Length: {}\r\nConnection: close\r\n",
+                    served_payload.len()
+                ),
+                &served_payload,
+            ))
+            .await
+            .unwrap();
+        let _ = probe.shutdown().await;
+        let (mut full, _) = listener.accept().await.unwrap();
+        let full_request = read_request(&mut full).await;
+        full.write_all(&response(
+            "200 OK",
+            &format!(
+                "Content-Length: {}\r\nConnection: close\r\n",
+                served_payload.len()
+            ),
+            &served_payload,
+        ))
+        .await
+        .unwrap();
+        let _ = full.shutdown().await;
+        (probe_request, full_request)
+    });
+    let dir = TestDir::new();
+    let manager = DownloadManager::new().unwrap();
+    let mut request = managed_request(
+        "range-fallback",
+        format!("http://{address}/file"),
+        dir.path().join("fallback.bin"),
+    );
+    request.segmented = true;
+    let handle = manager.start(request).unwrap();
+    let result = wait_for_terminal(&manager, &handle).await;
+    let (probe, full) = server.await.unwrap();
+    assert_eq!(result.state, DownloadState::Completed, "{:?}", result.error);
+    assert!(probe.to_ascii_lowercase().contains("range: bytes=0-0"));
+    assert!(!full.to_ascii_lowercase().contains("range:"));
+    assert_eq!(fs::read(dir.path().join("fallback.bin")).unwrap(), payload);
+}
+
+#[tokio::test]
+async fn cancelling_segmented_download_removes_parts_and_never_promotes_output() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let body = Arc::new(vec![5_u8; 4 * 1024 * 1024]);
+    let in_segments = Arc::new(AtomicUsize::new(0));
+    let in_segments_server = in_segments.clone();
+    let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+    let server_body = body.clone();
+    let server = tokio::spawn(async move {
+        let mut workers = tokio::task::JoinSet::new();
+        for _ in 0..5 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let body = server_body.clone();
+            let mut release = release_rx.clone();
+            let active = in_segments_server.clone();
+            workers.spawn(async move {
+                let mut stream = stream;
+                let request = read_request(&mut stream).await;
+                let range = request.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("range: bytes=").map(str::to_owned)).unwrap();
+                let (start, end) = range.split_once('-').unwrap();
+                let start: usize = start.parse().unwrap();
+                let end: usize = end.parse().unwrap();
+                if start == 0 && end == 0 {
+                    let head = format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/{}\r\nContent-Length: 1\r\nETag: \"stable\"\r\nConnection: close\r\n\r\n", body.len());
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(&body[..1]).await;
+                } else {
+                    active.fetch_add(1, Ordering::SeqCst);
+                    while !*release.borrow() { if release.changed().await.is_err() { break; } }
+                    let bytes = &body[start..=end];
+                    let head = format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\nETag: \"stable\"\r\nConnection: close\r\n\r\n", body.len(), bytes.len());
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(bytes).await;
+                }
+                let _ = stream.shutdown().await;
+            });
+        }
+        while workers.join_next().await.is_some() {}
+    });
+    let dir = TestDir::new();
+    let target = dir.path().join("cancelled-segmented.bin");
+    let manager = DownloadManager::new().unwrap();
+    let mut request = managed_request(
+        "cancel-segments",
+        format!("http://{address}/large"),
+        target.clone(),
+    );
+    request.segmented = true;
+    let handle = manager.start(request).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while in_segments.load(Ordering::SeqCst) < 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all bounded range workers should be active");
+    manager.cancel(&handle).unwrap();
+    let result = wait_for_terminal(&manager, &handle).await;
+    let _ = release_tx.send(true);
+    server.await.unwrap();
+    assert_eq!(result.state, DownloadState::Cancelled);
+    assert!(!target.exists());
+    assert_eq!(
+        fs::read_dir(dir.path()).unwrap().count(),
+        0,
+        "segment scratch and main temp files are cleaned"
+    );
 }
 
 fn verify_generated_file(path: &Path, expected_len: u64) {
@@ -2833,6 +3096,8 @@ async fn manager_adopts_a_persisted_partial_and_resumes_cross_restart() {
             url: url.clone(),
             destination: dir.path().join("durable.bin"),
             resume: Some(durable_resume(persisted.clone(), 5, &url, "\"stable\"", 10)),
+            speed_limit_bytes_per_second: None,
+            segmented: false,
         })
         .unwrap();
 
@@ -2900,6 +3165,8 @@ async fn manager_discards_a_shrunk_persisted_partial_and_restarts_from_zero() {
                 "\"stable\"",
                 10,
             )),
+            speed_limit_bytes_per_second: None,
+            segmented: false,
         })
         .unwrap();
 
@@ -2947,6 +3214,8 @@ async fn manager_restarts_from_zero_when_a_persisted_partial_meets_the_total() {
                 "\"stable\"",
                 10,
             )),
+            speed_limit_bytes_per_second: None,
+            segmented: false,
         })
         .unwrap();
 
@@ -2993,6 +3262,8 @@ async fn manager_continues_normally_when_the_persisted_partial_is_missing() {
                 persisted_bytes: 2,
                 checkpoint: None,
             }),
+            speed_limit_bytes_per_second: None,
+            segmented: false,
         })
         .unwrap();
 

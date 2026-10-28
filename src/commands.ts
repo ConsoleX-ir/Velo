@@ -19,8 +19,17 @@ export const setDefaultDirectory = (directory: string): Promise<SettingsDto> =>
 
 export const clearDefaultDirectory = (): Promise<SettingsDto> => invoke("clear_default_directory");
 
-export const startDownload = (url: string, directory: string, fileName: string): Promise<DownloadDto> =>
-  invoke("start_download", { url, directory, fileName });
+export const setGlobalSpeedLimit = (bytesPerSecond: number | null): Promise<SettingsDto> =>
+  invoke("set_global_speed_limit", { bytesPerSecond });
+
+export const startDownload = (url: string, directory: string, fileName: string, speedLimitBytesPerSecond: number | null): Promise<DownloadDto> =>
+  invoke("start_download", { url, directory, fileName, speedLimitBytesPerSecond });
+
+export const scheduleDownload = (url: string, directory: string, fileName: string, scheduledAtUnixMs: number, speedLimitBytesPerSecond: number | null): Promise<DownloadDto> =>
+  invoke("schedule_download", { url, directory, fileName, scheduledAtUnixMs, speedLimitBytesPerSecond });
+
+export const editDownloadSchedule = (id: string, generation: number, scheduledAtUnixMs: number): Promise<DownloadDto> =>
+  invoke("edit_download_schedule", { id, generation, scheduledAtUnixMs });
 
 export const cancelDownload = (id: string, generation: number): Promise<void> =>
   invoke("cancel_download", { id, generation });

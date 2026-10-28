@@ -1,9 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { SegmentedControl } from "./ui/segmented";
 import { Toggle } from "./ui/switch";
 import { Icon } from "./icons";
-import { setDefaultDirectory, clearDefaultDirectory } from "../commands";
+import { setDefaultDirectory, clearDefaultDirectory, setGlobalSpeedLimit } from "../commands";
 import type { SettingsDto } from "../model";
 
 type SettingsViewProps = {
@@ -36,6 +36,8 @@ export function SettingsView({
   const osDir = settings?.osDefaultDownloadDir ?? null;
   const effective = settings?.effectiveDownloadDir ?? null;
   const broken = Boolean(defaultDir && settings && !settings.storedDirValid);
+  const [speedDraft, setSpeedDraft] = useState("");
+  useEffect(() => setSpeedDraft(settings?.globalSpeedLimitBytesPerSecond ? String(Math.round(settings.globalSpeedLimitBytesPerSecond / 1024)) : ""), [settings?.globalSpeedLimitBytesPerSecond]);
 
   async function changeFolder() {
     setBusy(true);
@@ -66,6 +68,17 @@ export function SettingsView({
     } finally {
       setBusy(false);
     }
+  }
+
+  async function changeSpeedLimit() {
+    const kib = speedDraft === "" ? null : Number(speedDraft);
+    if (kib !== null && (!Number.isFinite(kib) || kib < 1 || kib > 1_048_576)) return;
+    setBusy(true);
+    try {
+      onSettingsChanged(await setGlobalSpeedLimit(kib === null ? null : kib * 1024));
+    } catch (cause) {
+      onSettingsError(typeof cause === "object" && cause !== null && "message" in cause ? String(cause.message) : "The speed limit could not be saved.");
+    } finally { setBusy(false); }
   }
 
   return (
@@ -109,6 +122,15 @@ export function SettingsView({
             </span>
           </div>
         )}
+        <div className="settings-separator" />
+        <div className="settings-item">
+          <div className="settings-icon behavior"><Icon name="drive" /></div>
+          <div className="settings-copy">
+            <strong>Global download speed limit</strong>
+            <span>Limits combined transfer speed across active downloads and applies to new jobs. Leave blank for unlimited.</span>
+          </div>
+          <label className="settings-speed-limit"><input aria-label="Global speed limit in KiB/s" type="number" min="1" max="1048576" value={speedDraft} disabled={busy} onChange={(event) => setSpeedDraft(event.target.value)} onBlur={() => void changeSpeedLimit()} onKeyDown={(event) => { if (event.key === "Enter") { event.currentTarget.blur(); } }} /><span>KiB/s</span></label>
+        </div>
         <div className="settings-separator" />
         <div className="settings-item">
           <div className="settings-icon behavior"><Icon name="drive" /></div>

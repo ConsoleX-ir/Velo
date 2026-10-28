@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { TitleBar } from "./components/TitleBar";
 import { Sidebar } from "./components/Sidebar";
@@ -6,6 +6,7 @@ import { StatusBar } from "./components/StatusBar";
 import { DownloadRow } from "./components/DownloadRow";
 import { ContextMenu, type MenuItemSpec } from "./components/ContextMenu";
 import { AddDownloadDialog } from "./components/AddDownloadDialog";
+import { Dialog } from "./components/ui/dialog";
 import { SettingsView } from "./components/SettingsView";
 import { EmptyState, FilteredEmpty } from "./components/ui/empty-state";
 import { SegmentedControl, type SegmentedOption } from "./components/ui/segmented";
@@ -23,6 +24,7 @@ import {
   pauseDownload,
   resumeDownload,
   retryDownload,
+  editDownloadSchedule,
 } from "./commands";
 import {
   emptySpeedHistory,
@@ -78,6 +80,7 @@ function VeloApp() {
   const [pending, setPending] = useState<Set<string>>(() => new Set());
   const [speedHistories, setSpeedHistories] = useState<Record<string, SpeedHistory>>({});
   const [menuState, setMenuState] = useState<{ x: number; y: number; item: DownloadDto } | null>(null);
+  const [scheduleEdit, setScheduleEdit] = useState<DownloadDto | null>(null);
   const latestRevision = useRef(new Map<string, number>());
   const keyStates = useRef(new Map<string, DownloadDto["state"]>());
   const searchRef = useRef<HTMLInputElement>(null);
@@ -312,6 +315,9 @@ function VeloApp() {
     } else if (item.state === "downloading" || item.state === "preparing") {
       items.push({ id: "pause", label: "Pause", icon: <Icon name="pause" size={15} />, disabled: busy, onSelect: () => togglePause(item) });
     }
+    if (item.state === "scheduled") {
+      items.push({ id: "edit-schedule", label: "Edit schedule", icon: <Icon name="clock" size={15} />, disabled: busy, onSelect: () => setScheduleEdit(item) });
+    }
     if (item.state === "failed" || item.state === "cancelled" || item.state === "interrupted") {
       items.push({ id: "retry", label: "Retry", icon: <Icon name="refresh" size={15} />, disabled: busy, onSelect: () => retry(item) });
     }
@@ -452,7 +458,7 @@ function VeloApp() {
             setDialogOpen(false);
             setView("downloads");
             setFilter("all");
-            push({ title: `Download started — ${item.fileName}`, kind: "success" });
+            push({ title: item.state === "scheduled" ? `Download scheduled — ${item.fileName}` : `Download started — ${item.fileName}`, kind: "success" });
           }}
           onCommandError={(message) => push({ title: message, kind: "error" })}
         />
@@ -465,6 +471,37 @@ function VeloApp() {
           onClose={() => setMenuState(null)}
         />
       )}
+      {scheduleEdit && (
+        <ScheduleEditDialog item={scheduleEdit} onClose={() => setScheduleEdit(null)} onSaved={(item) => { projectDownload(item); setScheduleEdit(null); }} onError={(message) => push({ title: message, kind: "error" })} />
+      )}
     </div>
   );
+}
+
+function toLocalDateTime(value: number | null | undefined): string {
+  const date = value ? new Date(value) : new Date(Date.now() + 60_000);
+  const pad = (part: number) => String(part).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function ScheduleEditDialog({ item, onClose, onSaved, onError }: { item: DownloadDto; onClose: () => void; onSaved: (item: DownloadDto) => void; onError: (message: string) => void }) {
+  const [when, setWhen] = useState(toLocalDateTime(item.scheduledAtUnixMs));
+  const [busy, setBusy] = useState(false);
+  async function save(event: FormEvent) {
+    event.preventDefault();
+    const ms = new Date(when).getTime();
+    if (!Number.isFinite(ms) || ms <= Date.now()) { onError("Choose a future date and time."); return; }
+    setBusy(true);
+    try { onSaved(await editDownloadSchedule(item.id, item.generation, ms)); }
+    catch (error) { onError(errorText(error)); setBusy(false); }
+  }
+  return <Dialog open onClose={busy ? () => undefined : onClose} closeOnEscape={!busy} closeOnOutsideClick={!busy} labelledBy="edit-schedule-title" panelClassName="add-dialog">
+    <h2 id="edit-schedule-title">Edit scheduled download</h2>
+    <p className="dialog-intro">{item.fileName}</p>
+    <form onSubmit={(event) => void save(event)}>
+      <label className="field-label" htmlFor="edit-schedule-time">Start at</label>
+      <div className="input-wrap"><input id="edit-schedule-time" type="datetime-local" min={toLocalDateTime(Date.now() + 60_000)} value={when} onChange={(event) => setWhen(event.target.value)} /></div>
+      <div className="dialog-actions"><Button variant="secondary" onClick={onClose} disabled={busy}>Cancel</Button><Button variant="primary" type="submit" loading={busy}>Save schedule</Button></div>
+    </form>
+  </Dialog>;
 }

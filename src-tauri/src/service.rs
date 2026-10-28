@@ -23,6 +23,7 @@ use url::Url;
 /// only. Bounded so a dead network cannot loop forever; manual retry remains
 /// available afterwards.
 const MAX_AUTO_RETRIES: u8 = 2;
+const MAX_SERVICE_RECORDS: usize = 100;
 pub(crate) const RETRY_BACKOFF_BASE: Duration = Duration::from_secs(2);
 const INTERRUPTED_CHECKPOINT_MESSAGE: &str = "Velo closed before this transfer finished. Retry continues from the last verified checkpoint when the server allows it.";
 const INTERRUPTED_BYTE_ZERO_MESSAGE: &str =
@@ -32,6 +33,7 @@ const INTERRUPTED_BYTE_ZERO_MESSAGE: &str =
 pub(crate) struct AppState {
     pub(crate) manager: DownloadManager,
     pub(crate) jobs: Arc<Mutex<HashMap<String, UiJob>>>,
+    schedule_lock: Arc<Mutex<()>>,
     next_id: Arc<AtomicU64>,
     pub(crate) shutdown_started: Arc<AtomicBool>,
     pub(crate) exit_ready: Arc<AtomicBool>,
@@ -65,6 +67,9 @@ pub(crate) struct UiJob {
     pub(crate) resume: Option<persistence::StoredResume>,
     pub(crate) auto_retries: u8,
     pub(crate) retry_timer: Option<tokio::task::JoinHandle<()>>,
+    pub(crate) scheduled_at_unix_ms: Option<u64>,
+    pub(crate) schedule_timer: Option<tokio::task::JoinHandle<()>>,
+    pub(crate) speed_limit_bytes_per_second: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -86,12 +91,15 @@ pub(crate) struct DownloadDto {
     pub(crate) speed_bytes_per_second: Option<u64>,
     pub(crate) eta_seconds: Option<u64>,
     pub(crate) error: Option<String>,
+    #[serde(default)]
+    pub(crate) scheduled_at_unix_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum UiDownloadState {
     Queued,
+    Scheduled,
     Preparing,
     Downloading,
     Pausing,
@@ -181,7 +189,8 @@ impl AppState {
                             Some("The saved file is missing or its size changed.".into());
                     } else if !matches!(
                         download.state,
-                        UiDownloadState::Completed
+                        UiDownloadState::Scheduled
+                            | UiDownloadState::Completed
                             | UiDownloadState::Failed
                             | UiDownloadState::Cancelled
                             | UiDownloadState::Interrupted
@@ -197,6 +206,10 @@ impl AppState {
                         download.error = Some(
                             "This saved URL cannot be decrypted on this Windows account.".into(),
                         );
+                        if download.state == UiDownloadState::Scheduled {
+                            download.state = UiDownloadState::Failed;
+                            download.scheduled_at_unix_ms = None;
+                        }
                     }
                     // Durable resume only applies to retryable interrupted
                     // records with a decryptable URL, and only when the
@@ -228,6 +241,9 @@ impl AppState {
                             resume,
                             auto_retries: 0,
                             retry_timer: None,
+                            scheduled_at_unix_ms: record.scheduled_at_unix_ms,
+                            schedule_timer: None,
+                            speed_limit_bytes_per_second: record.speed_limit_bytes_per_second,
                         },
                     );
                 }
@@ -241,9 +257,10 @@ impl AppState {
                 )
             }
         };
-        Self {
+        let state = Self {
             manager,
             jobs: Arc::new(Mutex::new(jobs)),
+            schedule_lock: Arc::new(Mutex::new(())),
             next_id: Arc::new(AtomicU64::new(next_order)),
             shutdown_started: Arc::new(AtomicBool::new(false)),
             exit_ready: Arc::new(AtomicBool::new(false)),
@@ -253,10 +270,25 @@ impl AppState {
             history_notice: Arc::new(Mutex::new(notice)),
             publish,
             retry_backoff_base,
+        };
+        let scheduled: Vec<_> = lock_jobs(&state.jobs)
+            .values()
+            .filter(|job| job.download.state == UiDownloadState::Scheduled)
+            .map(|job| {
+                (
+                    job.download.id.clone(),
+                    job.download.generation,
+                    job.scheduled_at_unix_ms.unwrap_or(0),
+                )
+            })
+            .collect();
+        for (id, generation, when) in scheduled {
+            state.arm_schedule(&id, generation, when);
         }
+        state
     }
 
-    pub(crate) fn persist(&self, force: bool) {
+    pub(crate) fn persist(&self, force: bool) -> bool {
         let _write_guard = self
             .store_write_lock
             .lock()
@@ -267,7 +299,7 @@ impl AppState {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !force && last.elapsed() < Duration::from_secs(1) {
-                return;
+                return true;
             }
             *last = Instant::now();
         }
@@ -278,10 +310,16 @@ impl AppState {
                 destination: job.destination.clone(),
                 encrypted_url: job.encrypted_url.clone(),
                 resume: job.resume.clone(),
+                scheduled_at_unix_ms: job.scheduled_at_unix_ms,
+                speed_limit_bytes_per_second: job.speed_limit_bytes_per_second,
             })
             .collect();
-        if let Err(error) = persistence::save(&self.store_path, &records) {
-            eprintln!("Could not save the Velo download history: {error}");
+        match persistence::save(&self.store_path, &records) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("Could not save the Velo download history: {error}");
+                false
+            }
         }
     }
 
@@ -294,8 +332,10 @@ impl AppState {
         url: String,
         destination: String,
         resume: Option<DurableResume>,
+        speed_limit_bytes_per_second: Option<u64>,
     ) -> Result<(DownloadDto, DownloadHandle), CommandError> {
         validate_url_input(&url)?;
+        validate_per_download_limit(speed_limit_bytes_per_second)?;
         let encrypted_url = store_url(&url).map_err(|_| {
             CommandError::new(
                 "history_unavailable",
@@ -326,6 +366,8 @@ impl AppState {
                 url: url.clone(),
                 destination: path,
                 resume: resume.clone(),
+                speed_limit_bytes_per_second,
+                segmented: !cfg!(test),
             })
             .map_err(command_start_error)?;
         let snapshot = handle.latest_progress();
@@ -342,6 +384,7 @@ impl AppState {
             speed_bytes_per_second: None,
             eta_seconds: None,
             error: None,
+            scheduled_at_unix_ms: None,
         };
         lock_jobs(&self.jobs).insert(
             dto.id.clone(),
@@ -365,6 +408,9 @@ impl AppState {
                 }),
                 auto_retries: 0,
                 retry_timer: None,
+                scheduled_at_unix_ms: None,
+                schedule_timer: None,
+                speed_limit_bytes_per_second,
             },
         );
         self.persist(true);
@@ -387,6 +433,7 @@ impl AppState {
         url: String,
         directory: String,
         file_name: String,
+        speed_limit_bytes_per_second: Option<u64>,
     ) -> Result<DownloadDto, CommandError> {
         // The webview hands over a folder plus a bare file name; the native
         // side composes and validates the final path so the engine keeps
@@ -403,12 +450,297 @@ impl AppState {
             },
         )?;
         let destination_text = destination.to_string_lossy().into_owned();
-        let (download, handle) = self.start(url, destination_text, None)?;
+        let (download, handle) =
+            self.start(url, destination_text, None, speed_limit_bytes_per_second)?;
         tokio::spawn({
             let state = self.clone();
             async move { state.monitor(handle).await }
         });
         Ok(download)
+    }
+
+    pub(crate) fn schedule_download(
+        &self,
+        url: String,
+        directory: String,
+        file_name: String,
+        scheduled_at_unix_ms: u64,
+        speed_limit_bytes_per_second: Option<u64>,
+    ) -> Result<DownloadDto, CommandError> {
+        let _schedule_guard = self
+            .schedule_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        validate_url_input(&url)?;
+        validate_per_download_limit(speed_limit_bytes_per_second)?;
+        let now = unix_now_ms();
+        if scheduled_at_unix_ms <= now
+            || scheduled_at_unix_ms > now.saturating_add(366 * 24 * 60 * 60 * 1000)
+        {
+            return Err(CommandError::new(
+                "invalid_schedule",
+                "Choose a time in the next 366 days.",
+            ));
+        }
+        let destination = super::settings::join_destination(&directory, &file_name).map_err(
+            |error| match error {
+                super::settings::JoinDestinationError::InvalidDirectory => CommandError::new(
+                    "invalid_destination",
+                    "Choose a valid folder for this download.",
+                ),
+                super::settings::JoinDestinationError::InvalidFileName(message) => {
+                    CommandError::new("invalid_file_name", message)
+                }
+            },
+        )?;
+        let parent = destination.parent().ok_or_else(|| {
+            CommandError::new(
+                "invalid_destination",
+                "Choose a valid folder for this download.",
+            )
+        })?;
+        let canonical_parent = fs::canonicalize(parent).map_err(|_| {
+            CommandError::new(
+                "invalid_destination",
+                "Choose an existing folder for this download.",
+            )
+        })?;
+        let destination = canonical_parent.join(destination.file_name().unwrap_or_default());
+        if fs::symlink_metadata(&destination).is_ok() {
+            return Err(CommandError::new(
+                "destination_exists",
+                "A file with this name already exists.",
+            ));
+        }
+        let encrypted_url = store_url(&url).map_err(|_| {
+            CommandError::new(
+                "history_unavailable",
+                "Velo could not protect this download URL for local history.",
+            )
+        })?;
+        let order = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = format!("velo-scheduled-{}-{order}", std::process::id());
+        let dto = DownloadDto {
+            id: id.clone(),
+            generation: 1,
+            revision: 1,
+            order,
+            file_name,
+            destination: destination.to_string_lossy().into_owned(),
+            state: UiDownloadState::Scheduled,
+            bytes_written: 0,
+            total_bytes: None,
+            speed_bytes_per_second: None,
+            eta_seconds: None,
+            error: None,
+            scheduled_at_unix_ms: Some(scheduled_at_unix_ms),
+        };
+        {
+            let mut jobs = lock_jobs(&self.jobs);
+            if jobs.len() >= MAX_SERVICE_RECORDS {
+                return Err(CommandError::new(
+                    "capacity_reached",
+                    "Velo already has the maximum number of retained downloads and schedules.",
+                ));
+            }
+            let conflict = jobs.values().any(|job| {
+                if matches!(
+                    job.download.state,
+                    UiDownloadState::Completed
+                        | UiDownloadState::Failed
+                        | UiDownloadState::Cancelled
+                        | UiDownloadState::Interrupted
+                ) {
+                    return false;
+                }
+                let existing = Path::new(&job.destination);
+                #[cfg(windows)]
+                {
+                    existing
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(&destination.to_string_lossy())
+                }
+                #[cfg(not(windows))]
+                {
+                    existing == destination.as_path()
+                }
+            });
+            if conflict {
+                return Err(CommandError::new(
+                    "destination_conflict",
+                    "Another retained download already uses this destination.",
+                ));
+            }
+            jobs.insert(
+                id.clone(),
+                UiJob {
+                    handle: None,
+                    url: Some(url),
+                    destination: dto.destination.clone(),
+                    encrypted_url,
+                    download: dto.clone(),
+                    resume: None,
+                    auto_retries: 0,
+                    retry_timer: None,
+                    scheduled_at_unix_ms: Some(scheduled_at_unix_ms),
+                    schedule_timer: None,
+                    speed_limit_bytes_per_second,
+                },
+            );
+        }
+        self.arm_schedule(&id, 1, scheduled_at_unix_ms);
+        if !self.persist(true) {
+            if let Some(mut job) = lock_jobs(&self.jobs).remove(&id) {
+                if let Some(timer) = job.schedule_timer.take() {
+                    timer.abort();
+                }
+            }
+            return Err(CommandError::new(
+                "persistence_unavailable",
+                "Velo could not save this schedule. Check the available disk space and try again.",
+            ));
+        }
+        self.emit(UiEvent::Updated(dto.clone()));
+        Ok(dto)
+    }
+
+    pub(crate) fn edit_schedule(
+        &self,
+        id: &str,
+        generation: u64,
+        when: u64,
+    ) -> Result<DownloadDto, CommandError> {
+        let _schedule_guard = self
+            .schedule_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if when <= unix_now_ms() || when > unix_now_ms().saturating_add(366 * 24 * 60 * 60 * 1000) {
+            return Err(CommandError::new(
+                "invalid_schedule",
+                "Choose a time in the next 366 days.",
+            ));
+        }
+        let previous_when = {
+            let mut jobs = lock_jobs(&self.jobs);
+            let job = jobs
+                .get_mut(id)
+                .filter(|job| {
+                    job.download.generation == generation
+                        && job.download.state == UiDownloadState::Scheduled
+                })
+                .ok_or_else(|| {
+                    CommandError::new(
+                        "not_scheduled",
+                        "This download no longer has an editable schedule.",
+                    )
+                })?;
+            if let Some(timer) = job.schedule_timer.take() {
+                timer.abort();
+            }
+            let previous = job.scheduled_at_unix_ms.unwrap_or(when);
+            job.scheduled_at_unix_ms = Some(when);
+            job.download.scheduled_at_unix_ms = Some(when);
+            job.download.revision = job.download.revision.saturating_add(1);
+            previous
+        };
+        self.arm_schedule(id, generation, when);
+        if !self.persist(true) {
+            if let Some(job) = lock_jobs(&self.jobs).get_mut(id) {
+                job.scheduled_at_unix_ms = Some(previous_when);
+                job.download.scheduled_at_unix_ms = Some(previous_when);
+                job.download.revision = job.download.revision.saturating_add(1);
+            }
+            self.arm_schedule(id, generation, previous_when);
+            return Err(CommandError::new(
+                "persistence_unavailable",
+                "Velo could not save the edited schedule; the previous time is still active.",
+            ));
+        }
+        let dto = lock_jobs(&self.jobs)
+            .get(id)
+            .map(|job| job.download.clone())
+            .ok_or_else(|| {
+                CommandError::new("unknown_job", "This schedule is no longer available.")
+            })?;
+        self.emit(UiEvent::Updated(dto.clone()));
+        Ok(dto)
+    }
+
+    fn arm_schedule(&self, id: &str, generation: u64, when: u64) {
+        let delay = Duration::from_millis(when.saturating_sub(unix_now_ms()));
+        let timer = tokio::spawn(schedule_timer(
+            self.clone(),
+            id.to_owned(),
+            generation,
+            delay,
+        ));
+        if let Some(job) = lock_jobs(&self.jobs).get_mut(id).filter(|job| {
+            job.download.generation == generation
+                && job.download.state == UiDownloadState::Scheduled
+        }) {
+            if let Some(previous) = job.schedule_timer.replace(timer) {
+                previous.abort();
+            }
+        } else {
+            timer.abort();
+        }
+    }
+
+    fn fire_schedule(&self, id: &str, generation: u64) {
+        let _schedule_guard = self
+            .schedule_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (url, destination, speed_limit) = {
+            let jobs = lock_jobs(&self.jobs);
+            let Some(job) = jobs.get(id).filter(|job| {
+                job.download.generation == generation
+                    && job.download.state == UiDownloadState::Scheduled
+            }) else {
+                return;
+            };
+            let Some(url) = job.url.clone() else {
+                return;
+            };
+            (
+                url,
+                job.destination.clone(),
+                job.speed_limit_bytes_per_second,
+            )
+        };
+        match self.start(url, destination, None, speed_limit) {
+            Ok((_, handle)) => {
+                lock_jobs(&self.jobs).remove(id);
+                self.persist(true);
+                self.emit(UiEvent::Removed {
+                    id: id.to_owned(),
+                    generation,
+                });
+                tokio::spawn({
+                    let state = self.clone();
+                    async move { state.monitor(handle).await }
+                });
+            }
+            Err(error) => {
+                let updated = {
+                    let mut jobs = lock_jobs(&self.jobs);
+                    let Some(job) = jobs
+                        .get_mut(id)
+                        .filter(|job| job.download.generation == generation)
+                    else {
+                        return;
+                    };
+                    job.download.state = UiDownloadState::Failed;
+                    job.download.scheduled_at_unix_ms = None;
+                    job.scheduled_at_unix_ms = None;
+                    job.download.error = Some(error.message);
+                    job.download.revision = job.download.revision.saturating_add(1);
+                    job.download.clone()
+                };
+                self.persist(true);
+                self.emit(UiEvent::Updated(updated));
+            }
+        }
     }
 
     pub(crate) fn take_history_notice(&self) -> Option<String> {
@@ -418,7 +750,59 @@ impl AppState {
             .take()
     }
 
+    pub(crate) fn set_speed_limit(&self, limit: Option<u64>) {
+        self.manager.set_global_speed_limit_bytes_per_second(limit);
+    }
+
     pub(crate) fn cancel_download(&self, id: &str, generation: u64) -> Result<(), CommandError> {
+        let _schedule_guard = self
+            .schedule_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let scheduled = {
+            let mut jobs = lock_jobs(&self.jobs);
+            let job = jobs.get_mut(id).ok_or_else(|| {
+                CommandError::new("unknown_job", "This download is no longer available.")
+            })?;
+            if job.download.generation != generation {
+                return Err(CommandError::new(
+                    "stale_job",
+                    "This download view is out of date.",
+                ));
+            }
+            if job.download.state == UiDownloadState::Scheduled {
+                let when = job.scheduled_at_unix_ms.unwrap_or_default();
+                if let Some(timer) = job.schedule_timer.take() {
+                    timer.abort();
+                }
+                job.download.state = UiDownloadState::Cancelled;
+                job.download.scheduled_at_unix_ms = None;
+                job.scheduled_at_unix_ms = None;
+                job.download.error = Some("The scheduled download was cancelled.".into());
+                job.download.revision = job.download.revision.saturating_add(1);
+                Some((job.download.clone(), when))
+            } else {
+                None
+            }
+        };
+        if let Some((dto, when)) = scheduled {
+            if !self.persist(true) {
+                if let Some(job) = lock_jobs(&self.jobs).get_mut(id) {
+                    job.download.state = UiDownloadState::Scheduled;
+                    job.download.scheduled_at_unix_ms = Some(when);
+                    job.scheduled_at_unix_ms = Some(when);
+                    job.download.error = None;
+                    job.download.revision = job.download.revision.saturating_add(1);
+                }
+                self.arm_schedule(id, generation, when);
+                return Err(CommandError::new(
+                    "persistence_unavailable",
+                    "Velo could not save the cancellation; the scheduled download remains active.",
+                ));
+            }
+            self.emit(UiEvent::Updated(dto));
+            return Ok(());
+        }
         // A scheduled retry owns no active transfer: cancel the pending timer
         // and close the record out. The retired engine handle is acknowledged
         // so the engine retains nothing for this job.
@@ -538,7 +922,7 @@ impl AppState {
         id: &str,
         generation: u64,
     ) -> Result<DownloadDto, CommandError> {
-        let (url, destination, resume, old_handle) = {
+        let (url, destination, resume, speed_limit, old_handle) = {
             let jobs = lock_jobs(&self.jobs);
             let old = jobs.get(id).ok_or_else(|| {
                 CommandError::new("unknown_job", "This download is no longer available.")
@@ -571,6 +955,7 @@ impl AppState {
                 })?,
                 old.destination.clone(),
                 resume,
+                old.speed_limit_bytes_per_second,
                 old.handle.clone(),
             )
         };
@@ -582,7 +967,7 @@ impl AppState {
                 old_job.handle = None;
             }
         }
-        let (download, handle) = self.start(url, destination, resume)?;
+        let (download, handle) = self.start(url, destination, resume, speed_limit)?;
         lock_jobs(&self.jobs).remove(id);
         self.persist(true);
         self.emit(UiEvent::Removed {
@@ -752,7 +1137,7 @@ impl AppState {
     /// one that adopts the verified partial data. No-ops if the user cancelled
     /// or dismissed the pending retry while the timer was sleeping.
     fn fire_scheduled_retry(&self, id: &str, generation: u64) {
-        let (url, destination, resume, old_handle, carried_auto_retries) = {
+        let (url, destination, resume, speed_limit, old_handle, carried_auto_retries) = {
             let mut jobs = lock_jobs(&self.jobs);
             let Some(job) = jobs.get_mut(id) else {
                 return;
@@ -770,6 +1155,7 @@ impl AppState {
                 job.url.clone(),
                 job.destination.clone(),
                 resume,
+                job.speed_limit_bytes_per_second,
                 job.handle.take(),
                 job.auto_retries,
             )
@@ -785,7 +1171,7 @@ impl AppState {
             );
             return;
         };
-        match self.start(url, destination, resume) {
+        match self.start(url, destination, resume, speed_limit) {
             Ok((download, handle)) => {
                 {
                     let mut jobs = lock_jobs(&self.jobs);
@@ -862,6 +1248,16 @@ fn validate_url_input(value: &str) -> Result<(), CommandError> {
         return Err(CommandError::new(
             "invalid_url",
             "Only HTTP and HTTPS URLs without embedded credentials are supported.",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_per_download_limit(limit: Option<u64>) -> Result<(), CommandError> {
+    if limit == Some(0) || limit.is_some_and(|value| value > 1_073_741_824) {
+        return Err(CommandError::new(
+            "invalid_speed_limit",
+            "Choose a per-download speed limit from 1 byte/s to 1 GiB/s, or turn it off.",
         ));
     }
     Ok(())
@@ -1075,6 +1471,18 @@ async fn schedule_retry_timer(state: AppState, id: String, generation: u64, dela
     state.fire_scheduled_retry(&id, generation);
 }
 
+async fn schedule_timer(state: AppState, id: String, generation: u64, delay: Duration) {
+    tokio::time::sleep(delay).await;
+    state.fire_schedule(&id, generation);
+}
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
 fn store_url(value: &str) -> std::io::Result<Vec<u8>> {
     #[cfg(test)]
     {
@@ -1132,10 +1540,113 @@ pub(crate) mod tests {
                 "https://example.test/file".into(),
                 dir.to_string_lossy().into_owned(),
                 "../escape.bin".into(),
+                None,
             )
             .unwrap_err();
         assert_eq!(error.code, "invalid_file_name");
         state.manager.shutdown().await;
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn user_schedule_can_be_edited_and_cancelled() {
+        let dir = std::env::temp_dir().join(format!(
+            "velo-schedule-{}-{}",
+            std::process::id(),
+            TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let (state, updates, _removals) =
+            test_state(dir.join("history.json"), Duration::from_millis(20));
+        let when = unix_now_ms() + 60_000;
+        let scheduled = state
+            .schedule_download(
+                "https://example.test/file".into(),
+                dir.to_string_lossy().into_owned(),
+                "later.bin".into(),
+                when,
+                None,
+            )
+            .unwrap();
+        assert_eq!(scheduled.state, UiDownloadState::Scheduled);
+        assert_eq!(scheduled.scheduled_at_unix_ms, Some(when));
+        let moved_to = when + 60_000;
+        let edited = state
+            .edit_schedule(&scheduled.id, scheduled.generation, moved_to)
+            .unwrap();
+        assert_eq!(edited.scheduled_at_unix_ms, Some(moved_to));
+        assert_eq!(
+            state.list_downloads()[0].scheduled_at_unix_ms,
+            Some(moved_to)
+        );
+        state
+            .cancel_download(&scheduled.id, scheduled.generation)
+            .unwrap();
+        let cancelled = state
+            .list_downloads()
+            .into_iter()
+            .find(|item| item.id == scheduled.id)
+            .unwrap();
+        assert_eq!(cancelled.state, UiDownloadState::Cancelled);
+        assert!(updates
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|dto| dto.id == scheduled.id && dto.state == UiDownloadState::Scheduled));
+        state.manager.shutdown().await;
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn scheduled_job_is_reloaded_and_its_timer_is_rearmed() {
+        let dir = std::env::temp_dir().join(format!(
+            "velo-schedule-restart-{}-{}",
+            std::process::id(),
+            TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("history.json");
+        let (first, _events, _removals) = test_state(store.clone(), Duration::from_millis(20));
+        let when = unix_now_ms() + 120_000;
+        let scheduled = first
+            .schedule_download(
+                "https://example.test/file".into(),
+                dir.to_string_lossy().into_owned(),
+                "restored.bin".into(),
+                when,
+                Some(64 * 1024),
+            )
+            .unwrap();
+        if let Some(timer) = lock_jobs(&first.jobs)
+            .get_mut(&scheduled.id)
+            .and_then(|job| job.schedule_timer.take())
+        {
+            timer.abort();
+        }
+        first.manager.shutdown().await;
+
+        let (restarted, _events, _removals) = test_state(store, Duration::from_millis(20));
+        let restored = restarted
+            .list_downloads()
+            .into_iter()
+            .find(|item| item.id == scheduled.id)
+            .unwrap();
+        assert_eq!(restored.state, UiDownloadState::Scheduled);
+        assert_eq!(restored.scheduled_at_unix_ms, Some(when));
+        assert_eq!(
+            lock_jobs(&restarted.jobs)
+                .get(&scheduled.id)
+                .unwrap()
+                .speed_limit_bytes_per_second,
+            Some(64 * 1024)
+        );
+        assert!(lock_jobs(&restarted.jobs)
+            .get(&scheduled.id)
+            .is_some_and(|job| job.schedule_timer.is_some()));
+        restarted
+            .cancel_download(&scheduled.id, scheduled.generation)
+            .unwrap();
+        restarted.manager.shutdown().await;
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1191,6 +1702,7 @@ pub(crate) mod tests {
             .start(
                 format!("http://{address}/file"),
                 destination.to_string_lossy().into_owned(),
+                None,
                 None,
             )
             .unwrap();
@@ -1359,6 +1871,7 @@ pub(crate) mod tests {
                 url,
                 dir.to_string_lossy().into_owned(),
                 "out.bin".to_owned(),
+                None,
             )
             .unwrap();
         let terminal = wait_for_terminal_state(&updates, UiDownloadState::Completed).await;
@@ -1414,6 +1927,7 @@ pub(crate) mod tests {
                 url,
                 dir.to_string_lossy().into_owned(),
                 "out.bin".to_owned(),
+                None,
             )
             .unwrap();
         let terminal = wait_for_terminal_state(&updates, UiDownloadState::Failed).await;
@@ -1444,6 +1958,7 @@ pub(crate) mod tests {
                 url,
                 dir.to_string_lossy().into_owned(),
                 "out.bin".to_owned(),
+                None,
             )
             .unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {

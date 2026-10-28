@@ -1,5 +1,6 @@
 export type DownloadState =
   | "queued"
+  | "scheduled"
   | "preparing"
   | "downloading"
   | "pausing"
@@ -26,6 +27,7 @@ export type DownloadDto = {
   speedBytesPerSecond: number | null;
   etaSeconds: number | null;
   error: string | null;
+  scheduledAtUnixMs?: number | null;
 };
 
 export type DownloadView = "downloads" | "queue" | "completed" | "settings";
@@ -42,6 +44,7 @@ export type SettingsDto = {
   osDefaultDownloadDir: string | null;
   /** Where downloads go without an override: saved default while valid, else OS folder. */
   effectiveDownloadDir: string | null;
+  globalSpeedLimitBytesPerSecond?: number | null;
 };
 
 export const APP_VERSION = "0.6.0";

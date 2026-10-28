@@ -3,7 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { Dialog } from "./ui/dialog";
 import { Button } from "./ui/button";
 import { Icon } from "./icons";
-import { startDownload } from "../commands";
+import { scheduleDownload, startDownload } from "../commands";
 import {
   suggestedFileName,
   validateUrl,
@@ -32,6 +32,8 @@ export function AddDownloadDialog({ settings, onClose, onStarted, onCommandError
   const [nameEdited, setNameEdited] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [scheduledAt, setScheduledAt] = useState("");
+  const [speedLimitKib, setSpeedLimitKib] = useState("");
 
   const urlError = url.trim() ? validateUrl(url) : null;
   const effectiveDir = overrideDir ?? settings?.effectiveDownloadDir ?? null;
@@ -41,6 +43,8 @@ export function AddDownloadDialog({ settings, onClose, onStarted, onCommandError
   const suggested = url.trim() && !urlError ? suggestedFileName(url) : null;
 
   const resolvedFileName = fileName.trim() || suggested || "";
+  const minimumDate = new Date(Date.now() + 60_000);
+  const minSchedule = `${minimumDate.getFullYear()}-${String(minimumDate.getMonth() + 1).padStart(2, "0")}-${String(minimumDate.getDate()).padStart(2, "0")}T${String(minimumDate.getHours()).padStart(2, "0")}:${String(minimumDate.getMinutes()).padStart(2, "0")}`;
 
   async function chooseFolder() {
     setError(null);
@@ -74,7 +78,22 @@ export function AddDownloadDialog({ settings, onClose, onStarted, onCommandError
     setBusy(true);
     setError(null);
     try {
-      const download = await startDownload(url.trim(), effectiveDir, resolvedFileName);
+      const scheduleMs = scheduledAt ? new Date(scheduledAt).getTime() : null;
+      const speedKib = speedLimitKib ? Number(speedLimitKib) : null;
+      if (speedKib !== null && (!Number.isFinite(speedKib) || speedKib < 1 || speedKib > 1_048_576)) {
+        setError("Enter a per-download speed limit from 1 to 1,048,576 KiB/s, or leave it blank.");
+        setBusy(false);
+        return;
+      }
+      const speedLimitBytesPerSecond = speedKib === null ? null : Math.round(speedKib * 1024);
+      if (scheduleMs !== null && (!Number.isFinite(scheduleMs) || scheduleMs <= Date.now())) {
+        setError("Choose a future date and time.");
+        setBusy(false);
+        return;
+      }
+      const download = scheduleMs === null
+        ? await startDownload(url.trim(), effectiveDir, resolvedFileName, speedLimitBytesPerSecond)
+        : await scheduleDownload(url.trim(), effectiveDir, resolvedFileName, scheduleMs, speedLimitBytesPerSecond);
       onStarted(download);
     } catch (cause) {
       const message = errorText(cause);
@@ -161,6 +180,11 @@ export function AddDownloadDialog({ settings, onClose, onStarted, onCommandError
             </button>
           </div>
         </div>
+        <label className="field-label destination-label" htmlFor="download-schedule">Start at (optional)</label>
+        <div className="input-wrap"><input id="download-schedule" type="datetime-local" value={scheduledAt} min={minSchedule} onChange={(event) => setScheduledAt(event.target.value)} /></div>
+        <span className="field-hint">Velo starts the download at this local date and time, including after restart.</span>
+        <label className="field-label destination-label" htmlFor="download-speed-limit">Per-download speed limit (optional)</label>
+        <div className="input-wrap"><input id="download-speed-limit" type="number" min="1" max="1048576" value={speedLimitKib} onChange={(event) => setSpeedLimitKib(event.target.value)} placeholder="Unlimited" /><span className="input-suffix">KiB/s</span></div>
         {storedDirBroken && !defaultIsOverridden && (
           <div className="dialog-warn" role="alert">
             <Icon name="alert" size={15} />
@@ -176,7 +200,7 @@ export function AddDownloadDialog({ settings, onClose, onStarted, onCommandError
         <div className="dialog-actions">
           <Button variant="secondary" onClick={onClose} disabled={busy}>Cancel</Button>
           <Button variant="primary" type="submit" loading={busy} disabled={Boolean(urlError) || !url.trim() || !resolvedFileName || !dirKnown}>
-            {busy ? "Starting…" : <>Start download <Icon name="arrow" size={15} /></>}
+            {busy ? "Saving…" : <>{scheduledAt ? "Schedule download" : "Start download"} <Icon name="arrow" size={15} /></>}
           </Button>
         </div>
       </form>

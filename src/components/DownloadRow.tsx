@@ -17,6 +17,7 @@ import {
 
 const STATE_ICON: Record<DownloadDto["state"], IconName> = {
   queued: "clock",
+  scheduled: "clock",
   preparing: "globe",
   downloading: "download",
   pausing: "pause",
@@ -69,7 +70,9 @@ export const DownloadRow = memo(function DownloadRow({
 
   const meta = item.state === "retrying"
     ? "Retry scheduled"
-    : item.state === "queued"
+    : item.state === "scheduled"
+      ? item.scheduledAtUnixMs ? `Scheduled for ${new Date(item.scheduledAtUnixMs).toLocaleString()}` : "Scheduled"
+      : item.state === "queued"
       ? "Waiting for a transfer slot"
       : item.state === "completed"
         ? `${formatBytes(item.bytesWritten)} saved`
@@ -114,7 +117,7 @@ export const DownloadRow = memo(function DownloadRow({
           <ProgressTrack
             value={percent ?? (item.state === "completed" ? 100 : null)}
             completed={item.state === "completed"}
-            indeterminateWidth={item.state === "queued" ? 0 : 6}
+            indeterminateWidth={item.state === "queued" || item.state === "scheduled" ? 0 : 6}
             className="row-progress"
             ariaLabel={`${item.fileName} progress`}
           />

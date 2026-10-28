@@ -28,7 +28,7 @@ use std::{
 
 use thiserror::Error;
 use tokio::{
-    io::{AsyncWrite, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt},
     sync::watch,
     task::JoinHandle,
     time::timeout,
@@ -43,6 +43,8 @@ const READ_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
 const JOB_DEADLINE: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_REDIRECTS: usize = 10;
 const MAX_RESUME_REQUESTS: usize = 3;
+const MAX_SEGMENTS: usize = 4;
+const MIN_SEGMENTED_SIZE: u64 = 4 * 1024 * 1024;
 const DEFAULT_MAX_ACTIVE: usize = 4;
 const DEFAULT_MAX_RETAINED: usize = 100;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
@@ -75,6 +77,11 @@ pub struct DownloadRequest {
     /// Every field is re-verified on disk and against the server before any
     /// byte is appended; an invalid checkpoint degrades to a fresh transfer.
     pub resume: Option<DurableResume>,
+    /// Optional per-transfer byte rate ceiling. `None` uses the manager-wide
+    /// setting; zero is rejected at admission.
+    pub speed_limit_bytes_per_second: Option<u64>,
+    /// Enables the engine's validated concurrent HTTP Range path.
+    pub segmented: bool,
 }
 
 /// Persisted partial-transfer state handed back to the manager after a
@@ -320,6 +327,12 @@ enum TransferExit {
         checkpoint: Option<ResumeCheckpoint>,
     },
     Cancelled,
+}
+
+enum SegmentAttempt {
+    Unsupported,
+    Complete(u64),
+    Interrupted(WorkerControl),
 }
 
 fn interrupted_transfer(
@@ -569,6 +582,229 @@ impl DownloadEngine {
         Ok(target)
     }
 
+    /// Attempts a four-way, validator-pinned range transfer. `Unsupported`
+    /// means no output bytes were committed and the caller may safely fall
+    /// back to the ordinary full GET.
+    async fn segmented_transfer<F>(
+        &self,
+        url: &Url,
+        temp_path: &Path,
+        output: &mut tokio::fs::File,
+        control: &mut watch::Receiver<WorkerControl>,
+        progress: &mut F,
+    ) -> Result<SegmentAttempt, DownloadError>
+    where
+        F: FnMut(TransferEvent),
+    {
+        let probe = tokio::select! {
+            biased;
+            signal = wait_for_control(control) => return Ok(SegmentAttempt::Interrupted(signal)),
+            result = timeout(self.read_inactivity, self.client.get(url.clone())
+                .header(reqwest::header::ACCEPT_ENCODING, "identity")
+                .header(reqwest::header::RANGE, "bytes=0-0").send()) => result,
+        };
+        let Ok(Ok(response)) = probe else {
+            return Ok(SegmentAttempt::Unsupported);
+        };
+        if response.status() != reqwest::StatusCode::PARTIAL_CONTENT
+            || validate_entity_headers(response.headers()).is_err()
+        {
+            return Ok(SegmentAttempt::Unsupported);
+        }
+        let Ok(range) = parse_content_range(response.headers()) else {
+            return Ok(SegmentAttempt::Unsupported);
+        };
+        let Ok(length) = parse_content_length(response.headers()) else {
+            return Ok(SegmentAttempt::Unsupported);
+        };
+        let Ok(etag) = parse_strong_etag(response.headers()) else {
+            return Ok(SegmentAttempt::Unsupported);
+        };
+        let Some(etag) = etag else {
+            return Ok(SegmentAttempt::Unsupported);
+        };
+        if response.url().scheme() != url.scheme()
+            || range.start != 0
+            || range.end != 0
+            || range.total < MIN_SEGMENTED_SIZE
+            || length != Some(1)
+        {
+            return Ok(SegmentAttempt::Unsupported);
+        }
+        let effective_url = response.url().clone();
+        let mut probe = response;
+        let first = tokio::select! {
+            biased;
+            signal = wait_for_control(control) => return Ok(SegmentAttempt::Interrupted(signal)),
+            result = timeout(self.read_inactivity, probe.chunk()) => result,
+        };
+        if !matches!(first, Ok(Ok(Some(ref chunk))) if chunk.len() == 1) {
+            return Ok(SegmentAttempt::Unsupported);
+        }
+        let eof = tokio::select! {
+            biased;
+            signal = wait_for_control(control) => return Ok(SegmentAttempt::Interrupted(signal)),
+            result = timeout(self.read_inactivity, probe.chunk()) => result,
+        };
+        if !matches!(eof, Ok(Ok(None))) {
+            return Ok(SegmentAttempt::Unsupported);
+        }
+
+        let segment_count = MAX_SEGMENTS.min(usize::try_from(range.total).unwrap_or(usize::MAX));
+        if segment_count < 2 {
+            return Ok(SegmentAttempt::Unsupported);
+        }
+        let each = range.total / segment_count as u64;
+        let extra = range.total % segment_count as u64;
+        let mut bounds = Vec::with_capacity(segment_count);
+        let mut start = 0_u64;
+        for index in 0..segment_count {
+            let size = each + u64::from((index as u64) < extra);
+            let Some(end) = start.checked_add(size).and_then(|next| next.checked_sub(1)) else {
+                return Ok(SegmentAttempt::Unsupported);
+            };
+            bounds.push((start, end));
+            start = end.saturating_add(1);
+        }
+
+        let token = TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let stem = temp_path.file_name().unwrap_or_default().to_string_lossy();
+        let paths: Vec<_> = (0..segment_count)
+            .map(|index| temp_path.with_file_name(format!("{stem}.segment-{token}-{index}")))
+            .collect();
+        let context = SegmentFetchContext {
+            client: self.range_client.clone(),
+            url: effective_url,
+            etag,
+            total: range.total,
+            inactivity: self.read_inactivity,
+        };
+        let mut workers = tokio::task::JoinSet::new();
+        for (index, (from, to)) in bounds.iter().copied().enumerate() {
+            workers.spawn(fetch_segment(
+                context.clone(),
+                from,
+                to,
+                paths[index].clone(),
+                index,
+            ));
+        }
+        let mut completed = vec![false; segment_count];
+        let mut failure = None;
+        while !workers.is_empty() {
+            tokio::select! {
+                biased;
+                signal = wait_for_control(control) => {
+                    workers.abort_all();
+                    while workers.join_next().await.is_some() {}
+                    remove_segment_files(&paths)?;
+                    return Ok(SegmentAttempt::Interrupted(signal));
+                }
+                result = workers.join_next() => match result {
+                    Some(Ok(Ok(index))) => completed[index] = true,
+                    Some(Ok(Err(error))) => { failure = Some(error); workers.abort_all(); }
+                    Some(Err(_)) => { failure = Some(DownloadError::InvalidResponse); workers.abort_all(); }
+                    None => break,
+                }
+            }
+        }
+        while workers.join_next().await.is_some() {}
+        if let Some(error) = failure {
+            remove_segment_files(&paths)?;
+            return match error {
+                DownloadError::Filesystem { .. } => Err(error),
+                _ => Ok(SegmentAttempt::Unsupported),
+            };
+        }
+        if completed.iter().any(|done| !done) {
+            remove_segment_files(&paths)?;
+            return Ok(SegmentAttempt::Unsupported);
+        }
+
+        if *control.borrow() != WorkerControl::Running {
+            remove_segment_files(&paths)?;
+            return Ok(SegmentAttempt::Interrupted(*control.borrow()));
+        }
+        if let Err(source) = output.set_len(0).await {
+            remove_segment_files(&paths)?;
+            return Err(DownloadError::Filesystem {
+                operation: "reset segmented output",
+                path: temp_path.to_path_buf(),
+                source,
+            });
+        }
+        if let Err(source) = output.seek(std::io::SeekFrom::Start(0)).await {
+            remove_segment_files(&paths)?;
+            return Err(DownloadError::Filesystem {
+                operation: "seek segmented output",
+                path: temp_path.to_path_buf(),
+                source,
+            });
+        }
+        progress(TransferEvent::Downloading { checkpoint: None });
+        let mut written = 0_u64;
+        for path in &paths {
+            let mut part = match tokio::fs::File::open(path).await {
+                Ok(file) => file,
+                Err(source) => {
+                    remove_segment_files(&paths)?;
+                    return Err(DownloadError::Filesystem {
+                        operation: "open completed segment",
+                        path: path.clone(),
+                        source,
+                    });
+                }
+            };
+            let mut buffer = vec![0_u8; 64 * 1024];
+            loop {
+                if *control.borrow() != WorkerControl::Running {
+                    let signal = *control.borrow();
+                    drop(part);
+                    remove_segment_files(&paths)?;
+                    return Ok(SegmentAttempt::Interrupted(signal));
+                }
+                let count = match part.read(&mut buffer).await {
+                    Ok(count) => count,
+                    Err(source) => {
+                        drop(part);
+                        remove_segment_files(&paths)?;
+                        return Err(DownloadError::Filesystem {
+                            operation: "read completed segment",
+                            path: path.clone(),
+                            source,
+                        });
+                    }
+                };
+                if count == 0 {
+                    break;
+                }
+                let write = write_chunk_accounted(
+                    output,
+                    temp_path,
+                    &buffer[..count],
+                    &mut written,
+                    |count| {
+                        progress(TransferEvent::BytesWritten {
+                            bytes_written: count,
+                            total_bytes: Some(range.total),
+                        })
+                    },
+                )
+                .await;
+                if let Err(error) = write {
+                    drop(part);
+                    remove_segment_files(&paths)?;
+                    return Err(error);
+                }
+            }
+        }
+        remove_segment_files(&paths)?;
+        if written != range.total {
+            return Ok(SegmentAttempt::Unsupported);
+        }
+        Ok(SegmentAttempt::Complete(written))
+    }
+
     #[cfg(test)]
     async fn download_reserved(
         &self,
@@ -580,7 +816,18 @@ impl DownloadEngine {
         // (declared earlier, dropped later) removes the file.
         let mut file = file;
         let attempt = self
-            .transfer(&url, &temp_path, &mut file, None, None, 0, |_| {})
+            .transfer(
+                &url,
+                &temp_path,
+                &mut file,
+                None,
+                None,
+                0,
+                None,
+                None,
+                false,
+                |_| {},
+            )
             .await;
 
         let bytes_written = match attempt {
@@ -651,11 +898,48 @@ impl DownloadEngine {
         mut control: Option<&mut watch::Receiver<WorkerControl>>,
         checkpoint: Option<ResumeCheckpoint>,
         initial_bytes: u64,
+        speed_limit_bytes_per_second: Option<u64>,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+        segmented: bool,
         mut progress: F,
     ) -> Result<TransferExit, DownloadError>
     where
         F: FnMut(TransferEvent),
     {
+        if segmented
+            && initial_bytes == 0
+            && checkpoint.is_none()
+            && speed_limit_bytes_per_second.is_none()
+            && !bandwidth.as_ref().is_some_and(|limiter| limiter.enabled())
+        {
+            if let Some(receiver) = control.as_deref_mut() {
+                match self
+                    .segmented_transfer(url, temp_path, file, receiver, &mut progress)
+                    .await?
+                {
+                    SegmentAttempt::Complete(bytes) => return Ok(TransferExit::Complete(bytes)),
+                    SegmentAttempt::Interrupted(signal) => {
+                        return Ok(interrupted_transfer(signal, 0, url, None, None))
+                    }
+                    SegmentAttempt::Unsupported => {
+                        file.set_len(0)
+                            .await
+                            .map_err(|source| DownloadError::Filesystem {
+                                operation: "reset after unsupported range probe",
+                                path: temp_path.to_path_buf(),
+                                source,
+                            })?;
+                        file.seek(std::io::SeekFrom::Start(0))
+                            .await
+                            .map_err(|source| DownloadError::Filesystem {
+                                operation: "seek after unsupported range probe",
+                                path: temp_path.to_path_buf(),
+                                source,
+                            })?;
+                    }
+                }
+            }
+        }
         let mut written = initial_bytes;
         let started = Instant::now();
         let mut resume_url = checkpoint
@@ -892,6 +1176,56 @@ impl DownloadEngine {
                     });
                 })
                 .await?;
+                if let Some(limit) = speed_limit_bytes_per_second.filter(|limit| *limit > 0) {
+                    let transferred = written.saturating_sub(initial_bytes);
+                    let allowed = Duration::from_secs_f64(
+                        (transferred as f64 / limit as f64).min(JOB_DEADLINE.as_secs_f64()),
+                    );
+                    if allowed > started.elapsed() {
+                        let wait = allowed - started.elapsed();
+                        if let Some(receiver) = control.as_deref_mut() {
+                            let signal = tokio::select! {
+                                biased;
+                                signal = wait_for_control(receiver) => Some(signal),
+                                _ = tokio::time::sleep(wait) => None,
+                            };
+                            if let Some(signal) = signal {
+                                return Ok(interrupted_transfer(
+                                    signal,
+                                    written,
+                                    &resume_url,
+                                    expected_total,
+                                    etag.as_ref(),
+                                ));
+                            }
+                        } else {
+                            tokio::time::sleep(wait).await;
+                        }
+                    }
+                }
+                if let Some(deadline) = bandwidth
+                    .as_ref()
+                    .and_then(|limiter| limiter.reserve(chunk_len))
+                {
+                    if let Some(receiver) = control.as_deref_mut() {
+                        let signal = tokio::select! {
+                            biased;
+                            signal = wait_for_control(receiver) => Some(signal),
+                            _ = tokio::time::sleep_until(deadline.into()) => None,
+                        };
+                        if let Some(signal) = signal {
+                            return Ok(interrupted_transfer(
+                                signal,
+                                written,
+                                &resume_url,
+                                expected_total,
+                                etag.as_ref(),
+                            ));
+                        }
+                    } else {
+                        tokio::time::sleep_until(deadline.into()).await;
+                    }
+                }
             }
 
             if let Some(error) = body_error {
@@ -976,6 +1310,134 @@ where
     Ok(())
 }
 
+#[derive(Clone)]
+struct SegmentFetchContext {
+    client: reqwest::Client,
+    url: Url,
+    etag: reqwest::header::HeaderValue,
+    total: u64,
+    inactivity: Duration,
+}
+
+async fn fetch_segment(
+    context: SegmentFetchContext,
+    start: u64,
+    end: u64,
+    path: PathBuf,
+    index: usize,
+) -> Result<usize, DownloadError> {
+    let expected = end
+        .checked_sub(start)
+        .and_then(|span| span.checked_add(1))
+        .ok_or(DownloadError::InvalidResponse)?;
+    let response = timeout(
+        context.inactivity,
+        context
+            .client
+            .get(context.url.clone())
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
+            .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
+            .header(reqwest::header::IF_RANGE, context.etag.clone())
+            .send(),
+    )
+    .await
+    .map_err(|_| DownloadError::NetworkFailure(NetworkFailureKind::Timeout))?
+    .map_err(|_| DownloadError::NetworkFailure(NetworkFailureKind::RequestOrBody))?;
+    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT
+        || response.url() != &context.url
+        || validate_entity_headers(response.headers()).is_err()
+        || parse_strong_etag(response.headers())
+            .ok()
+            .flatten()
+            .as_ref()
+            != Some(&context.etag)
+        || parse_content_length(response.headers()).ok().flatten() != Some(expected)
+        || !parse_content_range(response.headers()).is_ok_and(|range| {
+            range.start == start && range.end == end && range.total == context.total
+        })
+    {
+        return Err(DownloadError::InvalidResponse);
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .await
+        .map_err(|source| DownloadError::Filesystem {
+            operation: "create range segment",
+            path: path.clone(),
+            source,
+        })?;
+    let mut response = response;
+    let mut received = 0_u64;
+    loop {
+        let chunk = match timeout(context.inactivity, response.chunk()).await {
+            Ok(Ok(Some(chunk))) => chunk,
+            Ok(Ok(None)) => break,
+            Ok(Err(_)) => {
+                drop(file);
+                let _ = tokio::fs::remove_file(&path).await;
+                return Err(DownloadError::NetworkFailure(
+                    NetworkFailureKind::RequestOrBody,
+                ));
+            }
+            Err(_) => {
+                drop(file);
+                let _ = tokio::fs::remove_file(&path).await;
+                return Err(DownloadError::NetworkFailure(NetworkFailureKind::Timeout));
+            }
+        };
+        let count = u64::try_from(chunk.len()).map_err(|_| DownloadError::ByteCountOverflow)?;
+        received = received
+            .checked_add(count)
+            .ok_or(DownloadError::ByteCountOverflow)?;
+        if received > expected {
+            drop(file);
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(DownloadError::InvalidResponse);
+        }
+        if let Err(source) = file.write_all(&chunk).await {
+            drop(file);
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(DownloadError::Filesystem {
+                operation: "write range segment",
+                path,
+                source,
+            });
+        }
+    }
+    file.flush()
+        .await
+        .map_err(|source| DownloadError::Filesystem {
+            operation: "flush range segment",
+            path: path.clone(),
+            source,
+        })?;
+    drop(file);
+    if received != expected {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(DownloadError::InvalidResponse);
+    }
+    Ok(index)
+}
+
+fn remove_segment_files(paths: &[PathBuf]) -> Result<(), DownloadError> {
+    for path in paths {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(DownloadError::Filesystem {
+                    operation: "remove range segment",
+                    path: path.clone(),
+                    source,
+                })
+            }
+        }
+    }
+    Ok(())
+}
+
 struct JobToken {
     id: DownloadId,
     generation: u64,
@@ -996,6 +1458,8 @@ struct JobRecord {
     temp_path: Option<PathBuf>,
     checkpoint: Option<ResumeCheckpoint>,
     resume: Option<DurableResume>,
+    speed_limit_bytes_per_second: Option<u64>,
+    segmented: bool,
     promoted: bool,
     terminal: Option<Arc<TerminalResult>>,
     task: Option<JoinHandle<()>>,
@@ -1010,10 +1474,48 @@ struct Registry {
     closing: bool,
 }
 
+/// Shared reservation clock so a global cap is aggregate across active jobs.
+struct BandwidthLimiter {
+    bytes_per_second: AtomicU64,
+    next_slot: Mutex<Instant>,
+}
+
+impl BandwidthLimiter {
+    fn new() -> Self {
+        Self {
+            bytes_per_second: AtomicU64::new(0),
+            next_slot: Mutex::new(Instant::now()),
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.bytes_per_second.load(Ordering::Relaxed) > 0
+    }
+
+    fn reserve(&self, bytes: u64) -> Option<Instant> {
+        let global = self.bytes_per_second.load(Ordering::Relaxed);
+        if global == 0 {
+            return None;
+        }
+        let rate = global;
+        let seconds = (bytes as f64 / rate as f64).min(JOB_DEADLINE.as_secs_f64());
+        let duration = Duration::from_secs_f64(seconds);
+        let now = Instant::now();
+        let mut next = self
+            .next_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let end = (*next).max(now) + duration;
+        *next = end;
+        Some(end)
+    }
+}
+
 struct ManagerCore {
     engine: DownloadEngine,
     runtime: tokio::runtime::Handle,
     config: DownloadManagerConfig,
+    bandwidth: Arc<BandwidthLimiter>,
     registry: Mutex<Registry>,
     shutdown_done: watch::Sender<bool>,
     #[cfg(test)]
@@ -1059,6 +1561,7 @@ impl DownloadManager {
                 engine,
                 runtime,
                 config,
+                bandwidth: Arc::new(BandwidthLimiter::new()),
                 registry: Mutex::new(Registry {
                     jobs: HashMap::new(),
                     queue: VecDeque::new(),
@@ -1074,6 +1577,14 @@ impl DownloadManager {
                 fail_next_cleanup: AtomicBool::new(false),
             }),
         })
+    }
+
+    /// Updates the aggregate cap for active and future jobs.
+    pub fn set_global_speed_limit_bytes_per_second(&self, limit: Option<u64>) {
+        self.core
+            .bandwidth
+            .bytes_per_second
+            .store(limit.unwrap_or(0), Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -1167,6 +1678,8 @@ impl DownloadManager {
                 temp_path: None,
                 checkpoint: None,
                 resume: request.resume,
+                speed_limit_bytes_per_second: request.speed_limit_bytes_per_second,
+                segmented: request.segmented,
                 promoted: false,
                 terminal: None,
                 task: None,
@@ -1459,6 +1972,8 @@ fn dispatch_locked(core: &Arc<ManagerCore>, registry: &mut Registry) {
         let temp_path = record.temp_path.clone();
         let checkpoint = record.checkpoint.clone();
         let bytes_written = record.bytes_written;
+        let speed_limit = record.speed_limit_bytes_per_second;
+        let segmented = record.segmented;
         let control_rx = record.control_tx.subscribe();
         let core_for_task = Arc::clone(core);
         let core_for_recovery = Arc::clone(core);
@@ -1476,6 +1991,8 @@ fn dispatch_locked(core: &Arc<ManagerCore>, registry: &mut Registry) {
                 checkpoint,
                 durable,
                 bytes_written,
+                speed_limit,
+                segmented,
                 control_rx,
             )));
             let result = (&mut guarded).await;
@@ -1524,6 +2041,8 @@ async fn prepare_managed_transfer(
     checkpoint: Option<ResumeCheckpoint>,
     durable: Option<DurableResume>,
     existing_bytes: u64,
+    speed_limit_bytes_per_second: Option<u64>,
+    segmented: bool,
     mut control_rx: watch::Receiver<WorkerControl>,
 ) -> WorkerOutput {
     // A durable resume names the persisted partial file from a previous
@@ -1588,6 +2107,16 @@ async fn prepare_managed_transfer(
                 temp: Some((temp_path, guard)),
             };
         }
+    } else if let Err(source) = file.seek(std::io::SeekFrom::Start(initial_bytes)).await {
+        drop(file);
+        return WorkerOutput::Failed {
+            error: DownloadError::Filesystem {
+                operation: "seek to verified resume offset",
+                path: temp_path.clone(),
+                source,
+            },
+            temp: Some((temp_path, guard)),
+        };
     }
     let progress_core = Arc::clone(&core);
     let progress_token = JobToken {
@@ -1602,6 +2131,9 @@ async fn prepare_managed_transfer(
             Some(&mut control_rx),
             resume_checkpoint.clone(),
             initial_bytes,
+            speed_limit_bytes_per_second,
+            Some(core.bandwidth.clone()),
+            segmented,
             |event| match event {
                 TransferEvent::Downloading { checkpoint } => {
                     set_downloading(&progress_core, &progress_token, checkpoint);
@@ -1632,6 +2164,9 @@ async fn prepare_managed_transfer(
                         Some(&mut control_rx),
                         None,
                         0,
+                        speed_limit_bytes_per_second,
+                        Some(core.bandwidth.clone()),
+                        false,
                         |event| match event {
                             TransferEvent::Downloading { checkpoint } => {
                                 set_downloading(&progress_core, &progress_token, checkpoint)
@@ -1746,6 +2281,8 @@ async fn supervise_job(
     checkpoint: Option<ResumeCheckpoint>,
     durable: Option<DurableResume>,
     bytes_written: u64,
+    speed_limit_bytes_per_second: Option<u64>,
+    segmented: bool,
     control_rx: watch::Receiver<WorkerControl>,
 ) {
     let output = prepare_managed_transfer(
@@ -1761,6 +2298,8 @@ async fn supervise_job(
         checkpoint,
         durable,
         bytes_written,
+        speed_limit_bytes_per_second,
+        segmented,
         control_rx,
     )
     .await;
@@ -2433,7 +2972,6 @@ async fn open_or_create_temp(
                     Ok((adopted_path, adopted_len)) => {
                         return match tokio::fs::OpenOptions::new()
                             .write(true)
-                            .append(true)
                             .open(&adopted_path)
                             .await
                         {

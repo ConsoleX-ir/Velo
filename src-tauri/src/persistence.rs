@@ -26,6 +26,10 @@ pub(super) struct StoredDownload {
     /// record predates durable resume or the partial file was never valid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<StoredResume>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed_limit_bytes_per_second: Option<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -365,10 +369,13 @@ mod tests {
                 speed_bytes_per_second: None,
                 eta_seconds: None,
                 error: Some("interrupted".into()),
+                scheduled_at_unix_ms: None,
             },
             destination: "C:\\Downloads\\sample.bin".into(),
             encrypted_url: vec![1, 2, 3],
             resume: None,
+            scheduled_at_unix_ms: None,
+            speed_limit_bytes_per_second: None,
         }
     }
 
@@ -476,6 +483,23 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["version"], STORE_VERSION);
         assert!(value["downloads"].is_array());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn scheduled_jobs_survive_history_round_trip() {
+        let path = test_path();
+        let mut record = sample("scheduled");
+        record.download.state = UiDownloadState::Scheduled;
+        record.download.scheduled_at_unix_ms = Some(1_900_000_000_000);
+        record.scheduled_at_unix_ms = Some(1_900_000_000_000);
+        save(&path, &[record]).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.records[0].download.state, UiDownloadState::Scheduled);
+        assert_eq!(
+            loaded.records[0].scheduled_at_unix_ms,
+            Some(1_900_000_000_000)
+        );
         fs::remove_file(path).unwrap();
     }
 
