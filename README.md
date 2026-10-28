@@ -16,7 +16,7 @@ ConsoleX Velo is a Windows-first desktop download manager. The UI is a Tauri 2 w
 
 ## Run locally
 
-Prerequisites: Node.js/npm, Rust with the MSVC Windows target and Visual C++ Build Tools, and the WebView2 runtime/development prerequisites required by Tauri.
+Prerequisites: Node.js 22.12+ (or 24.x/26+) and npm, Rust with the MSVC Windows target and Visual C++ Build Tools, and the WebView2 runtime/development prerequisites required by Tauri.
 
 ```powershell
 npm install

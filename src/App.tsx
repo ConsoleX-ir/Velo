@@ -301,6 +301,10 @@ function VeloApp() {
     [forgetDownload, push],
   );
 
+  const openMenu = useCallback((item: DownloadDto, event: React.MouseEvent<HTMLElement>) => {
+    setMenuState({ x: event.clientX, y: event.clientY, item });
+  }, []);
+
   const cancel = useCallback(
     (item: DownloadDto) => {
       void runCommand(`${item.id}:${item.generation}`, () => cancelDownloadCommand(item.id, item.generation));
@@ -442,11 +446,11 @@ function VeloApp() {
                       speedHistory={speedHistories[`${item.id}:${item.generation}`]?.samples ?? NO_SPEED_SAMPLES}
                       pending={pending.has(`${item.id}:${item.generation}`)}
                       reducedMotion={reducedMotion}
-                      onTogglePause={() => togglePause(item)}
-                      onRetry={() => retry(item)}
-                      onCancel={() => cancel(item)}
-                      onDismiss={() => dismiss(item)}
-                      onOpenMenu={(event) => setMenuState({ x: event.clientX, y: event.clientY, item })}
+                      onTogglePause={togglePause}
+                      onRetry={retry}
+                      onCancel={cancel}
+                      onDismiss={dismiss}
+                      onOpenMenu={openMenu}
                     />
                   ))}
                 </div>

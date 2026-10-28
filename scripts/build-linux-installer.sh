@@ -5,7 +5,7 @@
 # Run from a Linux machine (Ubuntu 22.04+ / Debian 12+ or equivalent)
 # with the following installed:
 #
-#   * Node.js 18+ and npm
+#   * Node.js 22.12+ (or 24+, 26+) and npm
 #   * Rust stable toolchain (rustup default stable)
 #   * System libraries: libwebkit2gtk-4.1-dev, libgtk-3-dev,
 #     libayatana-appindicator3-dev (tray), librsvg2-dev,
@@ -50,7 +50,12 @@ if [[ "$SKIP_CHECKS" == false ]]; then
   done
 
   echo "rustc: $(rustc --version)"
-  echo "node:  $(node --version)"
+  node_version="$(node -p 'process.versions.node')"
+  if ! node -e 'const [major, minor] = process.versions.node.split(".").map(Number); if (!((major === 22 && minor >= 12) || major === 24 || major >= 26)) process.exit(1)'; then
+    echo "ERROR: Node.js $node_version is unsupported by the locked frontend dependencies. Use 22.12+, 24.x, or 26+." >&2
+    exit 1
+  fi
+  echo "node:  v$node_version"
 
   # Verify the default target is Linux x86_64 or aarch64.
   local_target="$(rustc -vV | grep host | cut -d' ' -f2)"
@@ -59,7 +64,7 @@ if [[ "$SKIP_CHECKS" == false ]]; then
   # Check for required system libraries.
   echo ""
   echo "-- Checking system libraries"
-  for lib in webkit2gtk-4.1 gtk+-3.0 libayatana-appindicator3-0.1 librsvg-2.0 openssl; do
+  for lib in webkit2gtk-4.1 gtk+-3.0 ayatana-appindicator3-0.1 librsvg-2.0 openssl; do
     if ! pkg-config --exists "$lib" 2>/dev/null; then
       echo "WARNING: $lib not found via pkg-config. Build may fail."
       echo "  On Ubuntu/Debian: sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev"

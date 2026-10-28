@@ -6,6 +6,8 @@
 #   3. Runs the existing build-linux-installer.sh inside WSL
 #   4. Copies the resulting .deb and .AppImage back to the Windows project
 #
+# Node.js 22.12+ (or 24.x/26+) and npm must already be installed in the distro.
+#
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File scripts\build-linux-wsl.ps1
 #   powershell -ExecutionPolicy Bypass -File scripts\build-linux-wsl.ps1 -SkipSetup
@@ -32,6 +34,16 @@ function Invoke-WSL {
     if ($LASTEXITCODE -ne 0) { throw "WSL command failed: $Command" }
 }
 
+function Invoke-WSLRoot {
+    param([string]$Command)
+    if ($Distro) {
+        wsl -d $Distro -u root -- bash -lc $Command
+    } else {
+        wsl -u root -- bash -lc $Command
+    }
+    if ($LASTEXITCODE -ne 0) { throw "WSL root command failed: $Command" }
+}
+
 # ── 1. Check WSL availability ──────────────────────────────────────────
 Write-Host "`n== ConsoleX Velo WSL build ==" -ForegroundColor Cyan
 
@@ -46,19 +58,21 @@ Write-Host "WSL distro: $wslDistroLabel"
 # ── 2. Install prerequisites (skip with -SkipSetup) ───────────────────
 if (-not $SkipSetup) {
     Write-Host "`n-- Installing system prerequisites in WSL" -ForegroundColor Yellow
-    Invoke-WSL @"
-sudo apt-get update -qq &&
-sudo apt-get install -y -qq \
+    Invoke-WSLRoot @"
+apt-get update -qq &&
+apt-get install -y -qq \
   libwebkit2gtk-4.1-dev \
   libgtk-3-dev \
   libayatana-appindicator3-dev \
   librsvg2-dev \
   libsoup-3.0-dev \
   libssl-dev \
+  libxdo-dev \
   patchelf \
   pkg-config \
   build-essential \
   curl \
+  wget \
   file
 "@
     Write-Host "Prerequisites installed." -ForegroundColor Green
@@ -83,7 +97,7 @@ Write-Host "Project copied." -ForegroundColor Green
 
 # ── 4. Run the build inside WSL ───────────────────────────────────────
 Write-Host "`n-- Running Linux build inside WSL" -ForegroundColor Yellow
-Invoke-WSL "cd $wslBuildDir && bash scripts/build-linux-installer.sh --skip-checks"
+Invoke-WSL "cd $wslBuildDir && bash scripts/build-linux-installer.sh"
 Write-Host "Build complete." -ForegroundColor Green
 
 # ── 5. Copy artifacts back to Windows ─────────────────────────────────

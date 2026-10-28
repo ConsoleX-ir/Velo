@@ -2,7 +2,7 @@
 #
 # Builds the NSIS installer from this source tree. Run from a Windows machine
 # (Windows 10/11 x64) with:
-#   * Node.js 18+ and npm on PATH
+#   * Node.js 22.12+ (or 24+, 26+) and npm on PATH
 #   * Rust stable with the MSVC toolchain (`rustup default stable`) — the
 #     "Desktop development with C++" Visual Studio Build Tools workload
 #   * WebView2 (preinstalled on Windows 11; Tauri offers the bootstrapper at
@@ -32,7 +32,15 @@ if (-not $SkipChecks) {
     }
     $rustVersion = (rustc --version)
     Write-Host "rustc: $rustVersion"
-    Write-Host "node:  $(node --version)"
+    $nodeVersion = node -p "process.versions.node"
+    if ($LASTEXITCODE -ne 0) { throw "Could not determine the Node.js version." }
+    $nodeParts = $nodeVersion.Split(".") | ForEach-Object { [int]$_ }
+    $supportedNode = ($nodeParts[0] -eq 22 -and $nodeParts[1] -ge 12) -or
+        $nodeParts[0] -eq 24 -or $nodeParts[0] -ge 26
+    if (-not $supportedNode) {
+        throw "Node.js $nodeVersion is unsupported by the locked frontend dependencies. Use 22.12+, 24.x, or 26+."
+    }
+    Write-Host "node:  v$nodeVersion"
 
     # Verify the MSVC target that Tauri needs on Windows.
     $targets = rustup target list --installed

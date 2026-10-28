@@ -38,11 +38,11 @@ export type DownloadRowProps = {
   pending: boolean;
   /** In-app reduced-motion preference, applied to the queue indicator. */
   reducedMotion?: boolean;
-  onTogglePause: () => void;
-  onRetry: () => void;
-  onCancel: () => void;
-  onDismiss: () => void;
-  onOpenMenu: (event: React.MouseEvent<HTMLElement>) => void;
+  onTogglePause: (item: DownloadDto) => void;
+  onRetry: (item: DownloadDto) => void;
+  onCancel: (item: DownloadDto) => void;
+  onDismiss: (item: DownloadDto) => void;
+  onOpenMenu: (item: DownloadDto, event: React.MouseEvent<HTMLElement>) => void;
 };
 
 /**
@@ -91,7 +91,7 @@ export const DownloadRow = memo(function DownloadRow({
       className={`download-row state-${item.state}`}
       onContextMenu={(event) => {
         event.preventDefault();
-        onOpenMenu(event);
+        onOpenMenu(item, event);
       }}
     >
       {/* Tiles carry the pill's hue: red for genuinely moving transfers,
@@ -160,7 +160,7 @@ export const DownloadRow = memo(function DownloadRow({
             <button
               type="button"
               className="row-action"
-              onClick={onTogglePause}
+              onClick={() => onTogglePause(item)}
               disabled={pending}
               aria-label={`${item.state === "paused" ? "Resume" : "Pause"} ${item.fileName}`}
             >
@@ -172,7 +172,7 @@ export const DownloadRow = memo(function DownloadRow({
           <button
             type="button"
             className="row-action cancel"
-            onClick={onCancel}
+            onClick={() => onCancel(item)}
             disabled={pending}
             aria-label={`Cancel ${item.fileName}`}
           >
@@ -180,12 +180,12 @@ export const DownloadRow = memo(function DownloadRow({
           </button>
         )}
         {(item.state === "failed" || item.state === "cancelled" || item.state === "interrupted") && (
-          <button type="button" className="row-action" onClick={onRetry} disabled={pending} aria-label={`Retry ${item.fileName}`}>
+          <button type="button" className="row-action" onClick={() => onRetry(item)} disabled={pending} aria-label={`Retry ${item.fileName}`}>
             <Icon name="refresh" size={16} />
           </button>
         )}
         {terminal && (
-          <button type="button" className="row-action" onClick={onDismiss} disabled={pending} aria-label={`Remove ${item.fileName} from the list`}>
+          <button type="button" className="row-action" onClick={() => onDismiss(item)} disabled={pending} aria-label={`Remove ${item.fileName} from the list`}>
             {pending ? <Spinner /> : <Icon name="trash" size={16} />}
           </button>
         )}

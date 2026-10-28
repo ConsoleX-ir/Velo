@@ -80,7 +80,7 @@ const PAD = 14 // canvas bleed around the pill, for shadows and ripples
 /* ---------- styles ---------- */
 const NIMBUS_CSS = `
 .nimbus-nav{--n-tint:rgba(255,255,255,.14);--n-fg:#0B132B;--n-fg-soft:rgba(11,19,43,.6);--n-rim:rgba(255,255,255,.7);
-  position:relative;display:inline-flex;align-items:center;gap:2px;padding:6px;border-radius:999px;isolation:isolate;
+  position:relative;display:inline-flex;align-items:center;gap:2px;padding:4px;border-radius:999px;isolation:isolate;
   font-family:ui-sans-serif,-apple-system,"SF Pro Text","Segoe UI",system-ui,sans-serif;-webkit-font-smoothing:antialiased;user-select:none;-webkit-tap-highlight-color:transparent}
 .nimbus-nav[data-tone="dark"]{--n-tint:rgba(10,18,40,.26);--n-fg:#F1F7FF;--n-fg-soft:rgba(241,247,255,.66);--n-rim:rgba(255,255,255,.34)}
 .nimbus-glass{position:absolute;inset:0;border-radius:inherit;z-index:-2;overflow:hidden;background:var(--n-tint);
@@ -93,8 +93,8 @@ const NIMBUS_CSS = `
   background:radial-gradient(120% 140% at 30% 0%,rgba(255,255,255,.75),rgba(255,255,255,0) 55%),rgba(255,255,255,.38);
   box-shadow:inset 0 1px 1px rgba(255,255,255,.95),inset 0 -2px 6px rgba(0,162,255,.22),inset 0 0 0 1px rgba(255,255,255,.55),0 6px 16px -6px rgba(0,70,140,.45)}
 .nimbus-nav[data-gl="off"] .nimbus-drop{display:block}
-.nimbus-item{position:relative;z-index:1;display:inline-flex;align-items:center;gap:8px;height:42px;padding:0 16px;border:0;border-radius:999px;background:none;color:var(--n-fg-soft);
-  font-family:inherit;font-weight:500;font-size:14px;line-height:1;letter-spacing:-.01em;text-decoration:none;cursor:pointer;transition:color .25s}
+.nimbus-item{position:relative;z-index:1;display:inline-flex;align-items:center;gap:6px;height:34px;padding:0 12px;border:0;border-radius:999px;background:none;color:var(--n-fg-soft);
+  font-family:inherit;font-weight:500;font-size:13px;line-height:1;letter-spacing:-.01em;text-decoration:none;cursor:pointer;transition:color .25s}
 .nimbus-item:hover,.nimbus-item[aria-current="page"]{color:var(--n-fg)}
 .nimbus-item:focus-visible{outline:2px solid #00A2FF;outline-offset:2px}
 .nimbus-item[aria-checked="true"]{color:var(--n-fg)}
@@ -391,8 +391,9 @@ export function LiquidNavbar({
       step(dt, now)
       draw()
       const busy = s.moving || s.rips.length || s.sats.length || s.mouse.s > 0.01
-      // ambient water keeps moving while visible; reduced-motion only animates on change
-      if (s.visible && (!s.reduce || busy)) s.raf = requestAnimationFrame(tick)
+      // Keep the water shader active only while the pill is responding to an
+      // interaction; an idle filter bar does not need a perpetual GPU loop.
+      if (s.visible && busy) s.raf = requestAnimationFrame(tick)
       else s.raf = 0
     }
     s.raf = requestAnimationFrame(tick)
