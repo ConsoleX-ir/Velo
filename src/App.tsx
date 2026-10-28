@@ -9,8 +9,11 @@ import { AddDownloadDialog } from "./components/AddDownloadDialog";
 import { Dialog } from "./components/ui/dialog";
 import { SettingsView } from "./components/SettingsView";
 import { EmptyState, FilteredEmpty } from "./components/ui/empty-state";
-import { SegmentedControl, type SegmentedOption } from "./components/ui/segmented";
-import { Spinner } from "./components/ui/spinner";
+import { AILoader } from "./components/ui/ai-loader";
+import { DateTimeField } from "./components/ui/date-time-picker";
+import { LiquidNavbar } from "./components/ui/liquid-glass-navbar";
+import { ShaderBackground } from "./components/ui/manu";
+import type { SegmentedOption } from "./components/ui/segmented";
 import { ToastProvider, useToast } from "./components/ui/toast";
 import { Button } from "./components/ui/button";
 import { Icon } from "./components/icons";
@@ -343,6 +346,7 @@ function VeloApp() {
 
   return (
     <div className="app-shell">
+      {!reducedMotion && <ShaderBackground className="shader-backdrop" />}
       <TitleBar />
       <div className="app-body">
         <Sidebar view={view} onView={setView} downloads={downloads} />
@@ -373,13 +377,15 @@ function VeloApp() {
 
               {showFilters && (
                 <div className="toolbar">
-                  <SegmentedControl
-                    aria-label="Filter downloads"
-                    className="filter-row"
-                    optionClassName="filter-chip"
-                    value={filter}
-                    onChange={setFilter}
-                    options={FILTER_OPTIONS}
+                  <LiquidNavbar
+                    selectable
+                    ariaLabel="Filter downloads"
+                    className="filter-pill"
+                    tone={theme === "dark" ? "dark" : "light"}
+                    reducedMotion={reducedMotion}
+                    active={Math.max(0, FILTER_OPTIONS.findIndex((option) => option.value === filter))}
+                    onChange={(index) => setFilter(FILTER_OPTIONS[index].value)}
+                    items={FILTER_OPTIONS.map(({ label }) => ({ label }))}
                   />
                   <label className="search-box">
                     <Icon name="search" size={15} />
@@ -409,7 +415,9 @@ function VeloApp() {
               )}
 
               {!ready ? (
-                <div className="loading-state"><Spinner className="loading-ring" /> Connecting to the local download engine…</div>
+                <div className="loading-state">
+                  <AILoader label="Connecting to the local download engine" variant="dots" reduced={reducedMotion} />
+                </div>
               ) : listEmpty ? (
                 firstRun ? (
                   <EmptyState
@@ -433,6 +441,7 @@ function VeloApp() {
                       item={item}
                       speedHistory={speedHistories[`${item.id}:${item.generation}`]?.samples ?? NO_SPEED_SAMPLES}
                       pending={pending.has(`${item.id}:${item.generation}`)}
+                      reducedMotion={reducedMotion}
                       onTogglePause={() => togglePause(item)}
                       onRetry={() => retry(item)}
                       onCancel={() => cancel(item)}
@@ -500,7 +509,7 @@ function ScheduleEditDialog({ item, onClose, onSaved, onError }: { item: Downloa
     <p className="dialog-intro">{item.fileName}</p>
     <form onSubmit={(event) => void save(event)}>
       <label className="field-label" htmlFor="edit-schedule-time">Start at</label>
-      <div className="input-wrap"><input id="edit-schedule-time" type="datetime-local" min={toLocalDateTime(Date.now() + 60_000)} value={when} onChange={(event) => setWhen(event.target.value)} /></div>
+      <DateTimeField id="edit-schedule-time" value={when} minMs={Date.now() + 60_000} disabled={busy} onChange={setWhen} />
       <div className="dialog-actions"><Button variant="secondary" onClick={onClose} disabled={busy}>Cancel</Button><Button variant="primary" type="submit" loading={busy}>Save schedule</Button></div>
     </form>
   </Dialog>;

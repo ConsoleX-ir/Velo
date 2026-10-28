@@ -10,9 +10,14 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@radix-ui/react-scroll-area": "^1.4.0",
     "@tauri-apps/api": "^2.8.0",
     "@tauri-apps/plugin-dialog": "^2.4.0",
+    "class-variance-authority": "^0.7.1",
+    "framer-motion": "^14.7.1",
+    "lucide-react": "^1.63.0",
     "react": "^19.1.0",
+    "react-day-picker": "^10.0.2",
     "react-dom": "^19.1.0"
   },
   "devDependencies": {

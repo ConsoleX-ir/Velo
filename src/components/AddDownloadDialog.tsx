@@ -2,6 +2,7 @@ import { useMemo, useState, type FormEvent } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Dialog } from "./ui/dialog";
 import { Button } from "./ui/button";
+import { DateTimeField } from "./ui/date-time-picker";
 import { Icon } from "./icons";
 import { scheduleDownload, startDownload } from "../commands";
 import {
@@ -44,7 +45,7 @@ export function AddDownloadDialog({ settings, onClose, onStarted, onCommandError
 
   const resolvedFileName = fileName.trim() || suggested || "";
   const minimumDate = new Date(Date.now() + 60_000);
-  const minSchedule = `${minimumDate.getFullYear()}-${String(minimumDate.getMonth() + 1).padStart(2, "0")}-${String(minimumDate.getDate()).padStart(2, "0")}T${String(minimumDate.getHours()).padStart(2, "0")}:${String(minimumDate.getMinutes()).padStart(2, "0")}`;
+  const minScheduleMs = minimumDate.getTime();
 
   async function chooseFolder() {
     setError(null);
@@ -181,7 +182,7 @@ export function AddDownloadDialog({ settings, onClose, onStarted, onCommandError
           </div>
         </div>
         <label className="field-label destination-label" htmlFor="download-schedule">Start at (optional)</label>
-        <div className="input-wrap"><input id="download-schedule" type="datetime-local" value={scheduledAt} min={minSchedule} onChange={(event) => setScheduledAt(event.target.value)} /></div>
+        <DateTimeField id="download-schedule" value={scheduledAt} minMs={minScheduleMs} disabled={busy} onChange={setScheduledAt} />
         <span className="field-hint">Velo starts the download at this local date and time, including after restart.</span>
         <label className="field-label destination-label" htmlFor="download-speed-limit">Per-download speed limit (optional)</label>
         <div className="input-wrap"><input id="download-speed-limit" type="number" min="1" max="1048576" value={speedLimitKib} onChange={(event) => setSpeedLimitKib(event.target.value)} placeholder="Unlimited" /><span className="input-suffix">KiB/s</span></div>

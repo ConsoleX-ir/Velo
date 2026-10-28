@@ -1,5 +1,6 @@
 import { memo } from "react";
 import { STATE_LABELS, StatePill } from "./ui/badge";
+import { AILoader } from "./ui/ai-loader";
 import { ProgressTrack } from "./ui/progress";
 import { Spinner } from "./ui/spinner";
 import { Tooltip } from "./ui/tooltip";
@@ -35,6 +36,8 @@ export type DownloadRowProps = {
   item: DownloadDto;
   speedHistory: number[];
   pending: boolean;
+  /** In-app reduced-motion preference, applied to the queue indicator. */
+  reducedMotion?: boolean;
   onTogglePause: () => void;
   onRetry: () => void;
   onCancel: () => void;
@@ -52,6 +55,7 @@ export const DownloadRow = memo(function DownloadRow({
   item,
   speedHistory,
   pending,
+  reducedMotion = false,
   onTogglePause,
   onRetry,
   onCancel,
@@ -123,6 +127,9 @@ export const DownloadRow = memo(function DownloadRow({
           />
         )}
         <div className="row-meta">
+          {item.state === "queued" && (
+            <AILoader variant="dots" reduced={reducedMotion} className="row-queue-indicator" />
+          )}
           {item.error && (
             <span
               className={`row-meta-state${item.state === "failed" ? " error" : ""}${

@@ -22,7 +22,8 @@ export type IconName =
   | "trash"
   | "shield"
   | "drive"
-  | "spark";
+  | "spark"
+  | "calendar";
 
 const PATHS: Record<IconName, ReactNode> = {
   download: <><path d="M12 3v11" /><path d="m7 10 5 5 5-5" /><path d="M5 20h14" /></>,
@@ -47,6 +48,7 @@ const PATHS: Record<IconName, ReactNode> = {
   shield: <><path d="M12 3 5 5.8v5.4c0 4.3 2.9 8.2 7 9.3 4.1-1.1 7-5 7-9.3V5.8Z" /><path d="m9.2 12 2 2 3.6-3.8" /></>,
   drive: <><rect x="3" y="4" width="18" height="7" rx="1.5" /><rect x="3" y="13" width="18" height="7" rx="1.5" /><path d="M7 7.5h.01M7 16.5h.01" /></>,
   spark: <><path d="m12 3 1.6 6.4L20 11l-6.4 1.6L12 19l-1.6-6.4L4 11l6.4-1.6Z" /><path d="m19 15 .8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8Z" /></>,
+  calendar: <><rect x="3.5" y="5" width="17" height="16" rx="2.5" /><path d="M8 3v4M16 3v4M3.5 10.5h17" /></>,
 };
 
 export function Icon({ name, size = 18 }: { name: IconName; size?: number }) {

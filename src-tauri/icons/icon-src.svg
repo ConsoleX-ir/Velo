@@ -1,7 +1,14 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" fill="none">
-  <rect width="1024" height="1024" rx="228" fill="#1B1B20"/>
+  <defs>
+    <linearGradient id="aurora" x1="256" y1="170" x2="768" y2="853" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6BD7FA"/>
+      <stop offset="0.55" stop-color="#46C8F2"/>
+      <stop offset="1" stop-color="#8F7BFF"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="228" fill="#0C1322"/>
   <rect x="7" y="7" width="1010" height="1010" rx="221" stroke="#FFFFFF" stroke-opacity="0.10" stroke-width="14"/>
-  <path d="M203 192 512 821 821 192" stroke="#E5484D" stroke-width="112" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M512 309v288" stroke="#F2F3F5" stroke-width="69" stroke-linecap="round"/>
-  <path d="M395 480 512 597 629 480" stroke="#F2F3F5" stroke-width="69" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M203 192 512 821 821 192" stroke="url(#aurora)" stroke-width="112" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M512 309v288" stroke="#EDF2FB" stroke-width="69" stroke-linecap="round"/>
+  <path d="M395 480 512 597 629 480" stroke="#EDF2FB" stroke-width="69" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>
