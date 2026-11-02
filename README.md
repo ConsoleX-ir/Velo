@@ -1,507 +1,225 @@
- <div align="center">
+# Velo
 
-  <img src="src-tauri/icons/icon.png" alt="Velo Logo" width="112" />
+<div align="center">
+  <img src="src-tauri/icons/icon.png" width="112" alt="Velo Logo" />
 
-  # Velo
+  **Move files. Not limits.**
 
-  ### Move files. Not limits.
+  A modern, lightweight, and powerful download manager built with Rust, Tauri, and React.
 
-  **A modern, high-performance download manager built with Rust and Tauri.**
+  [![Version](https://img.shields.io/badge/version-0.7.0-00bcd4.svg)](https://github.com/ConsoleX-ir/Velo/releases)
+  [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+  ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey.svg)
+  ![Rust](https://img.shields.io/badge/Rust-powered-orange.svg)
+  ![Tauri](https://img.shields.io/badge/Tauri-2-blue.svg)
 
-  Reliable downloads, intelligent scheduling, and a refined desktop experience — all in one lightweight application.
+  <br />
 
-  <p>
-    <a href="https://github.com/ConsoleX-ir/Velo/releases">
-      <img src="https://img.shields.io/github/v/release/ConsoleX-ir/Velo?style=for-the-badge&color=8B5CF6&label=Latest%20Release" alt="Latest Release" />
-    </a>
-    <a href="https://github.com/ConsoleX-ir/Velo/blob/main/LICENSE">
-      <img src="https://img.shields.io/github/license/ConsoleX-ir/Velo?style=for-the-badge&color=06B6D4" alt="License" />
-    </a>
-    <a href="https://github.com/ConsoleX-ir/Velo">
-      <img src="https://img.shields.io/github/stars/ConsoleX-ir/Velo?style=for-the-badge&color=F59E0B" alt="GitHub Stars" />
-    </a>
-    <a href="https://github.com/ConsoleX-ir/Velo/issues">
-      <img src="https://img.shields.io/github/issues/ConsoleX-ir/Velo?style=for-the-badge&color=EC4899" alt="Issues" />
-    </a>
-  </p>
-
-  <p>
-    <img src="https://img.shields.io/badge/Rust-Backend-orange?style=flat-square&logo=rust" alt="Rust" />
-    <img src="https://img.shields.io/badge/Tauri-2-FFC131?style=flat-square&logo=tauri" alt="Tauri" />
-    <img src="https://img.shields.io/badge/React-Frontend-61DAFB?style=flat-square&logo=react" alt="React" />
-    <img src="https://img.shields.io/badge/TypeScript-Language-3178C6?style=flat-square&logo=typescript" alt="TypeScript" />
-    <img src="https://img.shields.io/badge/Tailwind_CSS-v4-06B6D4?style=flat-square&logo=tailwindcss" alt="Tailwind CSS" />
-  </p>
-
-  <p>
-    <a href="#-features">Features</a> •
-    <a href="#-screenshots">Screenshots</a> •
-    <a href="#-installation">Installation</a> •
-    <a href="#-development">Development</a> •
-    <a href="#-architecture">Architecture</a>
-  </p>
-
+  [Features](#-features) · [Installation](#-installation) · [Development](#-development) · [Architecture](#-architecture) · [License](#-license)
 </div>
 
 ---
 
-## ✨ About Velo
+## ✨ Overview
 
-Velo is a modern desktop download manager designed around one simple idea: **downloads should be fast, reliable, and effortless to manage.**
+**Velo** is a modern desktop download manager designed to make downloading files fast, reliable, and straightforward.
 
-Powered by a native Rust download engine and a React-based interface, Velo combines efficient network operations with a carefully designed desktop experience.
+Built with a high-performance Rust backend and a modern React interface, Velo combines efficient download management with a polished desktop experience.
 
-From concurrent HTTP transfers and automatic retries to persistent recovery and intelligent scheduling, Velo is built to handle downloads without unnecessary complexity.
-
-It is designed to be lightweight, responsive, and practical — without sacrificing control over your downloads.
+The goal is simple: deliver a powerful download engine without unnecessary complexity, excessive resource consumption, advertisements, or artificial limitations.
 
 ## 🚀 Features
 
-<table>
-  <tr>
-    <td width="50%">
-      <h3>⚡ High-Performance Engine</h3>
-      <ul>
-        <li>Native Rust download engine</li>
-        <li>Concurrent HTTP Range transfers</li>
-        <li>Server-aware transfer validation</li>
-        <li>Configurable bandwidth limits</li>
-        <li>Unlimited speed mode</li>
-      </ul>
-    </td>
-    <td width="50%">
-      <h3>📥 Smart Download Management</h3>
-      <ul>
-        <li>Automatic queue management</li>
-        <li>Configurable concurrency</li>
-        <li>Pause, resume, cancel, and retry</li>
-        <li>Download scheduling</li>
-        <li>Persistent download history</li>
-      </ul>
-    </td>
-  </tr>
-  <tr>
-    <td width="50%">
-      <h3>🧠 Intelligent Experience</h3>
-      <ul>
-        <li>Clipboard URL detection</li>
-        <li>URL inspection before downloading</li>
-        <li>Automatic metadata extraction</li>
-        <li>Redirect-aware inspection</li>
-        <li>Automatic retry for transient failures</li>
-      </ul>
-    </td>
-    <td width="50%">
-      <h3>🖥️ Native Desktop Integration</h3>
-      <ul>
-        <li>System tray integration</li>
-        <li>Minimize to tray</li>
-        <li>Launch at startup</li>
-        <li>Native desktop notifications</li>
-        <li>Persistent application settings</li>
-      </ul>
-    </td>
-  </tr>
-</table>
+- **High-performance engine** — Powered by Rust for efficient download processing.
+- **Download management** — Add, monitor, pause, resume, and manage downloads.
+- **Multi-connection downloads** — Supports segmented HTTP downloads when server capabilities allow it.
+- **Real-time progress** — Monitor download progress, speed, and status.
+- **Download scheduling** — Manage when downloads should run.
+- **System tray integration** — Keep Velo running in the background.
+- **Desktop notifications** — Get notified about completed and failed downloads.
+- **Launch at startup** — Optionally start Velo when your system boots.
+- **Light & Dark themes** — Choose the appearance that suits your environment.
+- **Lightweight experience** — Designed to keep resource usage under control.
+- **Free and open source** — No advertisements or paid feature restrictions.
 
-### ⚡ Download Engine
+## 🛠️ Tech Stack
 
-Velo uses a Rust-based engine to manage HTTP and HTTPS transfers.
-
-- **Concurrent transfers:** Uses multiple validated HTTP Range requests when supported by the server.
-- **Safe continuation:** Validates server responses and entity information before continuing interrupted transfers.
-- **Automatic recovery:** Supports persistent download metadata and recovery across application restarts.
-- **Smart scheduling:** Manages active and queued downloads automatically.
-- **Bandwidth control:** Supports global and per-download speed limits.
-- **Unlimited mode:** Avoids artificial speed restrictions when unlimited mode is selected.
-
-### 🎨 Desktop Experience
-
-Velo features an Industrial Futurism-inspired interface with a focus on clarity, responsiveness, and visual character.
-
-- Dark and light themes.
-- Compact download cards.
-- Live download speed visualizations.
-- Responsive layouts.
-- Organized settings and controls.
-- Native desktop interactions.
-
----
+| Technology | Purpose |
+|---|---|
+| [Rust](https://www.rust-lang.org/) | Download engine and backend |
+| [Tauri 2](https://tauri.app/) | Desktop application framework |
+| [React](https://react.dev/) | User interface |
+| [TypeScript](https://www.typescriptlang.org/) | Type-safe frontend development |
+| [Vite](https://vite.dev/) | Frontend build tooling |
+| [Tailwind CSS v4](https://tailwindcss.com/) | UI styling |
 
 ## 📦 Installation
 
-Prebuilt packages are intended to be distributed through the GitHub repository.
-
-**Supported package formats:**
-
-| Platform | Package | Format |
-|---|---|---|
-| Windows | NSIS Installer | `.exe` |
-| Linux | AppImage | `.AppImage` |
-| Linux | Debian Package | `.deb` |
+Download the latest release from the [GitHub Releases](https://github.com/ConsoleX-ir/Velo/releases) page.
 
 ### Windows
 
-1. Download the latest Windows installer.
-2. Run the `.exe` installer.
-3. Follow the installation wizard.
-4. Launch Velo from the Start Menu.
+Download and run the Windows installer (`.exe`).
 
-**Requirements**
-- Windows 10 or later.
-- WebView2 Runtime.
-- x64 architecture for the current Windows build.
+### Linux
 
-### Linux — AppImage
+Choose the package that matches your distribution:
 
-```bash
-chmod +x Velo-0.7.0.AppImage
-./Velo-0.7.0.AppImage
-```
+| Format | Description |
+|---|---|
+| `.AppImage` | Portable application package |
+| `.deb` | Debian and Ubuntu-based distributions |
 
-### Linux — Debian / Ubuntu
+> **Note:** Available packages depend on the artifacts published with each release.
 
-```bash
-sudo apt install ./Velo-0.7.0.deb
-```
+## 💻 Development
 
-After installation, launch Velo from your desktop application launcher.
-
-> Linux runtime requirements can vary depending on your distribution and desktop environment.
-
-### 📂 Installer Directory
-
-Generated installers are organized in the repository root:
-
-```text
-installer/
-├── Velo-0.7.0-Windows-Setup.exe
-├── Velo-0.7.0-Linux.AppImage
-└── Velo-0.7.0-Linux.deb
-```
-
-Actual filenames should match the generated release artifacts.
-
----
-
-## 🛠️ Development
-
-Want to build Velo from source? Follow the instructions below.
+Want to build Velo from source or contribute to its development?
 
 ### Prerequisites
 
-| Tool | Requirement |
-|---|---|
-| Node.js | 22.12+ or supported 24.x / 26+ |
-| npm | Compatible with the installed Node.js version |
-| Rust | Stable toolchain |
-| Tauri | Tauri 2 prerequisites |
+Make sure you have the following tools installed:
 
-For Linux development, install the required system dependencies:
+- [Node.js](https://nodejs.org/) — 22.12 or newer
+- [npm](https://www.npmjs.com/)
+- [Rust](https://www.rust-lang.org/tools/install)
+- [Tauri prerequisites](https://tauri.app/start/prerequisites/)
 
-```bash
-sudo apt update
-
-sudo apt install \
-  libwebkit2gtk-4.1-dev \
-  libgtk-3-dev \
-  libayatana-appindicator3-dev \
-  librsvg2-dev \
-  libssl-dev \
-  pkg-config \
-  build-essential
-```
-
-### Clone the Repository
+### Clone the repository
 
 ```bash
 git clone https://github.com/ConsoleX-ir/Velo.git
-
 cd Velo
 ```
 
-### Install Dependencies
+### Install dependencies
 
 ```bash
-npm ci
+npm install
 ```
 
-### Run Development Server
+### Run in development mode
 
 ```bash
 npm run tauri dev
 ```
 
-### Build Frontend
-
-```bash
-npm run build
-```
-
-### Build Production Application
+### Build the application
 
 ```bash
 npm run tauri build
 ```
 
-Generated application bundles are available under:
-
-```text
-src-tauri/target/release/bundle/
-```
-
----
-
-## 📦 Building Installers
-
-Velo includes dedicated scripts for building platform-specific installers.
-
-### Windows
-
-Run PowerShell from the project root:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\build-windows-installer.ps1
-```
-
-To skip prerequisite checks:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\build-windows-installer.ps1 -SkipChecks
-```
-
-### Linux
-
-Run on a supported Linux distribution:
-
-```bash
-bash scripts/build-linux-installer.sh
-```
-
-To skip prerequisite checks:
-
-```bash
-bash scripts/build-linux-installer.sh --skip-checks
-```
-
-### Linux Through WSL
-
-Windows users can build Linux packages through WSL:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\build-linux-wsl.ps1
-```
-
-The WSL script uses a Linux environment to generate Linux-native packages.
-
----
-
-## 🏗️ Architecture
-
-Velo uses a native backend and a modern web-based desktop frontend.
-
-```text
-                   ┌──────────────────────────┐
-                   │       Velo Desktop       │
-                   └────────────┬─────────────┘
-                                │
-                   ┌────────────▼─────────────┐
-                   │       React + TS         │
-                   │       User Interface     │
-                   └────────────┬─────────────┘
-                                │
-                         Tauri IPC / Events
-                                │
-                   ┌────────────▼─────────────┐
-                   │         Rust             │
-                   │     Application Layer    │
-                   └────────────┬─────────────┘
-                                │
-             ┌──────────────────┼──────────────────┐
-             │                  │                  │
-     ┌───────▼────────┐ ┌───────▼────────┐ ┌───────▼────────┐
-     │ Download       │ │ Scheduler &   │ │ Persistence    │
-     │ Engine         │ │ Manager        │ │ & Recovery     │
-     └───────┬────────┘ └────────────────┘ └────────────────┘
-             │
-     ┌───────▼────────┐
-     │ HTTP / HTTPS   │
-     │ Network Layer  │
-     └────────────────┘
-```
-
-### Technology Stack
-
-| Layer | Technology |
-|---|---|
-| Desktop Runtime | Tauri 2 |
-| Backend | Rust |
-| Frontend | React |
-| Language | TypeScript |
-| Build Tool | Vite |
-| Styling | Tailwind CSS v4 |
-| HTTP Client | Reqwest |
-| Package Manager | npm |
-
----
-
-## 🧪 Testing
-
-Velo includes separate test suites for its Rust engine, Tauri backend, and frontend.
-
-### Rust Engine
+### Run tests
 
 ```bash
 cargo test
 ```
 
-### Tauri Backend
+For frontend tests:
 
 ```bash
-cargo test --manifest-path src-tauri/Cargo.toml
+npm test
 ```
 
-### Frontend
+## 🏗️ Architecture
 
-```bash
-npx vitest run
+Velo uses a layered architecture that separates the download engine, desktop integration, and frontend interface.
+
+```text
+              ┌──────────────────────┐
+              │      React UI        │
+              │   TypeScript + Vite  │
+              └──────────┬───────────┘
+                         │
+                    Tauri IPC
+                         │
+              ┌──────────▼───────────┐
+              │    Tauri Backend     │
+              │   Commands & Events  │
+              └──────────┬───────────┘
+                         │
+              ┌──────────▼───────────┐
+              │   Download Manager   │
+              │   Queue & Lifecycle  │
+              └──────────┬───────────┘
+                         │
+              ┌──────────▼───────────┐
+              │   Rust Download      │
+              │       Engine         │
+              └──────────────────────┘
 ```
 
-### Formatting
+This separation keeps the core download logic independent from the desktop interface and makes the application easier to maintain and extend.
 
-```bash
-cargo fmt --all -- --check
+## 📁 Project Structure
 
-cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+```text
+Velo/
+├── src/                  # React frontend
+├── src-tauri/            # Tauri application and Rust backend
+├── scripts/              # Build and packaging scripts
+├── installer/            # Release installer artifacts
+├── package.json
+└── README.md
 ```
 
-### Clippy
+## 🔒 Privacy & Security
 
-```bash
-cargo clippy --all-targets --all-features -- -D warnings
+Velo is designed with a straightforward approach to privacy:
 
-cargo clippy \
-  --manifest-path src-tauri/Cargo.toml \
-  --all-targets \
-  --all-features \
-  -- -D warnings
-```
+- No advertisements.
+- No unnecessary account requirements.
+- No paid feature restrictions.
+- Download processing is handled locally by the application.
 
-### Production Build
-
-```bash
-npm run build
-cargo build --release
-```
-
----
-
-## 🔐 Security & Privacy
-
-Velo follows several important security principles:
-
-- HTTPS downgrade prevention during supported redirect handling.
-- Validation of HTTP Range responses.
-- Safe handling of temporary download files.
-- Validation of download destinations.
-- Graceful handling of malformed server metadata.
-- Avoiding sensitive download URLs in desktop notifications.
-
-Velo does not assume every server supports concurrent or resumable downloads. Transfer strategies depend on server capabilities and response validation.
-
-If you discover a security vulnerability, please report it privately to the project maintainers rather than publishing exploit details in a public issue.
-
----
+Always download Velo from the official repository or its GitHub Releases page.
 
 ## 🗺️ Roadmap
 
-Velo is developed incrementally, with reliability and performance as its primary engineering goals.
+Velo is actively evolving. Future development may include:
 
-| Area | Status |
-|---|---|
-| Rust Download Engine | Implemented |
-| Download Scheduling | Implemented |
-| Persistent Recovery | Implemented |
-| Desktop UI | Implemented |
-| Smart Download Experience | Implemented |
-| Native Desktop Integration | Implemented |
-| Performance Optimization | Implemented; profiling validation pending |
-| Windows & Linux Packaging | Existing build infrastructure; final validation pending |
-| Production Release | In progress |
-
-Future protocol support, including BitTorrent, is considered a separate architectural decision.
-
----
+- Further download engine optimizations.
+- Improved download recovery and reliability.
+- Additional protocol support.
+- More advanced download management features.
+- Continued UI and performance improvements.
 
 ## 🤝 Contributing
 
-Contributions, bug reports, and suggestions are welcome!
-
-If you want to contribute:
+Contributions, bug reports, and feature suggestions are welcome!
 
 1. Fork the repository.
-2. Create a feature branch.
-3. Make your changes.
-4. Add or update tests where appropriate.
-5. Run the relevant checks.
-6. Submit a pull request with a clear description.
+2. Create a new branch:
 
-Please keep contributions focused and consistent with the existing architecture.
+   ```bash
+   git checkout -b feature/your-feature
+   ```
 
----
+3. Commit your changes:
 
-## ❓ FAQ
+   ```bash
+   git commit -m "feat: add your feature"
+   ```
 
-<details>
-<summary><strong>Does Velo support BitTorrent?</strong></summary>
+4. Push your branch and open a Pull Request.
 
-No. Velo currently focuses on HTTP and HTTPS downloads. BitTorrent is outside the current release scope.
-</details>
+For bug reports and feature requests, use [GitHub Issues](https://github.com/ConsoleX-ir/Velo/issues).
 
-<details>
-<summary><strong>Does Velo support unlimited download speed?</strong></summary>
+## 📄 License
 
-Yes. Velo provides an unlimited speed mode without artificial throttling.
-</details>
+Velo is licensed under the **MIT License**.
 
-<details>
-<summary><strong>Can Velo resume interrupted downloads?</strong></summary>
-
-Velo supports persistent recovery and validated continuation when the local file state and server response permit it. Otherwise, it uses a safe fallback.
-</details>
-
-<details>
-<summary><strong>Does Velo work on Linux?</strong></summary>
-
-Linux packages are targeted through AppImage and Debian formats. Compatibility depends on the target distribution and its runtime dependencies.
-</details>
-
-<details>
-<summary><strong>Is Velo open source?</strong></summary>
-
-Check the repository's license file for the exact licensing and redistribution terms.
-</details>
-
----
-
-## 📌 Project Links
-
-<p align="center">
-  <a href="https://github.com/ConsoleX-ir/Velo">GitHub Repository</a> •
-  <a href="https://github.com/ConsoleX-ir/Velo/issues">Issue Tracker</a> •
-  <a href="https://github.com/ConsoleX-ir/Velo/releases">Releases</a>
-</p>
+See the [LICENSE](LICENSE) file for the full license text.
 
 ---
 
 <div align="center">
 
-  <h2>Velo</h2>
+  **Velo — Move files. Not limits.**
 
-  **Move files. Not limits.**
+  Built with ❤️ by [ConsoleX](https://github.com/ConsoleX-ir)
 
-  Built with Rust, Tauri, and React.
-
-  <sub>© ConsoleX — Velo Project</sub>
+  <sub>Fast. Reliable. Free.</sub>
 
 </div>
