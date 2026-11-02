@@ -128,26 +128,6 @@ Velo features an Industrial Futurism-inspired interface with a focus on clarity,
 
 ---
 
-## 🖼️ Screenshots
-
-<div align="center">
-
-  <!-- Add real Velo 0.7 screenshots here -->
-
-  | Main Window | Download Management |
-  |:---:|:---:|
-  | ![Main Window](docs/screenshots/main-window.png) | ![Downloads](docs/screenshots/downloads.png) |
-
-  | Add Download | Settings |
-  |:---:|:---:|
-  | ![Add Download](docs/screenshots/add-download.png) | ![Settings](docs/screenshots/settings.png) |
-
-</div>
-
-> Replace the screenshot paths above with actual screenshots from the Velo 0.7 build before publishing.
-
----
-
 ## 📦 Installation
 
 Prebuilt packages are intended to be distributed through the GitHub repository.
