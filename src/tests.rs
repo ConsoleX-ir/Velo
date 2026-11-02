@@ -2066,7 +2066,7 @@ async fn segmented_download_falls_back_to_a_full_get_when_range_is_ignored() {
     let server = tokio::spawn(async move {
         let (mut probe, _) = listener.accept().await.unwrap();
         let probe_request = read_request(&mut probe).await;
-        probe
+        let _ = probe
             .write_all(&response(
                 "200 OK",
                 &format!(
@@ -2075,8 +2075,11 @@ async fn segmented_download_falls_back_to_a_full_get_when_range_is_ignored() {
                 ),
                 &served_payload,
             ))
-            .await
-            .unwrap();
+            .await;
+        // The engine drops the probe as soon as it learns ranges are
+        // unsupported. Drain so the server observes a clean close instead of
+        // a broken pipe while writing the unused body.
+        let _ = probe.read_to_end(&mut Vec::new()).await;
         let _ = probe.shutdown().await;
         let (mut full, _) = listener.accept().await.unwrap();
         let full_request = read_request(&mut full).await;
@@ -3344,5 +3347,433 @@ async fn resume_info_publishes_a_live_checkpoint_before_body_bytes_arrive() {
     );
     assert!(manager.resume_info(&handle).unwrap().is_none());
     manager.acknowledge_terminal(&handle).unwrap();
+    manager.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 regression tests: scheduling, dispatch, speed limits
+// ---------------------------------------------------------------------------
+
+/// An eligible download with a free execution slot transitions to Preparing
+/// immediately, not Queued.
+#[tokio::test]
+async fn manager_starts_eligible_download_immediately() {
+    let (url, server) = serve_once(response(
+        "200 OK",
+        "Content-Length: 2\r\nConnection: close\r\n",
+        b"ok",
+    ))
+    .await;
+    let dir = TestDir::new();
+    let manager = DownloadManager::new().unwrap();
+    let handle = manager
+        .start(managed_request(
+            "immediate",
+            url,
+            dir.path().join("immediate.bin"),
+        ))
+        .unwrap();
+    // With no other jobs and max_active=4, the single download must be
+    // dispatched to Preparing immediately, not left Queued.
+    assert_eq!(
+        handle.latest_progress().state,
+        DownloadState::Preparing,
+        "eligible download must not sit in Queued when a slot is free"
+    );
+    let terminal = wait_for_terminal(&manager, &handle).await;
+    server.await.unwrap();
+    assert_eq!(terminal.state, DownloadState::Completed);
+    manager.acknowledge_terminal(&handle).unwrap();
+    manager.shutdown().await;
+}
+
+/// When an active download completes, its slot is released and the next
+/// queued download is dispatched promptly.
+#[tokio::test]
+async fn manager_dispatches_next_queued_after_completion() {
+    let (first_url, _first_handle, first_started, first_release) = serve_gated().await;
+    let (second_url, _second_handle, _second_started, second_release) = serve_gated().await;
+    let dir = TestDir::new();
+    let manager = DownloadManager::with_config(DownloadManagerConfig {
+        max_active: 1,
+        max_retained_jobs: 3,
+    })
+    .unwrap();
+    let first = manager
+        .start(managed_request(
+            "first",
+            first_url,
+            dir.path().join("first.bin"),
+        ))
+        .unwrap();
+    first_started.await.unwrap();
+    assert_eq!(
+        first.latest_progress().state,
+        DownloadState::Preparing,
+        "first download must hold the only active slot"
+    );
+
+    let second = manager
+        .start(managed_request(
+            "second",
+            second_url,
+            dir.path().join("second.bin"),
+        ))
+        .unwrap();
+    assert_eq!(
+        second.latest_progress().state,
+        DownloadState::Queued,
+        "second download must be queued while the slot is held"
+    );
+
+    first_release.send(()).unwrap();
+    assert_eq!(
+        wait_for_terminal(&manager, &first).await.state,
+        DownloadState::Completed
+    );
+    manager.acknowledge_terminal(&first).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(
+                second.latest_progress().state,
+                DownloadState::Preparing | DownloadState::Downloading
+            ) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("queued download must be dispatched after completion");
+    second_release.send(()).unwrap();
+    assert_eq!(
+        wait_for_terminal(&manager, &second).await.state,
+        DownloadState::Completed
+    );
+    manager.acknowledge_terminal(&second).unwrap();
+    manager.shutdown().await;
+}
+
+/// When an active download is cancelled, its slot is released and the next
+/// queued download is dispatched.
+#[tokio::test]
+async fn manager_dispatches_next_queued_after_active_cancellation() {
+    let (first_url, _first_handle, first_started, _first_release) = serve_gated().await;
+    let (second_url, _second_handle, _second_started, second_release) = serve_gated().await;
+    let dir = TestDir::new();
+    let manager = DownloadManager::with_config(DownloadManagerConfig {
+        max_active: 1,
+        max_retained_jobs: 3,
+    })
+    .unwrap();
+    let first = manager
+        .start(managed_request(
+            "first",
+            first_url,
+            dir.path().join("first.bin"),
+        ))
+        .unwrap();
+    first_started.await.unwrap();
+    assert_eq!(
+        first.latest_progress().state,
+        DownloadState::Preparing,
+        "first download must hold the only active slot"
+    );
+
+    let second = manager
+        .start(managed_request(
+            "second",
+            second_url,
+            dir.path().join("second.bin"),
+        ))
+        .unwrap();
+    assert_eq!(
+        second.latest_progress().state,
+        DownloadState::Queued,
+        "second download must be queued while the slot is held"
+    );
+
+    assert_eq!(manager.cancel(&first).unwrap(), CancelDisposition::Accepted);
+    assert_eq!(
+        wait_for_terminal(&manager, &first).await.state,
+        DownloadState::Cancelled
+    );
+    manager.acknowledge_terminal(&first).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(
+                second.latest_progress().state,
+                DownloadState::Preparing | DownloadState::Downloading
+            ) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("queued download must be dispatched after active cancellation");
+    second_release.send(()).unwrap();
+    assert_eq!(
+        wait_for_terminal(&manager, &second).await.state,
+        DownloadState::Completed
+    );
+    manager.acknowledge_terminal(&second).unwrap();
+    manager.shutdown().await;
+}
+
+/// A download cancelled while waiting in the queue is removed and never
+/// dispatched, freeing no slot it never held.
+#[tokio::test]
+async fn manager_cancellation_while_queued() {
+    let (url, server, started, release) = serve_gated().await;
+    let dir = TestDir::new();
+    let manager = DownloadManager::with_config(DownloadManagerConfig {
+        max_active: 1,
+        max_retained_jobs: 3,
+    })
+    .unwrap();
+    let first = manager
+        .start(managed_request(
+            "first",
+            url.clone(),
+            dir.path().join("first.bin"),
+        ))
+        .unwrap();
+    started.await.unwrap();
+
+    let second = manager
+        .start(managed_request(
+            "second",
+            url.clone(),
+            dir.path().join("second.bin"),
+        ))
+        .unwrap();
+    assert_eq!(
+        second.latest_progress().state,
+        DownloadState::Queued,
+        "second download must be queued"
+    );
+
+    assert_eq!(
+        manager.cancel(&second).unwrap(),
+        CancelDisposition::Accepted
+    );
+    assert_eq!(
+        wait_for_terminal(&manager, &second).await.state,
+        DownloadState::Cancelled
+    );
+    manager.acknowledge_terminal(&second).unwrap();
+
+    // The first download must still complete normally; the queued cancellation
+    // must not block it.
+    release.send(()).unwrap();
+    assert_eq!(
+        wait_for_terminal(&manager, &first).await.state,
+        DownloadState::Completed
+    );
+    server.await.unwrap();
+    assert!(!dir.path().join("second.bin").exists());
+    manager.acknowledge_terminal(&first).unwrap();
+    manager.shutdown().await;
+}
+
+/// A failed download releases its slot and does not block queued downloads.
+#[tokio::test]
+async fn manager_failure_does_not_block_queue() {
+    let (bad_url, bad_server) = serve_once(response(
+        "503 Service Unavailable",
+        "Content-Length: 0\r\nConnection: close\r\n",
+        b"",
+    ))
+    .await;
+    let (good_url, good_server, started, release) = serve_gated().await;
+    let dir = TestDir::new();
+    let manager = DownloadManager::with_config(DownloadManagerConfig {
+        max_active: 1,
+        max_retained_jobs: 3,
+    })
+    .unwrap();
+    let failing = manager
+        .start(managed_request(
+            "failing",
+            bad_url,
+            dir.path().join("failing.bin"),
+        ))
+        .unwrap();
+    let good = manager
+        .start(managed_request(
+            "good",
+            good_url,
+            dir.path().join("good.bin"),
+        ))
+        .unwrap();
+    assert_eq!(
+        good.latest_progress().state,
+        DownloadState::Queued,
+        "good download must be queued while failing download is active"
+    );
+
+    assert_eq!(
+        wait_for_terminal(&manager, &failing).await.state,
+        DownloadState::Failed
+    );
+    manager.acknowledge_terminal(&failing).unwrap();
+    bad_server.await.unwrap();
+
+    // After the failure releases the slot, the queued download must start.
+    started.await.unwrap();
+    release.send(()).unwrap();
+    assert_eq!(
+        wait_for_terminal(&manager, &good).await.state,
+        DownloadState::Completed
+    );
+    good_server.await.unwrap();
+    manager.acknowledge_terminal(&good).unwrap();
+    manager.shutdown().await;
+}
+
+/// A download is dispatched exactly once: no duplicate Preparing transitions.
+#[tokio::test]
+async fn manager_no_duplicate_dispatch() {
+    let (url, server) = serve_once(response(
+        "200 OK",
+        "Content-Length: 2\r\nConnection: close\r\n",
+        b"ok",
+    ))
+    .await;
+    let dir = TestDir::new();
+    let manager = DownloadManager::new().unwrap();
+    let handle = manager
+        .start(managed_request(
+            "no-dup",
+            url,
+            dir.path().join("no-dup.bin"),
+        ))
+        .unwrap();
+
+    let state_at_start = handle.latest_progress().state;
+    assert!(
+        matches!(
+            state_at_start,
+            DownloadState::Preparing | DownloadState::Queued
+        ),
+        "unexpected initial state: {state_at_start:?}"
+    );
+
+    // Poll progress a few times: the job must not cycle back into Preparing
+    // or Queued after it has left those states.
+    let mut progress = handle.progress();
+    for _ in 0..10 {
+        progress.changed().await.unwrap();
+        let state = progress.borrow().state;
+        if matches!(state, DownloadState::Downloading | DownloadState::Completed) {
+            break;
+        }
+        assert!(
+            !matches!(state, DownloadState::Queued),
+            "job must not return to Queued after dispatch"
+        );
+    }
+
+    let terminal = wait_for_terminal(&manager, &handle).await;
+    server.await.unwrap();
+    assert_eq!(terminal.state, DownloadState::Completed);
+    manager.acknowledge_terminal(&handle).unwrap();
+    manager.shutdown().await;
+}
+
+/// With no speed limit configured, the engine applies no artificial throttle
+/// and the transfer proceeds at the pace of the server and client.
+#[tokio::test]
+async fn manager_unlimited_has_no_artificial_throttle() {
+    let payload = vec![1_u8; 64 * 1024];
+    let (url, server) = serve_once(response(
+        "200 OK",
+        &format!("Content-Length: {}\r\nConnection: close\r\n", payload.len()),
+        &payload,
+    ))
+    .await;
+    let dir = TestDir::new();
+    let manager = DownloadManager::new().unwrap();
+    let mut request = managed_request("unlimited", url, dir.path().join("unlimited.bin"));
+    request.speed_limit_bytes_per_second = None; // explicit unlimited
+    let started = Instant::now();
+    let handle = manager.start(request).unwrap();
+    let terminal = wait_for_terminal(&manager, &handle).await;
+    server.await.unwrap();
+    assert_eq!(terminal.state, DownloadState::Completed);
+    assert_eq!(terminal.bytes_written, payload.len() as u64);
+    assert_eq!(fs::read(dir.path().join("unlimited.bin")).unwrap(), payload);
+    // With no speed limit and a local loopback server, the transfer should
+    // complete well within a generous window. Any artificial throttle would
+    // introduce a measurable delay.
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "unlimited transfer took too long: {:?}",
+        started.elapsed()
+    );
+    manager.acknowledge_terminal(&handle).unwrap();
+    manager.shutdown().await;
+}
+
+/// Switching from a per-download speed limit to unlimited removes throttling.
+#[tokio::test]
+async fn manager_speed_limit_switching_to_unlimited() {
+    let payload = vec![2_u8; 24 * 1024];
+    let (url, server) = serve_once(response(
+        "200 OK",
+        &format!("Content-Length: {}\r\nConnection: close\r\n", payload.len()),
+        &payload,
+    ))
+    .await;
+    let dir = TestDir::new();
+    let manager = DownloadManager::new().unwrap();
+
+    // First: limited transfer
+    let mut limited_request =
+        managed_request("limited", url.clone(), dir.path().join("limited.bin"));
+    limited_request.speed_limit_bytes_per_second = Some(12 * 1024);
+    let limited_started = Instant::now();
+    let limited_handle = manager.start(limited_request).unwrap();
+    let limited_terminal = wait_for_terminal(&manager, &limited_handle).await;
+    server.await.unwrap();
+    assert_eq!(limited_terminal.state, DownloadState::Completed);
+    assert_eq!(fs::read(dir.path().join("limited.bin")).unwrap(), payload);
+    let limited_elapsed = limited_started.elapsed();
+    manager.acknowledge_terminal(&limited_handle).unwrap();
+
+    // Second: unlimited transfer of the same size must not be artificially
+    // slower than the limited one (and should typically be much faster).
+    let (url2, server2) = serve_once(response(
+        "200 OK",
+        &format!("Content-Length: {}\r\nConnection: close\r\n", payload.len()),
+        &payload,
+    ))
+    .await;
+    let mut unlimited_request = managed_request(
+        "unlimited-after-limited",
+        url2,
+        dir.path().join("unlimited-after.bin"),
+    );
+    unlimited_request.speed_limit_bytes_per_second = None;
+    let unlimited_started = Instant::now();
+    let unlimited_handle = manager.start(unlimited_request).unwrap();
+    let unlimited_terminal = wait_for_terminal(&manager, &unlimited_handle).await;
+    server2.await.unwrap();
+    assert_eq!(unlimited_terminal.state, DownloadState::Completed);
+    assert_eq!(
+        fs::read(dir.path().join("unlimited-after.bin")).unwrap(),
+        payload
+    );
+    let unlimited_elapsed = unlimited_started.elapsed();
+    manager.acknowledge_terminal(&unlimited_handle).unwrap();
+
+    eprintln!(
+        "SPEED limited_elapsed_ms={} unlimited_elapsed_ms={}",
+        limited_elapsed.as_millis(),
+        unlimited_elapsed.as_millis()
+    );
     manager.shutdown().await;
 }

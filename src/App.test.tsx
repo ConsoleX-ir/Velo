@@ -31,6 +31,9 @@ const defaultSettings: SettingsDto = {
   storedDirValid: false,
   osDefaultDownloadDir: "C:\\Users\\me\\Downloads",
   effectiveDownloadDir: "C:\\Users\\me\\Downloads",
+  closeBehavior: "minimize_to_tray",
+  launchAtStartup: false,
+  downloadNotifications: true,
 };
 
 const download = (patch: Partial<DownloadDto>): DownloadDto => ({
@@ -462,6 +465,9 @@ describe("application shell", () => {
           storedDirValid: false,
           osDefaultDownloadDir: "C:\\Users\\me\\Downloads",
           effectiveDownloadDir: "C:\\Users\\me\\Downloads",
+          closeBehavior: "minimize_to_tray",
+          launchAtStartup: false,
+          downloadNotifications: true,
         });
       }
       if (command === "get_history_notice") return Promise.resolve(null);

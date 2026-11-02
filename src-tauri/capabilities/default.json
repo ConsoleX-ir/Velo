@@ -3,12 +3,13 @@
   "identifier": "default",
   "description": "Least-privilege access for the Velo main window: typed IPC commands (registered natively), the folder/save dialogs it drives, and the custom title-bar window controls.",
   "windows": ["main"],
-  "permissions": [
-    "core:default",
-    "dialog:allow-open",
-    "core:window:allow-minimize",
-    "core:window:allow-toggle-maximize",
-    "core:window:allow-close",
-    "core:window:allow-start-dragging"
-  ]
+    "permissions": [
+      "core:default",
+      "dialog:allow-open",
+      "clipboard-manager:allow-read-text",
+      "core:window:allow-minimize",
+      "core:window:allow-toggle-maximize",
+      "core:window:allow-close",
+      "core:window:allow-start-dragging"
+    ]
 }

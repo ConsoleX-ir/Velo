@@ -25,6 +25,12 @@ use url::Url;
 const MAX_AUTO_RETRIES: u8 = 2;
 const MAX_SERVICE_RECORDS: usize = 100;
 pub(crate) const RETRY_BACKOFF_BASE: Duration = Duration::from_secs(2);
+/// Minimum interval between non-terminal `UiEvent::Updated` emissions per
+/// download. Terminal events (completed/failed/cancelled) always emit
+/// immediately. This caps IPC + React reconciliation work to at most ~4
+/// events per second per active download, well above the frontend's
+/// 1 Hz speed-sample resolution so no perceptible staleness is introduced.
+const UI_EMIT_INTERVAL: Duration = Duration::from_millis(250);
 const INTERRUPTED_CHECKPOINT_MESSAGE: &str = "Velo closed before this transfer finished. Retry continues from the last verified checkpoint when the server allows it.";
 const INTERRUPTED_BYTE_ZERO_MESSAGE: &str =
     "Velo closed before this transfer finished. Retry starts from byte zero.";
@@ -754,6 +760,42 @@ impl AppState {
         self.manager.set_global_speed_limit_bytes_per_second(limit);
     }
 
+    /// Pauses every download that can be paused (downloading or preparing).
+    /// Returns the number of pauses attempted.
+    pub(crate) fn pause_all_downloads(&self) -> usize {
+        let jobs = lock_jobs(&self.jobs);
+        let mut count = 0;
+        for job in jobs.values() {
+            let Some(handle) = job.handle.as_ref() else {
+                continue;
+            };
+            if matches!(
+                job.download.state,
+                UiDownloadState::Downloading | UiDownloadState::Preparing
+            ) && self.manager.pause(handle).is_ok()
+            {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Resumes every paused download. Returns the number of resumes attempted.
+    pub(crate) fn resume_all_downloads(&self) -> usize {
+        let jobs = lock_jobs(&self.jobs);
+        let mut count = 0;
+        for job in jobs.values() {
+            let Some(handle) = job.handle.as_ref() else {
+                continue;
+            };
+            if job.download.state == UiDownloadState::Paused && self.manager.resume(handle).is_ok()
+            {
+                count += 1;
+            }
+        }
+        count
+    }
+
     pub(crate) fn cancel_download(&self, id: &str, generation: u64) -> Result<(), CommandError> {
         let _schedule_guard = self
             .schedule_lock
@@ -1029,6 +1071,7 @@ impl AppState {
         let mut last_bytes = progress.borrow().bytes_written;
         let mut last_update = Instant::now();
         let mut speed = None;
+        let mut last_emit = Instant::now();
 
         loop {
             let snapshot = progress.borrow().clone();
@@ -1067,17 +1110,28 @@ impl AppState {
             let transient_failure = snapshot.state == DownloadState::Failed;
             let updated = update_job(self, &handle, snapshot, speed, error);
             if let Some(download) = updated {
+                if terminal
+                    && transient_failure
+                    && terminal_error.as_deref().is_some_and(is_transient_failure)
+                    && self.schedule_auto_retry(&handle)
+                {
+                    // The scheduled retry now owns this job. Don't emit the
+                    // terminal Failed state — the retry emits its own
+                    // Retrying update, and a final notification fires when
+                    // the retry resolves. This avoids a duplicate "download
+                    // failed" notification for a download that is being
+                    // automatically retried.
+                    return;
+                }
                 self.persist(terminal);
-                self.emit(UiEvent::Updated(download.clone()));
+                // Terminal events always emit immediately; non-terminal
+                // events are rate-limited to cap IPC + frontend
+                // reconciliation work during fast transfers.
+                if terminal || last_emit.elapsed() >= UI_EMIT_INTERVAL {
+                    self.emit(UiEvent::Updated(download.clone()));
+                    last_emit = Instant::now();
+                }
                 if terminal {
-                    if transient_failure
-                        && terminal_error.as_deref().is_some_and(is_transient_failure)
-                        && self.schedule_auto_retry(&handle)
-                    {
-                        // The scheduled retry now owns this job; stop monitoring
-                        // the terminal engine handle.
-                        return;
-                    }
                     return;
                 }
             }
@@ -1509,10 +1563,12 @@ fn restore_url(value: &[u8]) -> std::io::Result<String> {
 pub(crate) mod tests {
 
     use super::*;
-    use std::{fs, sync::atomic::AtomicU64, time::Duration};
+    use consolex_download_engine::DownloadManagerConfig;
+    use std::{fs, sync::atomic::AtomicU64, time::Duration, time::Instant};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
+        sync::oneshot,
         task::JoinHandle,
     };
 
@@ -1788,15 +1844,6 @@ pub(crate) mod tests {
             .collect()
     }
 
-    fn state_sequence_all(updates: &Mutex<Vec<DownloadDto>>) -> Vec<UiDownloadState> {
-        updates
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|download| download.state)
-            .collect()
-    }
-
     /// Waits until the newest published update is `expected` and stays so
     /// through a settle window longer than the largest injected backoff. The
     /// id is deliberately not filtered: a scheduled retry replaces the record
@@ -1877,25 +1924,141 @@ pub(crate) mod tests {
         let terminal = wait_for_terminal_state(&updates, UiDownloadState::Completed).await;
         server.await.unwrap();
         assert_eq!(terminal, UiDownloadState::Completed);
-        let mut chain = state_sequence_all(&updates);
-        chain.dedup_by(|a, b| a == b);
+        // Non-terminal events are rate-limited (UI_EMIT_INTERVAL), so the
+        // exact intermediate sequence is timing-dependent. Assert on the
+        // properties that must hold regardless of timing:
+        //   * terminal state is Completed (always emitted immediately)
+        //   * Retrying appears at least once (auto-retry engaged)
+        //   * Failed never appears (Phase 4: suppressed when retry scheduled)
+        let states: Vec<UiDownloadState> = updates
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|download| download.state)
+            .collect();
+        assert!(
+            states.contains(&UiDownloadState::Retrying),
+            "auto-retry should publish at least one Retrying state, got {states:?}"
+        );
+        assert!(
+            !states.contains(&UiDownloadState::Failed),
+            "no Failed state should be published when a retry is scheduled, got {states:?}"
+        );
         assert_eq!(
-            chain,
-            vec![
-                UiDownloadState::Preparing,
-                UiDownloadState::Failed,
-                UiDownloadState::Retrying,
-                UiDownloadState::Preparing,
-                UiDownloadState::Failed,
-                UiDownloadState::Retrying,
-                UiDownloadState::Preparing,
-                UiDownloadState::Downloading,
-                UiDownloadState::Completed,
-            ]
+            states.last().copied(),
+            Some(UiDownloadState::Completed),
+            "final published state should be Completed, got {states:?}"
         );
         assert_eq!(fs::read(dir.join("out.bin")).unwrap(), b"0123456789");
         state.manager.shutdown().await;
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn transient_failures_emit_no_failed_notification_when_retried() {
+        // When a transient failure is auto-retried, the terminal Failed state
+        // must not be emitted — only the Retrying state. This prevents a
+        // duplicate "download failed" notification for a download that is
+        // being automatically retried.
+        let dir = std::env::temp_dir().join(format!(
+            "velo-retry-no-failed-{}-{}",
+            std::process::id(),
+            TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&dir).unwrap();
+        let (url, server) = serve_retry_sequence(&["503 Service Unavailable"]).await;
+        let (state, updates, _removals) =
+            test_state(dir.join("history.json"), Duration::from_millis(20));
+        state
+            .begin_download(
+                url,
+                dir.to_string_lossy().into_owned(),
+                "out.bin".to_owned(),
+                None,
+            )
+            .unwrap();
+        let terminal = wait_for_terminal_state(&updates, UiDownloadState::Completed).await;
+        server.await.unwrap();
+        assert_eq!(terminal, UiDownloadState::Completed);
+        let states: Vec<UiDownloadState> = updates
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|download| download.state)
+            .collect();
+        assert!(
+            !states.contains(&UiDownloadState::Failed),
+            "no Failed event should be published when a retry is scheduled, got states: {states:?}"
+        );
+        assert!(states.contains(&UiDownloadState::Retrying));
+        state.manager.shutdown().await;
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn exhausted_retries_emit_single_failed_notification() {
+        // When all auto-retries are exhausted, exactly one Failed event is
+        // emitted (no intermediate Failed from the initial transient failure).
+        let dir = std::env::temp_dir().join(format!(
+            "velo-retry-exhausted-{}-{}",
+            std::process::id(),
+            TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&dir).unwrap();
+        // A server that always returns 503 so retries are never satisfied and
+        // the budget is eventually exhausted. No "success" connection is ever
+        // expected, unlike serve_retry_sequence.
+        let (url, server) = serve_always_fail().await;
+        let (state, updates, _removals) =
+            test_state(dir.join("history.json"), Duration::from_millis(20));
+        state
+            .begin_download(
+                url,
+                dir.to_string_lossy().into_owned(),
+                "out.bin".to_owned(),
+                None,
+            )
+            .unwrap();
+        let terminal = wait_for_terminal_state(&updates, UiDownloadState::Failed).await;
+        server.abort();
+        let _ = server.await;
+        assert_eq!(terminal, UiDownloadState::Failed);
+        let states: Vec<UiDownloadState> = updates
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|download| download.state)
+            .collect();
+        let failed_count = states
+            .iter()
+            .filter(|s| **s == UiDownloadState::Failed)
+            .count();
+        assert_eq!(
+            failed_count,
+            1,
+            "exactly one Failed event should be published when retries are exhausted, got {failed_count}"
+        );
+        assert!(states.contains(&UiDownloadState::Retrying));
+        state.manager.shutdown().await;
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A server that accepts connections indefinitely and always answers with
+    /// 503 Service Unavailable, used to exhaust the auto-retry budget.
+    async fn serve_always_fail() -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 2048];
+                let _ = stream.read(&mut request).await.unwrap();
+                let head = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (format!("http://{address}/file"), task)
     }
 
     #[tokio::test]
@@ -2105,6 +2268,222 @@ pub(crate) mod tests {
         assert!(notice.is_some());
         assert!(notice.unwrap().contains("backup"));
         assert!(state.take_history_notice().is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2 integration: immediate download start through the service layer
+    // -----------------------------------------------------------------------
+
+    /// A gated HTTP server that accepts one connection, signals when the
+    /// request is received, then waits for a release before sending the
+    /// response body. This enables deterministic measurement of
+    /// submission-to-first-bytes latency without arbitrary timing thresholds.
+    async fn serve_gated() -> (
+        String,
+        JoinHandle<()>,
+        oneshot::Receiver<()>,
+        oneshot::Sender<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await.unwrap();
+            let _ = request_tx.send(());
+            let _ = release_rx.await;
+            let response =
+                b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\n0123456789";
+            stream.write_all(response).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        (
+            format!("http://{address}/file"),
+            task,
+            request_rx,
+            release_tx,
+        )
+    }
+
+    /// A server that accepts one connection, reads the request, then delays
+    /// An eligible download with a free execution slot sends its HTTP request
+    /// promptly after `begin_download` returns. This test verifies the actual
+    /// network request is dispatched, not merely that the manager transitioned
+    /// to `Preparing`. Synchronization is via a oneshot channel fired when the
+    /// server observes the request — no timing thresholds or polling.
+    #[tokio::test]
+    async fn begin_download_starts_http_promptly_when_slot_available() {
+        let dir = std::env::temp_dir().join(format!(
+            "velo-integration-immediate-{}-{}",
+            std::process::id(),
+            TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let (url, _server, request_released, release_tx) = serve_gated().await;
+        let destination = dir.join("immediate.bin");
+
+        let (state, _updates, _removals) =
+            test_state(dir.join("history.json"), Duration::from_millis(20));
+
+        let started = Instant::now();
+        let result = state.begin_download(
+            url,
+            dir.to_string_lossy().into_owned(),
+            "immediate.bin".into(),
+            None,
+        );
+        let dto = result.expect("begin_download should succeed for an eligible download");
+        let submission_elapsed = started.elapsed();
+
+        // The HTTP request must reach the server promptly after submission.
+        // This is deterministic: the oneshot fires when the server reads the
+        // request, with no artificial delay or polling in the service layer.
+        let _ = tokio::time::timeout(Duration::from_secs(10), request_released)
+            .await
+            .expect("the download must send its HTTP request promptly after submission");
+
+        release_tx.send(()).unwrap();
+
+        let terminal = wait_for_terminal_state(&_updates, UiDownloadState::Completed).await;
+        assert_eq!(terminal, UiDownloadState::Completed);
+        assert_eq!(dto.file_name, "immediate.bin");
+        assert_eq!(fs::read(&destination).unwrap(), b"0123456789");
+
+        eprintln!(
+            "INTEGRATE submission_to_http_request_ms={}",
+            submission_elapsed.as_millis()
+        );
+        state.manager.shutdown().await;
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A queued download starts its HTTP request promptly after an active
+    /// download releases its execution slot. The second download's request
+    /// must arrive at its server after the first completes, demonstrating
+    /// reliable scheduler wake-up and slot handoff — not a stale queued job.
+    ///
+    /// Server 1 delays its response to hold the execution slot long enough
+    /// to observe the second download being queued. Server 2 is gated so we
+    /// can deterministically detect when the queued download's HTTP request
+    /// is dispatched after the slot is released. Synchronization is via
+    /// A queued download starts its HTTP request promptly after an active
+    /// download releases its execution slot. The second download's request
+    /// must arrive at its server after the first completes, demonstrating
+    /// reliable scheduler wake-up and slot handoff — not a stale queued job.
+    ///
+    /// Server 1 accepts download 1's request and holds it until released,
+    /// keeping download 1 active and holding the sole slot. Server 2 is
+    /// gated so we can deterministically detect when download 2's request
+    /// fires after the slot is released. Synchronization is via oneshot
+    /// channels — no timing thresholds or polling in the assertions.
+    #[tokio::test]
+    async fn begin_download_queued_starts_promptly_after_slot_release() {
+        let dir = std::env::temp_dir().join(format!(
+            "velo-integration-queued-{}-{}",
+            std::process::id(),
+            TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        // Server 1: holds download 1's request until released (slot held).
+        let (first_url, _first_server, first_request_released, first_release_tx) =
+            serve_gated().await;
+        // Server 2: gated to detect download 2's request after slot release.
+        let (second_url, _second_server, second_request_released, second_release_tx) =
+            serve_gated().await;
+
+        // Configure the manager with max_active=1 so download 2 is forced
+        // to queue while download 1 is active.
+        let manager = DownloadManager::with_config(DownloadManagerConfig {
+            max_active: 1,
+            max_retained_jobs: 100,
+        })
+        .unwrap();
+        let store_path = dir.join("history.json");
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let _removals = Arc::new(Mutex::new(Vec::new()));
+        let updates_for_publish = updates.clone();
+        let state = AppState::with_test_hooks(
+            manager,
+            store_path.clone(),
+            Arc::new(move |event| match event {
+                UiEvent::Updated(download) => {
+                    updates_for_publish.lock().unwrap().push(download);
+                }
+                UiEvent::Removed { id, generation } => {
+                    _removals.lock().unwrap().push((id, generation));
+                }
+            }),
+            Duration::from_millis(20),
+        );
+
+        // Download 1: dispatched immediately, holds the sole active slot.
+        let first = state
+            .begin_download(
+                first_url,
+                dir.to_string_lossy().into_owned(),
+                "first.bin".into(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(first.state, UiDownloadState::Preparing);
+
+        // Wait for download 1's request to reach its server, confirming it is
+        // genuinely active and holding the slot.
+        let _ = tokio::time::timeout(Duration::from_secs(10), first_request_released)
+            .await
+            .expect("download 1 must reach its server");
+
+        // Download 2: must be queued because max_active=1 and the slot is held.
+        let second = state
+            .begin_download(
+                second_url,
+                dir.to_string_lossy().into_owned(),
+                "second.bin".into(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            second.state,
+            UiDownloadState::Queued,
+            "second download must be queued while the slot is held"
+        );
+
+        // Release download 1's response, letting it complete and free the slot.
+        first_release_tx.send(()).unwrap();
+        // Wait for download 1 specifically to reach Completed (use state_sequence
+        // to filter by download 1's id, since download 2 may be dispatched
+        // afterward and become the last update).
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let states = state_sequence(&updates, &first.id);
+                if states
+                    .last()
+                    .is_some_and(|s| *s == UiDownloadState::Completed)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("download 1 should complete after slot release");
+
+        // Download 2 must dispatch promptly after the slot is released.
+        // Deterministic: the oneshot fires when its server reads the request.
+        let _ = tokio::time::timeout(Duration::from_secs(10), second_request_released)
+            .await
+            .expect("queued download must dispatch promptly after slot release");
+
+        second_release_tx.send(()).unwrap();
+        let terminal = wait_for_terminal_state(&updates, UiDownloadState::Completed).await;
+        assert_eq!(terminal, UiDownloadState::Completed);
+        assert_eq!(fs::read(dir.join("second.bin")).unwrap(), b"0123456789");
+
+        state.manager.shutdown().await;
         fs::remove_dir_all(dir).unwrap();
     }
 }

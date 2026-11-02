@@ -20,7 +20,18 @@ use serde::{Deserialize, Serialize};
 
 use super::persistence;
 
-const SETTINGS_VERSION: u32 = 2;
+const SETTINGS_VERSION: u32 = 3;
+
+/// How the main window's close button behaves.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CloseBehavior {
+    /// Closing the window hides it to the tray; downloads keep running.
+    #[default]
+    MinimizeToTray,
+    /// Closing the window shuts the application down.
+    ExitApplication,
+}
 
 /// What the settings store can hold today. Bump `SETTINGS_VERSION` and add a
 /// `#[serde(default)]` field when the shape grows.
@@ -31,6 +42,19 @@ struct StoredSettings {
     default_download_dir: Option<String>,
     #[serde(default)]
     global_speed_limit_bytes_per_second: Option<u64>,
+    /// Whether closing the main window hides it to the tray or exits the app.
+    #[serde(default)]
+    close_behavior: CloseBehavior,
+    /// Whether Velo registers itself to launch at system startup.
+    #[serde(default)]
+    launch_at_startup: bool,
+    /// Whether native notifications are sent for terminal download events.
+    #[serde(default = "default_true")]
+    download_notifications: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for StoredSettings {
@@ -39,6 +63,9 @@ impl Default for StoredSettings {
             version: SETTINGS_VERSION,
             default_download_dir: None,
             global_speed_limit_bytes_per_second: None,
+            close_behavior: CloseBehavior::default(),
+            launch_at_startup: false,
+            download_notifications: true,
         }
     }
 }
@@ -58,6 +85,12 @@ pub(crate) struct SettingsDto {
     /// default while it stays valid, otherwise the OS Downloads folder.
     pub(crate) effective_download_dir: Option<String>,
     pub(crate) global_speed_limit_bytes_per_second: Option<u64>,
+    /// Whether closing the main window hides it to the tray or exits the app.
+    pub(crate) close_behavior: CloseBehavior,
+    /// Whether Velo is registered to launch at system startup.
+    pub(crate) launch_at_startup: bool,
+    /// Whether native notifications are sent for terminal download events.
+    pub(crate) download_notifications: bool,
 }
 
 /// Command-shaped error so the Tauri shell can pass it to the webview
@@ -85,7 +118,7 @@ impl SettingsError {
         }
     }
 
-    fn invalid_setting(message: impl Into<String>) -> Self {
+    pub(crate) fn invalid_setting(message: impl Into<String>) -> Self {
         Self {
             code: "invalid_setting",
             message: message.into(),
@@ -165,6 +198,50 @@ impl SettingsState {
         Ok(self.snapshot(&inner))
     }
 
+    /// Persists the chosen close behavior and returns the refreshed snapshot.
+    pub(crate) fn set_close_behavior(
+        &self,
+        behavior: CloseBehavior,
+    ) -> Result<SettingsDto, SettingsError> {
+        let mut inner = self.lock();
+        inner.close_behavior = behavior;
+        save(&self.store_path, &inner).map_err(|error| {
+            eprintln!("Could not save the Velo settings: {error}");
+            SettingsError::store_unavailable()
+        })?;
+        Ok(self.snapshot(&inner))
+    }
+
+    /// Persists the launch-at-startup preference and returns the refreshed
+    /// snapshot.
+    pub(crate) fn set_launch_at_startup(
+        &self,
+        enabled: bool,
+    ) -> Result<SettingsDto, SettingsError> {
+        let mut inner = self.lock();
+        inner.launch_at_startup = enabled;
+        save(&self.store_path, &inner).map_err(|error| {
+            eprintln!("Could not save the Velo settings: {error}");
+            SettingsError::store_unavailable()
+        })?;
+        Ok(self.snapshot(&inner))
+    }
+
+    /// Persists the download-notifications preference and returns the refreshed
+    /// snapshot.
+    pub(crate) fn set_download_notifications(
+        &self,
+        enabled: bool,
+    ) -> Result<SettingsDto, SettingsError> {
+        let mut inner = self.lock();
+        inner.download_notifications = enabled;
+        save(&self.store_path, &inner).map_err(|error| {
+            eprintln!("Could not save the Velo settings: {error}");
+            SettingsError::store_unavailable()
+        })?;
+        Ok(self.snapshot(&inner))
+    }
+
     fn snapshot(&self, inner: &StoredSettings) -> SettingsDto {
         let stored_dir_valid = inner
             .default_download_dir
@@ -181,6 +258,9 @@ impl SettingsState {
                 .map(|path| path.to_string_lossy().into_owned()),
             effective_download_dir,
             global_speed_limit_bytes_per_second: inner.global_speed_limit_bytes_per_second,
+            close_behavior: inner.close_behavior,
+            launch_at_startup: inner.launch_at_startup,
+            download_notifications: inner.download_notifications,
         }
     }
 
@@ -403,7 +483,7 @@ mod tests {
         assert_eq!(state.get().global_speed_limit_bytes_per_second, None);
         state.set_speed_limit(Some(1024)).unwrap();
         let stored: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-        assert_eq!(stored["version"], 2);
+        assert_eq!(stored["version"], 3);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -459,6 +539,9 @@ mod tests {
             version: SETTINGS_VERSION,
             default_download_dir: Some(dir.join("gone-velo").to_string_lossy().into_owned()),
             global_speed_limit_bytes_per_second: None,
+            close_behavior: CloseBehavior::MinimizeToTray,
+            launch_at_startup: false,
+            download_notifications: true,
         };
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, serde_json::to_vec(&broken).unwrap()).unwrap();
@@ -555,6 +638,95 @@ mod tests {
             join_destination("", "file.bin"),
             Err(JoinDestinationError::InvalidDirectory)
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn close_behavior_defaults_to_minimize_to_tray() {
+        let dir = test_dir();
+        let state = SettingsState::build(store_path(&dir), None);
+        assert_eq!(state.get().close_behavior, CloseBehavior::MinimizeToTray);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn close_behavior_persists_across_restart() {
+        let dir = test_dir();
+        let path = store_path(&dir);
+        let state = SettingsState::build(path.clone(), None);
+        state
+            .set_close_behavior(CloseBehavior::ExitApplication)
+            .unwrap();
+        let restarted = SettingsState::build(path, None);
+        assert_eq!(
+            restarted.get().close_behavior,
+            CloseBehavior::ExitApplication
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn launch_at_startup_defaults_to_false() {
+        let dir = test_dir();
+        let state = SettingsState::build(store_path(&dir), None);
+        assert!(!state.get().launch_at_startup);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn launch_at_startup_persists_across_restart() {
+        let dir = test_dir();
+        let path = store_path(&dir);
+        let state = SettingsState::build(path.clone(), None);
+        state.set_launch_at_startup(true).unwrap();
+        let restarted = SettingsState::build(path, None);
+        assert!(restarted.get().launch_at_startup);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn download_notifications_defaults_to_true() {
+        let dir = test_dir();
+        let state = SettingsState::build(store_path(&dir), None);
+        assert!(state.get().download_notifications);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn download_notifications_persists_across_restart() {
+        let dir = test_dir();
+        let path = store_path(&dir);
+        let state = SettingsState::build(path.clone(), None);
+        state.set_download_notifications(false).unwrap();
+        let restarted = SettingsState::build(path, None);
+        assert!(!restarted.get().download_notifications);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn version_two_settings_migrate_to_version_three_with_defaults() {
+        let dir = test_dir();
+        let path = store_path(&dir);
+        fs::write(
+            &path,
+            serde_json::json!({
+                "version": 2,
+                "default_download_dir": dir.to_string_lossy(),
+                "global_speed_limit_bytes_per_second": 1024
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let state = SettingsState::build(path.clone(), None);
+        assert_eq!(
+            state.get().default_download_dir.as_deref(),
+            Some(dir.to_string_lossy().as_ref())
+        );
+        assert_eq!(state.get().global_speed_limit_bytes_per_second, Some(1024));
+        // New fields get their defaults.
+        assert_eq!(state.get().close_behavior, CloseBehavior::MinimizeToTray);
+        assert!(!state.get().launch_at_startup);
+        assert!(state.get().download_notifications);
         fs::remove_dir_all(dir).unwrap();
     }
 }

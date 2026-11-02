@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en" data-preview="true">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#11151b" />
+    <link rel="icon" type="image/svg+xml" href="/velo-mark.svg" />
+    <title>[Preview] ConsoleX Velo</title>
+    <script>
+      /*
+       * DEV-ONLY Tauri IPC shim (used exclusively by preview.html).
+       * The production entry (index.html) never loads this file, so the
+       * shipped app talks to the real engine exactly as before. Here the
+       * full command surface is simulated in-page: a small download engine
+       * toy model, event emission, settings persistence, dialog stubs and
+       * window-control no-ops, so every screen can be exercised in a
+       * plain browser.
+       */
+      (function () {
+        var callbackId = 0;
+        var callbacks = new Map();
+        var listeners = [];
+        var nextOrderId = 100;
+
+        var settings = {
+          defaultDownloadDir: "C:\\Users\\demo\\Downloads",
+          storedDirValid: true,
+          osDefaultDownloadDir: "C:\\Users\\demo\\Downloads",
+          effectiveDownloadDir: "C:\\Users\\demo\\Downloads",
+          globalSpeedLimitBytesPerSecond: null,
+        };
+
+        function dto(patch) {
+          return Object.assign(
+            {
+              id: "job-" + Math.random().toString(36).slice(2, 8),
+              generation: 1,
+              revision: 1,
+              order: nextOrderId++,
+              fileName: "file.zip",
+              destination: "C:\\Users\\demo\\Downloads\\file.zip",
+              state: "queued",
+              bytesWritten: 0,
+              totalBytes: null,
+              speedBytesPerSecond: null,
+              etaSeconds: null,
+              error: null,
+              scheduledAtUnixMs: null,
+            },
+            patch,
+          );
+        }
+
+        var downloads = [
+          dto({ id: "iso-live", order: 1, fileName: "ubuntu-24.04.2-desktop-amd64.iso", destination: "C:\\Users\\demo\\Downloads\\ubuntu-24.04.2-desktop-amd64.iso", state: "downloading", bytesWritten: 3_690_000_000, totalBytes: 5_920_000_000, speedBytesPerSecond: 14_900_000, etaSeconds: 150 }),
+          dto({ id: "zip-live", order: 2, fileName: "nebula-render-final-4k-master-collection-v2.zip", destination: "C:\\Users\\demo\\Media\\nebula-render-final-4k-master-collection-v2.zip", state: "downloading", bytesWritten: 1_450_000_000, totalBytes: 3_840_000_000, speedBytesPerSecond: 5_200_000, etaSeconds: 460 }),
+          dto({ id: "prep", order: 3, fileName: "studio-setup-x64.exe", state: "preparing", bytesWritten: 0, totalBytes: 812_000_000 }),
+          dto({ id: "q-1", order: 4, fileName: "training-dataset-v3.tar.zst", state: "queued", bytesWritten: 0, totalBytes: 18_600_000_000 }),
+          dto({ id: "q-2", order: 5, fileName: "firmware-router-pro.bin", state: "queued", bytesWritten: 0, totalBytes: 41_000_000 }),
+          dto({ id: "sched", order: 6, fileName: "backup-workstation.msi", state: "scheduled", bytesWritten: 0, totalBytes: 1_100_000_000, scheduledAtUnixMs: Date.now() + 26 * 3600_000 }),
+          dto({ id: "paused", order: 7, fileName: "documentary-the-deep-blue.mkv", destination: "C:\\Users\\demo\\Videos\\documentary-the-deep-blue.mkv", state: "paused", bytesWritten: 2_970_000_000, totalBytes: 4_180_000_000 }),
+          dto({ id: "done-1", order: 8, fileName: "wallpaper-pack-2026.zip", state: "completed", bytesWritten: 1_280_000_000, totalBytes: 1_280_000_000 }),
+          dto({ id: "done-2", order: 9, fileName: "quarterly-report.pdf", state: "completed", bytesWritten: 4_200_000, totalBytes: 4_200_000 }),
+          dto({ id: "fail", order: 10, fileName: "sdk-tools-2026.msi", state: "failed", bytesWritten: 0, totalBytes: 640_000_000, error: "The server responded with 403 Forbidden" }),
+          dto({ id: "intr", order: 11, fileName: "obs-studio-installer.exe", state: "interrupted", bytesWritten: 210_000_000, totalBytes: 460_000_000, error: "Velo closed before this transfer finished." }),
+          dto({ id: "retry", order: 12, fileName: "model-weights-8b.gguf", state: "retrying", bytesWritten: 900_000_000, totalBytes: 8_100_000_000, error: "Connection reset by peer — retrying automatically" }),
+        ];
+
+        function revisionOf(item) {
+          return item.revision;
+        }
+
+        function emit(event, payload) {
+          listeners.forEach(function (l) {
+            if (l.event !== event) return;
+            var cb = callbacks.get(l.handler);
+            if (cb) cb({ event: l.event, id: 0, payload: payload });
+          });
+        }
+
+        function emitUpdate(item) {
+          emit("download-updated", JSON.parse(JSON.stringify(item)));
+        }
+
+        var liveTick = null;
+        function startLive() {
+          if (liveTick) return;
+          liveTick = setInterval(function () {
+            var busy = false;
+            downloads.forEach(function (item) {
+              if (item.state === "downloading") {
+                busy = true;
+                var drift = 0.82 + Math.random() * 0.42;
+                var rate = Math.max(240_000, Math.round((item.speedBytesPerSecond || 4_000_000) * drift));
+                var written = item.bytesWritten + rate;
+                item.revision += 1;
+                if (item.totalBytes !== null && written >= item.totalBytes) {
+                  item.bytesWritten = item.totalBytes;
+                  item.state = "completed";
+                  item.speedBytesPerSecond = null;
+                  item.etaSeconds = null;
+                } else {
+                  item.bytesWritten = written;
+                  item.speedBytesPerSecond = rate;
+                  item.etaSeconds = item.totalBytes !== null ? Math.max(0, Math.round((item.totalBytes - written) / rate)) : null;
+                }
+                emitUpdate(item);
+              }
+            });
+            if (!busy) {
+              clearInterval(liveTick);
+              liveTick = null;
+            }
+          }, 1000);
+        }
+
+        var api = {
+          transformCallback: function (callback, once) {
+            var id = ++callbackId;
+            callbacks.set(id, function (event) {
+              if (once) callbacks.delete(id);
+              callback(event);
+            });
+            return id;
+          },
+          unregisterCallback: function (id) {
+            callbacks.delete(id);
+          },
+          metadata: {
+            currentWindow: { label: "main" },
+            currentWebview: { label: "main" },
+          },
+          convertFileSrc: function (filePath) {
+            return filePath;
+          },
+          invoke: function (cmd, args) {
+            args = args || {};
+            if (cmd === "plugin:event|listen") {
+              listeners.push({ event: args.event, handler: args.handler });
+              return Promise.resolve(args.handler);
+            }
+            if (cmd === "plugin:event|unlisten") {
+              listeners = listeners.filter(function (l) { return l.handler !== args.handler; });
+              return Promise.resolve(null);
+            }
+            if (cmd === "list_downloads") {
+              startLive();
+              return Promise.resolve(JSON.parse(JSON.stringify(downloads)));
+            }
+            if (cmd === "get_history_notice") return Promise.resolve(null);
+            if (cmd === "get_settings") return Promise.resolve(JSON.parse(JSON.stringify(settings)));
+            if (cmd === "set_default_directory") {
+              settings.defaultDownloadDir = args.directory;
+              settings.storedDirValid = true;
+              settings.effectiveDownloadDir = args.directory;
+              return Promise.resolve(JSON.parse(JSON.stringify(settings)));
+            }
+            if (cmd === "clear_default_directory") {
+              settings.defaultDownloadDir = null;
+              settings.storedDirValid = false;
+              settings.effectiveDownloadDir = settings.osDefaultDownloadDir;
+              return Promise.resolve(JSON.parse(JSON.stringify(settings)));
+            }
+            if (cmd === "set_global_speed_limit") {
+              settings.globalSpeedLimitBytesPerSecond = args.bytesPerSecond;
+              return Promise.resolve(JSON.parse(JSON.stringify(settings)));
+            }
+            if (cmd === "start_download") {
+              var fresh = dto({
+                fileName: args.fileName,
+                destination: args.directory + "\\" + args.fileName,
+                state: "preparing",
+                totalBytes: Math.round(200_000_000 + Math.random() * 3_000_000_000),
+                speedLimitBytesPerSecond: args.speedLimitBytesPerSecond,
+              });
+              downloads.unshift(fresh);
+              startLive();
+              setTimeout(function () {
+                fresh.revision += 1;
+                fresh.state = "downloading";
+                fresh.speedBytesPerSecond = Math.round(3_000_000 + Math.random() * 9_000_000);
+                emitUpdate(fresh);
+              }, 1400);
+              return Promise.resolve(JSON.parse(JSON.stringify(fresh)));
+            }
+            if (cmd === "schedule_download") {
+              var planned = dto({
+                fileName: args.fileName,
+                destination: args.directory + "\\" + args.fileName,
+                state: "scheduled",
+                scheduledAtUnixMs: args.scheduledAtUnixMs,
+                totalBytes: null,
+                speedLimitBytesPerSecond: args.speedLimitBytesPerSecond,
+              });
+              downloads.unshift(planned);
+              return Promise.resolve(JSON.parse(JSON.stringify(planned)));
+            }
+            if (cmd === "edit_download_schedule") {
+              var target = downloads.find(function (d) { return d.id === args.id && d.generation === args.generation; });
+              if (target) {
+                target.revision += 1;
+                target.scheduledAtUnixMs = args.scheduledAtUnixMs;
+                emitUpdate(target);
+                return Promise.resolve(JSON.parse(JSON.stringify(target)));
+              }
+              return Promise.reject("no such download");
+            }
+            if (cmd === "pause_download") {
+              var target = downloads.find(function (d) { return d.id === args.id && d.generation === args.generation; });
+              if (target && target.state === "downloading") {
+                target.revision += 1;
+                target.state = "paused";
+                target.speedBytesPerSecond = null;
+                target.etaSeconds = null;
+                emitUpdate(target);
+              }
+              return Promise.resolve(null);
+            }
+            if (cmd === "resume_download") {
+              var target = downloads.find(function (d) { return d.id === args.id && d.generation === args.generation; });
+              if (target && target.state === "paused") {
+                target.revision += 1;
+                target.state = "downloading";
+                target.speedBytesPerSecond = Math.round(3_000_000 + Math.random() * 9_000_000);
+                emitUpdate(target);
+                startLive();
+              }
+              return Promise.resolve(null);
+            }
+            if (cmd === "cancel_download") {
+              var target = downloads.find(function (d) { return d.id === args.id && d.generation === args.generation; });
+              if (target && !["completed", "failed", "cancelled", "interrupted"].includes(target.state)) {
+                target.revision += 1;
+                target.state = "cancelled";
+                target.speedBytesPerSecond = null;
+                target.etaSeconds = null;
+                emitUpdate(target);
+              }
+              return Promise.resolve(null);
+            }
+            if (cmd === "retry_download") {
+              var old = downloads.find(function (d) { return d.id === args.id && d.generation === args.generation; });
+              var replacement = dto({
+                fileName: old ? old.fileName : "retry.bin",
+                destination: old ? old.destination : "C:\\Users\\demo\\Downloads\\retry.bin",
+                state: "preparing",
+                bytesWritten: 0,
+                totalBytes: old ? old.totalBytes : null,
+              });
+              if (old) emit("download-removed", { id: old.id, generation: old.generation });
+              downloads.unshift(replacement);
+              startLive();
+              return Promise.resolve(JSON.parse(JSON.stringify(replacement)));
+            }
+            if (cmd === "acknowledge_download") return Promise.resolve(null);
+            if (cmd === "plugin:dialog|open") {
+              return Promise.resolve("C:\\Users\\demo\\Videos");
+            }
+            if (cmd === "plugin:window|is_maximized") return Promise.resolve(false);
+            if (cmd.indexOf("plugin:window|") === 0) return Promise.resolve(null);
+            return Promise.resolve(null);
+          },
+        };
+
+        window.__TAURI_INTERNALS__ = api;
+        // Preview helpers for quick screenshots.
+        window.__VELO_PREVIEW__ = { downloads: downloads, dto: dto, emitUpdate: emitUpdate, revisionOf: revisionOf };
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/preview/main.tsx"></script>
+  </body>
+</html>

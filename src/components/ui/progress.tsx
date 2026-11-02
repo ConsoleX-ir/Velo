@@ -23,7 +23,7 @@ type ProgressTrackProps = {
 export function ProgressTrack({ value, completed = false, indeterminateWidth = 4, className = "", ariaLabel }: ProgressTrackProps) {
   if (value === null) {
     return (
-      <div aria-hidden="true" className={cn("progress-track", completed && "complete", className)}>
+      <div aria-hidden="true" className={cn("progress-track", !completed && "indeterminate", completed && "complete", className)}>
         <span style={{ width: `${indeterminateWidth}%` }} />
       </div>
     );

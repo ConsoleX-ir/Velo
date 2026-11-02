@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { DownloadDto, SettingsDto } from "./model";
+import type { DownloadDto, InspectMetadata, SettingsDto } from "./model";
 
 /**
  * The complete typed command surface Velo's webview is allowed to call.
@@ -21,6 +21,20 @@ export const clearDefaultDirectory = (): Promise<SettingsDto> => invoke("clear_d
 
 export const setGlobalSpeedLimit = (bytesPerSecond: number | null): Promise<SettingsDto> =>
   invoke("set_global_speed_limit", { bytesPerSecond });
+
+export const setCloseBehavior = (behavior: "minimize_to_tray" | "exit_application"): Promise<SettingsDto> =>
+  invoke("set_close_behavior", { behavior });
+
+export const setLaunchAtStartup = (enabled: boolean): Promise<SettingsDto> =>
+  invoke("set_launch_at_startup", { enabled });
+
+export const isLaunchAtStartup = (): Promise<boolean> => invoke("is_launch_at_startup");
+
+export const setDownloadNotifications = (enabled: boolean): Promise<SettingsDto> =>
+  invoke("set_download_notifications", { enabled });
+
+export const pauseAllDownloads = (): Promise<number> => invoke("pause_all_downloads");
+export const resumeAllDownloads = (): Promise<number> => invoke("resume_all_downloads");
 
 export const startDownload = (url: string, directory: string, fileName: string, speedLimitBytesPerSecond: number | null): Promise<DownloadDto> =>
   invoke("start_download", { url, directory, fileName, speedLimitBytesPerSecond });
@@ -45,3 +59,6 @@ export const retryDownload = (id: string, generation: number): Promise<DownloadD
 
 export const acknowledgeDownload = (id: string, generation: number): Promise<void> =>
   invoke("acknowledge_download", { id, generation });
+
+export const inspectUrl = (url: string): Promise<InspectMetadata> =>
+  invoke("inspect_url", { url });

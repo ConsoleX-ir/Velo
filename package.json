@@ -1,7 +1,7 @@
 {
   "name": "consolex-velo",
   "private": true,
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1420 --strictPort",
@@ -12,7 +12,10 @@
   "dependencies": {
     "@radix-ui/react-scroll-area": "^1.4.0",
     "@tauri-apps/api": "^2.8.0",
-    "@tauri-apps/plugin-dialog": "^2.4.0",
+"@tauri-apps/plugin-clipboard-manager": "^2.5.0",
+  "@tauri-apps/plugin-dialog": "^2.4.0",
+  "@tauri-apps/plugin-autostart": "^2.2.0",
+  "@tauri-apps/plugin-notification": "^2.1.0",
     "class-variance-authority": "^0.7.1",
     "framer-motion": "^14.7.1",
     "lucide-react": "^1.63.0",

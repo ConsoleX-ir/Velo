@@ -3,7 +3,14 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { SegmentedControl } from "./ui/segmented";
 import { Toggle } from "./ui/switch";
 import { Icon } from "./icons";
-import { setDefaultDirectory, clearDefaultDirectory, setGlobalSpeedLimit } from "../commands";
+import {
+  setDefaultDirectory,
+  clearDefaultDirectory,
+  setGlobalSpeedLimit,
+  setCloseBehavior,
+  setLaunchAtStartup,
+  setDownloadNotifications,
+} from "../commands";
 import type { SettingsDto } from "../model";
 
 type SettingsViewProps = {
@@ -37,6 +44,9 @@ export function SettingsView({
   const effective = settings?.effectiveDownloadDir ?? null;
   const broken = Boolean(defaultDir && settings && !settings.storedDirValid);
   const [speedDraft, setSpeedDraft] = useState("");
+  const closeBehavior = settings?.closeBehavior ?? "minimize_to_tray";
+  const launchAtStartup = settings?.launchAtStartup ?? false;
+  const downloadNotifications = settings?.downloadNotifications ?? true;
   useEffect(() => setSpeedDraft(settings?.globalSpeedLimitBytesPerSecond ? String(Math.round(settings.globalSpeedLimitBytesPerSecond / 1024)) : ""), [settings?.globalSpeedLimitBytesPerSecond]);
 
   async function changeFolder() {
@@ -81,14 +91,43 @@ export function SettingsView({
     } finally { setBusy(false); }
   }
 
+  async function changeCloseBehavior(behavior: "minimize_to_tray" | "exit_application") {
+    setBusy(true);
+    try {
+      onSettingsChanged(await setCloseBehavior(behavior));
+    } catch (cause) {
+      onSettingsError(typeof cause === "object" && cause !== null && "message" in cause ? String(cause.message) : "The close behavior could not be saved.");
+    } finally { setBusy(false); }
+  }
+
+  async function changeLaunchAtStartup(enabled: boolean) {
+    setBusy(true);
+    try {
+      onSettingsChanged(await setLaunchAtStartup(enabled));
+    } catch (cause) {
+      onSettingsError(typeof cause === "object" && cause !== null && "message" in cause ? String(cause.message) : "The startup preference could not be saved.");
+    } finally { setBusy(false); }
+  }
+
+  async function changeDownloadNotifications(enabled: boolean) {
+    setBusy(true);
+    try {
+      onSettingsChanged(await setDownloadNotifications(enabled));
+    } catch (cause) {
+      onSettingsError(typeof cause === "object" && cause !== null && "message" in cause ? String(cause.message) : "The notification preference could not be saved.");
+    } finally { setBusy(false); }
+  }
+
   return (
     <section className="settings-view" aria-label="Settings">
       <div className="settings-heading">
+        <span className="page-eyebrow">Configuration</span>
         <h1>Settings</h1>
         <p>Where files land and how Velo looks — applied immediately, stored locally.</p>
       </div>
 
       <div className="settings-card">
+        <div className="settings-group-label micro-label">Storage</div>
         <div className="settings-item">
           <div className="settings-icon"><Icon name="folder" /></div>
           <div className="settings-copy">
@@ -123,6 +162,7 @@ export function SettingsView({
           </div>
         )}
         <div className="settings-separator" />
+        <div className="settings-group-label micro-label">Transfers</div>
         <div className="settings-item">
           <div className="settings-icon behavior"><Icon name="drive" /></div>
           <div className="settings-copy">
@@ -132,15 +172,45 @@ export function SettingsView({
           <label className="settings-speed-limit"><input aria-label="Global speed limit in KiB/s" type="number" min="1" max="1048576" value={speedDraft} disabled={busy} onChange={(event) => setSpeedDraft(event.target.value)} onBlur={() => void changeSpeedLimit()} onKeyDown={(event) => { if (event.key === "Enter") { event.currentTarget.blur(); } }} /><span>KiB/s</span></label>
         </div>
         <div className="settings-separator" />
+        <div className="settings-group-label micro-label">System</div>
         <div className="settings-item">
-          <div className="settings-icon behavior"><Icon name="drive" /></div>
+          <div className="settings-icon behavior"><Icon name="shield" /></div>
           <div className="settings-copy">
-            <strong>Background transfers</strong>
-            <span>Closing the window hides Velo to the system tray; downloads continue. Use the tray’s Exit to quit.</span>
+            <strong>Close button behavior</strong>
+            <span>Choose what happens when you close the window while downloads are active.</span>
           </div>
-          <span className="settings-static">Always on</span>
+          <SegmentedControl
+            aria-label="Close button behavior"
+            className="segmented-control"
+            value={closeBehavior}
+            onChange={changeCloseBehavior}
+            options={[
+              { value: "minimize_to_tray", label: "Minimize to Tray", icon: <Icon name="minimize" size={14} /> },
+              { value: "exit_application", label: "Exit Application", icon: <Icon name="close" size={14} /> },
+            ]}
+          />
         </div>
         <div className="settings-separator" />
+        <div className="settings-item">
+          <div className="settings-icon behavior"><Icon name="clock" /></div>
+          <div className="settings-copy">
+            <strong>Launch Velo at system startup</strong>
+            <span>Starts Velo automatically when you log in to Windows.</span>
+          </div>
+          <Toggle checked={launchAtStartup} onCheckedChange={changeLaunchAtStartup} aria-label="Launch Velo at system startup" disabled={busy} />
+        </div>
+        <div className="settings-separator" />
+        <div className="settings-group-label micro-label">Notifications</div>
+        <div className="settings-item">
+          <div className="settings-icon behavior"><Icon name="bell" /></div>
+          <div className="settings-copy">
+            <strong>Download notifications</strong>
+            <span>Show a native notification when a download completes or fails.</span>
+          </div>
+          <Toggle checked={downloadNotifications} onCheckedChange={changeDownloadNotifications} aria-label="Download notifications" disabled={busy} />
+        </div>
+        <div className="settings-separator" />
+        <div className="settings-group-label micro-label">Appearance</div>
         <div className="settings-item">
           <div className="settings-icon appearance"><Icon name="sun" /></div>
           <div className="settings-copy">
@@ -159,6 +229,7 @@ export function SettingsView({
           />
         </div>
         <div className="settings-separator" />
+        <div className="settings-group-label micro-label">Motion</div>
         <div className="settings-item">
           <div className="settings-icon motion"><Icon name="spark" /></div>
           <div className="settings-copy">

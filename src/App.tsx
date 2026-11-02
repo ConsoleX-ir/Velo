@@ -11,12 +11,13 @@ import { SettingsView } from "./components/SettingsView";
 import { EmptyState, FilteredEmpty } from "./components/ui/empty-state";
 import { AILoader } from "./components/ui/ai-loader";
 import { DateTimeField } from "./components/ui/date-time-picker";
-import { LiquidNavbar } from "./components/ui/liquid-glass-navbar";
+import { SegmentedControl, type SegmentedOption } from "./components/ui/segmented";
 import { AuroraBackground } from "./components/ui/aurora-background";
-import type { SegmentedOption } from "./components/ui/segmented";
 import { ToastProvider, useToast } from "./components/ui/toast";
 import { Button } from "./components/ui/button";
 import { Icon } from "./components/icons";
+import { InspectDialog } from "./components/InspectDialog";
+import { ConfirmDialog } from "./components/ConfirmDialog";
 import { errorText } from "./lib/utils";
 import {
   acknowledgeDownload,
@@ -31,6 +32,7 @@ import {
 } from "./commands";
 import {
   emptySpeedHistory,
+  formatRate,
   isTerminal,
   mergeDownloads,
   recordSpeedSample,
@@ -53,10 +55,10 @@ const FILTER_OPTIONS: SegmentedOption<Filter>[] = [
   { value: "failed", label: "Failed" },
 ];
 
-const VIEW_COPY: Record<Exclude<DownloadView, "settings">, { title: string; subtitle: string }> = {
-  downloads: { title: "Downloads", subtitle: "Every transfer on this device, from first byte to finish." },
-  queue: { title: "Queue", subtitle: "Waiting for one of the available transfer slots." },
-  completed: { title: "Completed", subtitle: "Files saved to disk. The list is stored locally." },
+const VIEW_COPY: Record<Exclude<DownloadView, "settings">, { title: string; subtitle: string; eyebrow: string }> = {
+  downloads: { eyebrow: "Transfer console", title: "Downloads", subtitle: "Every transfer on this device, from first byte to finish." },
+  queue: { eyebrow: "Scheduler", title: "Queue", subtitle: "Waiting for one of the available transfer slots." },
+  completed: { eyebrow: "Archive", title: "Completed", subtitle: "Files saved to disk. The list is stored locally." },
 };
 
 export default function App() {
@@ -84,9 +86,24 @@ function VeloApp() {
   const [speedHistories, setSpeedHistories] = useState<Record<string, SpeedHistory>>({});
   const [menuState, setMenuState] = useState<{ x: number; y: number; item: DownloadDto } | null>(null);
   const [scheduleEdit, setScheduleEdit] = useState<DownloadDto | null>(null);
+  const [inspectItem, setInspectItem] = useState<DownloadDto | null>(null);
+  const [confirmRemove, setConfirmRemove] = useState<DownloadDto | null>(null);
   const latestRevision = useRef(new Map<string, number>());
   const keyStates = useRef(new Map<string, DownloadDto["state"]>());
+  /*
+   * Presentation order: the sequence in which each download handle was first
+   * seen by this webview. Newest additions land at the top of the visible
+   * list, while the engine's own queue order (`order`) — and therefore
+   * scheduling and execution — remains untouched. Status changes never
+   * mutate the sequence, so cards never jump around.
+   */
+  const firstSeen = useRef(new Map<string, number>());
+  const seenCounter = useRef(0);
   const searchRef = useRef<HTMLInputElement>(null);
+  /** Tracks document.visibilityState so progress events are skipped while the
+   * window is hidden (minimized to tray). Events are not lost: the
+   * visibilitychange handler re-syncs from the native list on return. */
+  const visibilityRef = useRef(document.visibilityState);
 
   const projectDownload = useCallback(
     (item: DownloadDto) => {
@@ -94,6 +111,7 @@ function VeloApp() {
       const revision = latestRevision.current.get(key);
       if (revision !== undefined && item.revision <= revision) return;
       const previousState = keyStates.current.get(key);
+      if (!firstSeen.current.has(key)) firstSeen.current.set(key, ++seenCounter.current);
       latestRevision.current.set(key, item.revision);
       keyStates.current.set(key, item.state);
       setDownloads((current) => mergeDownloads(current, [item]));
@@ -119,6 +137,7 @@ function VeloApp() {
     setDownloads((current) => current.filter((item) => !(item.id === id && item.generation === generation)));
     latestRevision.current.delete(key);
     keyStates.current.delete(key);
+    firstSeen.current.delete(key);
     setSpeedHistories((current) => {
       if (!current[key]) return current;
       const next = { ...current };
@@ -151,7 +170,7 @@ function VeloApp() {
     void (async () => {
       try {
         const stopUpdated = await listen<DownloadDto>("download-updated", (event) => {
-          if (alive) projectDownload(event.payload);
+          if (alive && visibilityRef.current === "visible") projectDownload(event.payload);
         });
         unlisteners.push(stopUpdated);
         // A retry replaces its job record with a fresh id; the backend tells
@@ -195,6 +214,7 @@ function VeloApp() {
   useEffect(() => {
     if (!engineConnected) return;
     const onVisible = () => {
+      visibilityRef.current = document.visibilityState;
       if (document.visibilityState !== "visible") return;
       void listDownloads()
         .then((items) => items.forEach(projectDownload))
@@ -225,12 +245,19 @@ function VeloApp() {
     let items = selectDownloads(downloads, view, filter);
     const normalizedQuery = query.trim().toLocaleLowerCase();
     if (normalizedQuery) items = items.filter((item) => item.fileName.toLocaleLowerCase().includes(normalizedQuery));
-    return items;
+    // Presentation only: newest additions first, stable across status
+    // changes. The backend list and its execution order stay untouched.
+    const sequenceOf = (item: DownloadDto) => firstSeen.current.get(`${item.id}:${item.generation}`) ?? 0;
+    return [...items].sort((a, b) => sequenceOf(b) - sequenceOf(a));
   }, [downloads, filter, query, view]);
 
   const activeCount = downloads.filter((item) => ["preparing", "downloading", "pausing", "cancelling", "finalizing", "retrying"].includes(item.state)).length;
   const queueCount = downloads.filter((item) => item.state === "queued").length;
   const completedCount = downloads.filter((item) => item.state === "completed").length;
+  const activeRate = downloads.reduce(
+    (sum, item) => (item.state === "downloading" && item.speedBytesPerSecond ? sum + item.speedBytesPerSecond : sum),
+    0,
+  );
 
   async function runCommand(key: string, action: () => Promise<unknown>) {
     setPending((current) => new Set(current).add(key));
@@ -285,6 +312,15 @@ function VeloApp() {
 
   const dismiss = useCallback(
     (item: DownloadDto) => {
+      // Destructive list actions pass through a confirmation panel; the
+      // engine call itself happens only on confirm.
+      setConfirmRemove(item);
+    },
+    [],
+  );
+
+  const removeDownload = useCallback(
+    (item: DownloadDto) => {
       const key = `${item.id}:${item.generation}`;
       setPending((current) => new Set(current).add(key));
       acknowledgeDownload(item.id, item.generation)
@@ -328,6 +364,7 @@ function VeloApp() {
     if (item.state === "failed" || item.state === "cancelled" || item.state === "interrupted") {
       items.push({ id: "retry", label: "Retry", icon: <Icon name="refresh" size={15} />, disabled: busy, onSelect: () => retry(item) });
     }
+    items.push({ id: "inspect", label: "Inspect", icon: <Icon name="eye" size={15} />, disabled: busy, onSelect: () => setInspectItem(item) });
     if (!isTerminal(item.state) && item.state !== "finalizing") {
       items.push({
         id: "cancel",
@@ -371,6 +408,7 @@ function VeloApp() {
             <>
               <div className="page-head">
                 <div className="page-titles">
+                  <span className="page-eyebrow">{VIEW_COPY[view].eyebrow}</span>
                   <h1>{VIEW_COPY[view].title}</h1>
                   <p>{VIEW_COPY[view].subtitle}</p>
                 </div>
@@ -383,15 +421,13 @@ function VeloApp() {
 
               {showFilters && (
                 <div className="toolbar">
-                  <LiquidNavbar
-                    selectable
-                    ariaLabel="Filter downloads"
+                  <SegmentedControl
+                    aria-label="Filter downloads"
                     className="filter-pill"
-                    tone={theme === "dark" ? "dark" : "light"}
-                    reducedMotion={reducedMotion}
-                    active={Math.max(0, FILTER_OPTIONS.findIndex((option) => option.value === filter))}
-                    onChange={(index) => setFilter(FILTER_OPTIONS[index].value)}
-                    items={FILTER_OPTIONS.map(({ label }) => ({ label }))}
+                    optionClassName="filter-chip"
+                    value={filter}
+                    onChange={setFilter}
+                    options={FILTER_OPTIONS}
                   />
                   <label className="search-box">
                     <Icon name="search" size={15} />
@@ -461,7 +497,7 @@ function VeloApp() {
           )}
         </main>
       </div>
-      <StatusBar ready={ready} engineConnected={engineConnected} />
+      <StatusBar ready={ready} engineConnected={engineConnected} activeCount={activeCount} rateLabel={formatRate(activeRate)} />
       {dialogOpen && (
         <AddDownloadDialog
           settings={settings}
@@ -488,6 +524,26 @@ function VeloApp() {
       )}
       {scheduleEdit && (
         <ScheduleEditDialog item={scheduleEdit} onClose={() => setScheduleEdit(null)} onSaved={(item) => { projectDownload(item); setScheduleEdit(null); }} onError={(message) => push({ title: message, kind: "error" })} />
+      )}
+      {inspectItem && (
+        <InspectDialog
+          item={downloads.find((entry) => entry.id === inspectItem.id && entry.generation === inspectItem.generation) ?? inspectItem}
+          onClose={() => setInspectItem(null)}
+        />
+      )}
+      {confirmRemove && (
+        <ConfirmDialog
+          title="Remove from list?"
+          body="The downloaded file stays on disk — only its record is removed from this history."
+          target={confirmRemove.fileName}
+          confirmLabel="Remove"
+          onConfirm={() => {
+            const target = confirmRemove;
+            setConfirmRemove(null);
+            removeDownload(target);
+          }}
+          onClose={() => setConfirmRemove(null)}
+        />
       )}
     </div>
   );

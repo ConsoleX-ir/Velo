@@ -1,6 +1,6 @@
 [package]
 name = "consolex-velo"
-version = "0.6.0"
+version = "0.7.0"
 description = "A free, private desktop download manager"
 authors = ["ConsoleX"]
 edition = "2021"
@@ -25,11 +25,21 @@ serde_json = "1"
 # plugin crate is needed for it.
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
-# Reliable single-process guard on Windows: a second launch focuses the
-# existing window instead of starting a second engine and tray.
+# Clipboard read is used only to seed the Add Download URL field from the
+# user's clipboard; it is gated behind the `clipboard:allow-read` capability.
+tauri-plugin-clipboard-manager = "2"
 tauri-plugin-single-instance = "2"
+# Windows startup registration (Launch Velo at system startup).
+tauri-plugin-autostart = "2"
+# Native desktop notifications for terminal download events.
+tauri-plugin-notification = "2"
 tokio = { version = "1", features = ["sync"] }
 url = "2"
+# Inspection-only HTTP client: a separate reqwest Client from the download
+# engine's, so URL inspection never consumes download-manager concurrency
+# slots and cannot interfere with active transfers. Same reqwest stack, own
+# instance — not a second HTTP stack.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem"] }

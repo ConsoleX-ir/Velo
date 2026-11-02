@@ -4,9 +4,10 @@ import { AILoader } from "./ui/ai-loader";
 import { ProgressTrack } from "./ui/progress";
 import { Spinner } from "./ui/spinner";
 import { Tooltip } from "./ui/tooltip";
-import { Icon, type IconName } from "./icons";
+import { Icon } from "./icons";
 import {
   destinationDirectory,
+  fileTypeInfo,
   formatBytes,
   formatEta,
   formatRate,
@@ -16,21 +17,8 @@ import {
   type DownloadDto,
 } from "../model";
 
-const STATE_ICON: Record<DownloadDto["state"], IconName> = {
-  queued: "clock",
-  scheduled: "clock",
-  preparing: "globe",
-  downloading: "download",
-  pausing: "pause",
-  paused: "pause",
-  cancelling: "cancel",
-  finalizing: "check",
-  completed: "check",
-  failed: "alert",
-  cancelled: "cancel",
-  interrupted: "refresh",
-  retrying: "clock",
-};
+const SPARK_WIDTH = 96;
+const SPARK_HEIGHT = 22;
 
 export type DownloadRowProps = {
   item: DownloadDto;
@@ -46,10 +34,17 @@ export type DownloadRowProps = {
 };
 
 /**
- * One download as a compact two-zone row: identity + live transfer state on
- * the left, contextual actions on the right. The metadata line carries the
- * bytes, rate, ETA, and a small inline speed sparkline only while a real
- * rate is measured — terminal states never show live values.
+ * The signature Velo download card — a machined horizontal hybrid.
+ *
+ *   [state edge][type tile] [ identity + progress ] [ instrument rail ]
+ *                            name · destination     rate/size · spark
+ *                            ▓▓▓▓▓░░░ 42% · 8 of 10 eta · actions
+ *
+ * The instrument rail always shows one primary metric: live rate while
+ * moving, the saved size once complete, the percentage while paused, and a
+ * quiet dash while merely waiting. The sparkline renders exclusively from
+ * real sampled speed data and only while a transfer is actually running —
+ * terminal states never present speed.
  */
 export const DownloadRow = memo(function DownloadRow({
   item,
@@ -64,13 +59,41 @@ export const DownloadRow = memo(function DownloadRow({
 }: DownloadRowProps) {
   const percent = progressPercent(item);
   const terminal = isTerminal(item.state);
-  const rate = item.state === "downloading" ? formatRate(item.speedBytesPerSecond) : null;
-  const eta = item.state === "downloading" ? formatEta(item.etaSeconds) : null;
-  const sparkPoints = speedHistory.length >= 2 && item.state === "downloading"
-    ? speedHistoryPoints(speedHistory)
+  const live = item.state === "downloading";
+  const rate = live ? formatRate(item.speedBytesPerSecond) : null;
+  const eta = live ? formatEta(item.etaSeconds) : null;
+  const sparkPoints = speedHistory.length >= 2 && live
+    ? speedHistoryPoints(speedHistory, SPARK_WIDTH, SPARK_HEIGHT)
     : null;
   const sparkFirst = sparkPoints?.split(" ")[0].split(",").map(Number) ?? null;
   const sparkLast = sparkPoints?.split(" ").at(-1)?.split(",").map(Number) ?? null;
+  const kind = fileTypeInfo(item.fileName);
+
+  const sideValue = live
+    ? (rate ?? "Measuring…")
+    : item.state === "completed"
+      ? formatBytes(item.bytesWritten)
+      : percent !== null && percent > 0
+        ? `${Math.floor(percent)}%`
+        : "—";
+
+  const sideSub = live
+    ? (eta ? null : "Transfer running")
+    : item.state === "completed"
+      ? "Saved to disk"
+      : item.state === "paused"
+        ? "Paused by you"
+        : item.state === "preparing"
+          ? "Opening connection"
+          : item.state === "finalizing"
+            ? "Syncing to disk"
+            : item.state === "retrying"
+              ? "Automatic retry"
+              : item.state === "pausing"
+                ? "Pausing…"
+                : item.state === "cancelling"
+                  ? "Cancelling…"
+                  : null;
 
   const meta = item.state === "retrying"
     ? "Retry scheduled"
@@ -81,7 +104,7 @@ export const DownloadRow = memo(function DownloadRow({
       : item.state === "completed"
         ? `${formatBytes(item.bytesWritten)} saved`
         : percent !== null
-          ? `${Math.floor(percent)}% · ${formatBytes(item.bytesWritten)} of ${formatBytes(item.totalBytes ?? 0)}`
+          ? `${formatBytes(item.bytesWritten)} of ${formatBytes(item.totalBytes ?? 0)}`
           : item.totalBytes === null
             ? `${formatBytes(item.bytesWritten)} · size unknown`
             : formatBytes(item.bytesWritten);
@@ -94,18 +117,9 @@ export const DownloadRow = memo(function DownloadRow({
         onOpenMenu(item, event);
       }}
     >
-      {/* Tiles carry the pill's hue: red for genuinely moving transfers,
-          amber while finishing/retrying, slate while queued, neutral when
-          paused. Terminal states keep their own semantic tile. */}
-      <div
-        className={`row-icon ${
-          ["downloading", "preparing", "pausing", "cancelling"].includes(item.state)
-            ? "live"
-            : item.state
-        }`}
-        aria-hidden="true"
-      >
-        <Icon name={STATE_ICON[item.state]} size={19} />
+      {/* File-type tile: the extension lettering doubles as the thumbnail. */}
+      <div className={`row-icon tone-${kind.tone}`} aria-hidden="true">
+        {kind.tone === "generic" ? <Icon name="file" size={19} /> : <span className="row-icon-code">{kind.code}</span>}
       </div>
 
       <div className="row-main">
@@ -118,13 +132,18 @@ export const DownloadRow = memo(function DownloadRow({
           <span className="path-text" title={item.destination}>{destinationDirectory(item.destination)}</span>
         </div>
         {item.state !== "cancelled" && (
-          <ProgressTrack
-            value={percent ?? (item.state === "completed" ? 100 : null)}
-            completed={item.state === "completed"}
-            indeterminateWidth={item.state === "queued" || item.state === "scheduled" ? 0 : 6}
-            className="row-progress"
-            ariaLabel={`${item.fileName} progress`}
-          />
+          <div className="row-progressline">
+            <ProgressTrack
+              value={percent ?? (item.state === "completed" ? 100 : null)}
+              completed={item.state === "completed"}
+              indeterminateWidth={item.state === "queued" || item.state === "scheduled" ? 0 : 6}
+              className="row-progress"
+              ariaLabel={`${item.fileName} progress`}
+            />
+            <span className="row-percent">
+              {live ? (percent !== null ? `${Math.floor(percent)}%` : null) : item.state === "completed" ? "100%" : null}
+            </span>
+          </div>
         )}
         <div className="row-meta">
           {item.state === "queued" && (
@@ -140,55 +159,74 @@ export const DownloadRow = memo(function DownloadRow({
             </span>
           )}
           <span className="row-meta-dim">{meta}</span>
-          {eta && <span className="row-meta-dim">{eta}</span>}
           {item.state === "finalizing" && <span className="row-meta-dim">Syncing to disk…</span>}
-          {sparkPoints && (
-            <svg className="row-spark" viewBox="0 0 84 20" preserveAspectRatio="none" role="img" aria-label={`Recent speed ${rate ?? "measuring"}`}>
-              <polygon className="row-spark-area" points={`${sparkPoints} 84,20 0,20`} />
-              <polyline className="row-spark-line" points={sparkPoints} />
-              {sparkFirst && <circle className="row-spark-dot" cx={sparkFirst[0]} cy={sparkFirst[1]} r="1.6" />}
-              {sparkLast && <circle className="row-spark-dot current" cx={sparkLast[0]} cy={sparkLast[1]} r="1.9" />}
-            </svg>
-          )}
-          {rate && <span className="row-rate">{rate}</span>}
         </div>
       </div>
 
-      <div className="row-actions">
-        {(item.state === "downloading" || item.state === "preparing" || item.state === "paused") && (
-          <Tooltip label={item.state === "paused" ? "Resume download" : "Pause download"}>
+      <div className="row-side">
+        <span className={`row-side-value${live ? " row-rate" : ""}`}>{sideValue}</span>
+        {sparkPoints && (
+          <svg
+            className="row-spark"
+            viewBox={`0 0 ${SPARK_WIDTH} ${SPARK_HEIGHT}`}
+            preserveAspectRatio="none"
+            role="img"
+            aria-label={`Recent speed ${rate ?? "measuring"}`}
+          >
+            <polygon className="row-spark-area" points={`${sparkPoints} ${SPARK_WIDTH},${SPARK_HEIGHT} 0,${SPARK_HEIGHT}`} />
+            <polyline className="row-spark-line" points={sparkPoints} />
+            {sparkFirst && <circle className="row-spark-dot" cx={sparkFirst[0]} cy={sparkFirst[1]} r="1.6" />}
+            {sparkLast && <circle className="row-spark-dot current" cx={sparkLast[0]} cy={sparkLast[1]} r="1.9" />}
+          </svg>
+        )}
+        {eta && <span className="row-eta">{eta}</span>}
+        {sideSub && <span className="row-side-sub">{sideSub}</span>}
+        <div className="row-actions">
+          {(item.state === "downloading" || item.state === "preparing" || item.state === "paused") && (
+            <Tooltip label={item.state === "paused" ? "Resume download" : "Pause download"}>
+              <button
+                type="button"
+                className="row-action"
+                onClick={() => onTogglePause(item)}
+                disabled={pending}
+                aria-label={`${item.state === "paused" ? "Resume" : "Pause"} ${item.fileName}`}
+              >
+                <Icon name={item.state === "paused" ? "download" : "pause"} size={16} />
+              </button>
+            </Tooltip>
+          )}
+          {!terminal && item.state !== "finalizing" && (
             <button
               type="button"
-              className="row-action"
-              onClick={() => onTogglePause(item)}
+              className="row-action cancel"
+              onClick={() => onCancel(item)}
               disabled={pending}
-              aria-label={`${item.state === "paused" ? "Resume" : "Pause"} ${item.fileName}`}
+              aria-label={`Cancel ${item.fileName}`}
             >
-              <Icon name={item.state === "paused" ? "download" : "pause"} size={16} />
+              {pending ? <Spinner /> : <Icon name="close" size={16} />}
+            </button>
+          )}
+          {(item.state === "failed" || item.state === "cancelled" || item.state === "interrupted") && (
+            <button type="button" className="row-action" onClick={() => onRetry(item)} disabled={pending} aria-label={`Retry ${item.fileName}`}>
+              <Icon name="refresh" size={16} />
+            </button>
+          )}
+          {terminal && (
+            <button type="button" className="row-action" onClick={() => onDismiss(item)} disabled={pending} aria-label={`Remove ${item.fileName} from the list`}>
+              {pending ? <Spinner /> : <Icon name="trash" size={16} />}
+            </button>
+          )}
+          <Tooltip label="More actions">
+            <button
+              type="button"
+              className="row-action more"
+              onClick={(event) => onOpenMenu(item, event)}
+              aria-label={`More actions for ${item.fileName}`}
+            >
+              <Icon name="more" size={16} />
             </button>
           </Tooltip>
-        )}
-        {!terminal && item.state !== "finalizing" && (
-          <button
-            type="button"
-            className="row-action cancel"
-            onClick={() => onCancel(item)}
-            disabled={pending}
-            aria-label={`Cancel ${item.fileName}`}
-          >
-            {pending ? <Spinner /> : <Icon name="close" size={16} />}
-          </button>
-        )}
-        {(item.state === "failed" || item.state === "cancelled" || item.state === "interrupted") && (
-          <button type="button" className="row-action" onClick={() => onRetry(item)} disabled={pending} aria-label={`Retry ${item.fileName}`}>
-            <Icon name="refresh" size={16} />
-          </button>
-        )}
-        {terminal && (
-          <button type="button" className="row-action" onClick={() => onDismiss(item)} disabled={pending} aria-label={`Remove ${item.fileName} from the list`}>
-            {pending ? <Spinner /> : <Icon name="trash" size={16} />}
-          </button>
-        )}
+        </div>
         <span className="sr-only">{STATE_LABELS[item.state]}</span>
       </div>
     </article>

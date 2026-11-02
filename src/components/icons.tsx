@@ -23,7 +23,13 @@ export type IconName =
   | "shield"
   | "drive"
   | "spark"
-  | "calendar";
+  | "calendar"
+  | "more"
+  | "eye"
+  | "file"
+  | "activity"
+  | "bell"
+  | "minimize";
 
 const PATHS: Record<IconName, ReactNode> = {
   download: <><path d="M12 3v11" /><path d="m7 10 5 5 5-5" /><path d="M5 20h14" /></>,
@@ -49,6 +55,12 @@ const PATHS: Record<IconName, ReactNode> = {
   drive: <><rect x="3" y="4" width="18" height="7" rx="1.5" /><rect x="3" y="13" width="18" height="7" rx="1.5" /><path d="M7 7.5h.01M7 16.5h.01" /></>,
   spark: <><path d="m12 3 1.6 6.4L20 11l-6.4 1.6L12 19l-1.6-6.4L4 11l6.4-1.6Z" /><path d="m19 15 .8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8Z" /></>,
   calendar: <><rect x="3.5" y="5" width="17" height="16" rx="2.5" /><path d="M8 3v4M16 3v4M3.5 10.5h17" /></>,
+  more: <><circle cx="5" cy="12" r="1.15" fill="currentColor" stroke="none" /><circle cx="12" cy="12" r="1.15" fill="currentColor" stroke="none" /><circle cx="19" cy="12" r="1.15" fill="currentColor" stroke="none" /></>,
+  eye: <><path d="M2.6 12S6.2 5.8 12 5.8 21.4 12 21.4 12 17.8 18.2 12 18.2 2.6 12 2.6 12Z" /><circle cx="12" cy="12" r="2.9" /></>,
+  file: <><path d="M13.5 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8.5Z" /><path d="M13.5 3v5.5H19" /></>,
+  activity: <path d="M3 12h3.6L9 6.4l4.6 11.2 2.4-5.6H21" />,
+  bell: <><path d="M3 7v3a5 5 0 0 0 10 0V7M3 7v3a5 5 0 0 1 10 0V7" /><path d="M7 15h10v2H7z" /></>,
+  minimize: <path d="M1 5.5h8" />,
 };
 
 export function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
